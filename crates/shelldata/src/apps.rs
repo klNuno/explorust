@@ -4,6 +4,7 @@
 use crate::{Image, icons::icon_for_path, wide};
 use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, MAX_PATH};
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile, STGM_READ};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RegGetValueW};
 use windows::Win32::System::Threading::{
@@ -131,7 +132,9 @@ fn top_level_app_windows() -> Vec<(isize, String)> {
     unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
         unsafe {
             let out = &mut *(lp.0 as *mut Vec<(isize, String)>);
-            if !IsWindowVisible(hwnd).as_bool() || GetWindowTextLengthW(hwnd) == 0 {
+            let mut cloaked = 0u32;
+            let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as _, 4);
+            if !IsWindowVisible(hwnd).as_bool() || GetWindowTextLengthW(hwnd) == 0 || cloaked != 0 {
                 return true.into();
             }
             let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
