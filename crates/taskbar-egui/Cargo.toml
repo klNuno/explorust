@@ -1,0 +1,12 @@
+[package]
+name = "taskbar-egui"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+shelldata = { path = "../shelldata" }
+render = { path = "../render" }
+eframe = { version = "0.37", default-features = false, features = ["glow"] }
+raw-window-handle = "0.6"
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_UI_HiDpi"] }
