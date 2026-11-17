@@ -479,6 +479,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "explorer-proto"
+version = "0.1.0"
+dependencies = [
+ "render",
+ "shelldata",
+ "windows",
+ "windows-core",
+ "windows-numerics",
+]
+
+[[package]]
 name = "fdeflate"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
