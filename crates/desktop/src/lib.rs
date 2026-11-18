@@ -1,9 +1,36 @@
-//! explorust's the desktop: Progman and WorkerW for wallpaper engines, desktop icons through the shell view. Placeholder until step 8 of `.agents/TODO.md`.
+//! explorust's desktop: a `Progman` window at the bottom of the Z-order that paints the wallpaper
+//! from Windows' settings, Windows' own desktop shell view inside it (icons, context menu,
+//! rename, drag and drop, change notifications), and the command window `explorust.desktop`
+//! (ShowDesktop for Win+D and Win+M, Shutdown).
 //!
 //! Contract with the shell (`crates/shell/src/components.rs`): `run()` is called on a thread of
-//! its own, creates its windows (its command window has the class `bus::class_of(Owner::..)`),
-//! runs its message loop and returns on `bus::Command::Shutdown` or `WM_QUIT`. A panic is caught
-//! and logged by the shell, which starts `run()` again (at most 3 times in 5 minutes).
+//! its own, creates its windows, runs its message loop and returns on `bus::Command::Shutdown` or
+//! `WM_QUIT`. A panic is caught and logged by the shell, which starts `run()` again.
 
-/// Runs the component until shutdown. The placeholder returns at once.
-pub fn run() {}
+pub mod layout;
+pub mod toggle;
+
+#[cfg(target_os = "windows")]
+mod browser;
+#[cfg(target_os = "windows")]
+mod command;
+#[cfg(target_os = "windows")]
+mod log;
+#[cfg(target_os = "windows")]
+mod progman;
+#[cfg(target_os = "windows")]
+mod reg;
+#[cfg(target_os = "windows")]
+mod screen;
+#[cfg(target_os = "windows")]
+mod showdesktop;
+#[cfg(target_os = "windows")]
+mod view;
+#[cfg(target_os = "windows")]
+mod wallpaper;
+
+/// Runs the desktop until shutdown.
+pub fn run() {
+    #[cfg(target_os = "windows")]
+    progman::run();
+}
