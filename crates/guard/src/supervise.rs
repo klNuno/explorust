@@ -14,7 +14,8 @@ enum End {
     Fallback(String),
 }
 
-pub fn run() -> u32 {
+/// `adopt`: the pid of a running explorust whose guard died; it is watched instead of starting one.
+pub fn run(adopt: Option<u32>) -> u32 {
     let fallback = match Event::named(FALLBACK_EVENT) {
         Ok(e) => e,
         Err(e) => {
@@ -25,21 +26,36 @@ pub fn run() -> u32 {
     hotkey::spawn(fallback.0);
     let exe = shell_exe();
     let build = reg::windows_build();
-    log::line(&format!("guard start: windows {build}, shell {}", exe.display()));
-    if hotkey::shift_held() {
-        log::line("Shift held at logon: plain explorer");
-        return explorer_forever();
+    let mut policy = Policy::new(Duration::from_secs(300));
+    let mut attempt = 0u32;
+    let mut adopted = None;
+    if let Some(pid) = adopt {
+        log::line(&format!("guard adopts explorust pid {pid}: its guard ended"));
+        match Child::open(pid) {
+            Ok(child) => adopted = Some(child),
+            Err(e) => log::line(&format!("adopt: {e}; starting a new explorust")),
+        }
+    } else {
+        log::line(&format!("guard start: windows {build}, shell {}", exe.display()));
+        if hotkey::shift_held() {
+            log::line("Shift held at logon: plain explorer");
+            return explorer_forever();
+        }
     }
     if !exe.exists() {
         log::line("explorust.exe missing: plain explorer");
         return explorer_forever();
     }
-    let mut policy = Policy::new(Duration::from_secs(300));
-    let mut attempt = 0u32;
     loop {
-        attempt += 1;
-        let self_test = reg::last_good_build().as_deref() != Some(build.as_str());
-        match run_once(&exe, attempt, self_test, &build, &fallback) {
+        let end = match adopted.take() {
+            Some(child) => watch(&child, &fallback),
+            None => {
+                attempt += 1;
+                let self_test = reg::last_good_build().as_deref() != Some(build.as_str());
+                run_once(&exe, attempt, self_test, &build, &fallback)
+            }
+        };
+        match end {
             End::Fallback(why) => {
                 log::line(&format!("fallback: {why}"));
                 return explorer_forever();
@@ -61,7 +77,7 @@ fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &E
         Ok(e) => e,
         Err(e) => return End::Fallback(e),
     };
-    let mut args = format!("--ready-event {name}");
+    let mut args = format!("--ready-event {name} --guard {}", std::process::id());
     if self_test {
         args.push_str(" --self-test");
     }
@@ -88,6 +104,11 @@ fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &E
             return End::Failed(format!("not ready after {} s", timeout.as_secs()));
         }
     }
+    watch(&child, fallback)
+}
+
+/// Waits for a ready explorust to end or for the escape hatch.
+fn watch(child: &Child, fallback: &Event) -> End {
     match wait_any(&[child.handle, fallback.0], None) {
         Some(0) => match child.exit_code() {
             0 => End::Fallback("explorust exited cleanly".into()),

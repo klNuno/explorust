@@ -3,6 +3,7 @@
 //! rest join it step by step.
 //!
 //! - `--ready-event <name>`: set that named event once the host is up (and the self-test passed).
+//! - `--guard <pid>`: the guard that started it; if it ends, explorust starts one that adopts it.
 //! - `--self-test`: before signalling ready, open Calculator and wait for its frame on screen.
 //! - `--quit`: ask the running explorust of this session to exit cleanly (code 0).
 //!
@@ -13,6 +14,8 @@
 
 #[cfg(target_os = "windows")]
 mod events;
+#[cfg(target_os = "windows")]
+mod guardwatch;
 #[cfg(target_os = "windows")]
 mod log;
 #[cfg(target_os = "windows")]

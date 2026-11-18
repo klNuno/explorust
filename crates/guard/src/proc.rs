@@ -3,9 +3,9 @@
 use std::path::Path;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, GetExitCodeProcess, INFINITE, OpenEventW,
-    PROCESS_INFORMATION, STARTUPINFOW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
-    EVENT_MODIFY_STATE,
+    CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, EVENT_MODIFY_STATE, GetExitCodeProcess, INFINITE,
+    OpenEventW, OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, STARTUPINFOW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::core::{HSTRING, PWSTR};
 
@@ -40,6 +40,14 @@ impl Child {
         // SAFETY: the thread handle is not needed.
         let _ = unsafe { CloseHandle(pi.hThread) };
         Ok(Child { handle: pi.hProcess, pid: pi.dwProcessId })
+    }
+
+    /// Takes over a running process (an explorust whose guard died) as if this guard had started it.
+    pub fn open(pid: u32) -> Result<Child, String> {
+        let access = PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+        // SAFETY: Windows validates the pid and the requested rights.
+        let handle = unsafe { OpenProcess(access, false, pid) }.map_err(|e| format!("open pid {pid}: {e}"))?;
+        Ok(Child { handle, pid })
     }
 
     pub fn exit_code(&self) -> u32 {

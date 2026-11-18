@@ -1,0 +1,42 @@
+//! The guard's keeper. If the guard that started explorust ends (killed from Task Manager, say),
+//! nothing would bring explorer back on a crash and the escape hotkey would be gone, so explorust
+//! starts a new guard that adopts it (`explorust-guard --adopt <pid>`), and watches that one.
+
+use crate::log;
+use std::os::windows::process::CommandExt;
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+pub fn spawn(guard_pid: u32) {
+    let _ = std::thread::Builder::new().name("guard-watch".into()).spawn(move || watch(guard_pid));
+}
+
+fn watch(mut pid: u32) {
+    let guard = std::env::current_exe().map(|p| p.with_file_name("explorust-guard.exe"));
+    loop {
+        // SAFETY: opens, waits on and closes a handle owned here.
+        unsafe {
+            match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+                Ok(h) => {
+                    WaitForSingleObject(h, INFINITE);
+                    let _ = CloseHandle(h);
+                }
+                Err(e) => log::line(&format!("guard pid {pid}: {e}")),
+            }
+        }
+        let Ok(exe) = &guard else { return };
+        let me = std::process::id().to_string();
+        match std::process::Command::new(exe).args(["--adopt", &me]).creation_flags(CREATE_NO_WINDOW).spawn() {
+            Ok(child) => {
+                log::line(&format!("guard pid {pid} ended: started guard pid {} to adopt this shell", child.id()));
+                pid = child.id();
+            }
+            Err(e) => {
+                log::line(&format!("guard pid {pid} ended and a new guard failed to start: {e}"));
+                return;
+            }
+        }
+    }
+}

@@ -6,6 +6,7 @@
 //! - `--restore`: delete that value (next logon is plain Windows) and start explorer if no shell runs.
 //! - `--fallback`: ask a running guard to kill explorust and start explorer (same as Ctrl+Alt+Shift+F12).
 //! - `--status`: print the Shell value, the Windows build and the last good build.
+//! - `--adopt <pid>`: started by explorust when its guard died; supervises that explorust.
 
 #![windows_subsystem = "windows"]
 
@@ -31,7 +32,14 @@ fn main() {
     let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     let arg = std::env::args().nth(1).unwrap_or_default();
     let code = match arg.as_str() {
-        "" => run_shell(),
+        "" => run_shell(None),
+        "--adopt" => match std::env::args().nth(2).and_then(|p| p.parse().ok()) {
+            Some(pid) => run_shell(Some(pid)),
+            None => {
+                say("--adopt needs the explorust pid");
+                2
+            }
+        },
         "--install" => install(),
         "--restore" => restore(),
         "--fallback" => match proc::Event::set_existing(supervise::FALLBACK_EVENT) {
@@ -61,14 +69,14 @@ fn main() {
     std::process::exit(code as i32);
 }
 
-fn run_shell() -> u32 {
+fn run_shell(adopt: Option<u32>) -> u32 {
     // SAFETY: one guard per session; the mutex lives until the process ends.
     let _mutex = unsafe { CreateMutexW(None, false, &HSTRING::from(r"Local\explorust-guard")) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         log::line("another guard runs in this session: exiting");
         return 0;
     }
-    supervise::run()
+    supervise::run(adopt)
 }
 
 fn install() -> u32 {

@@ -1,7 +1,7 @@
 //! Argument parsing and the process lifetime: host thread up, optional self-test, ready signal,
 //! then wait for a quit request or the host's end.
 
-use crate::{events, log, selftest};
+use crate::{events, guardwatch, log, selftest};
 use std::sync::mpsc;
 use std::time::Duration;
 use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
@@ -17,16 +17,18 @@ const HOST_READY_TIMEOUT: Duration = Duration::from_secs(100);
 
 struct Args {
     ready_event: Option<String>,
+    guard: Option<u32>,
     self_test: bool,
     quit: bool,
 }
 
 fn parse() -> Result<Args, String> {
-    let mut args = Args { ready_event: None, self_test: false, quit: false };
+    let mut args = Args { ready_event: None, guard: None, self_test: false, quit: false };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--ready-event" => args.ready_event = Some(it.next().ok_or("--ready-event needs a name")?),
+            "--guard" => args.guard = it.next().and_then(|p| p.parse().ok()),
             "--self-test" => args.self_test = true,
             "--quit" => args.quit = true,
             other => return Err(format!("unknown argument {other}")),
@@ -101,6 +103,9 @@ fn shell(args: &Args) -> i32 {
                 return SELF_TEST_FAILED;
             }
         }
+    }
+    if let Some(pid) = args.guard {
+        guardwatch::spawn(pid);
     }
     if let Some(name) = &args.ready_event {
         if let Err(e) = events::set_existing(name) {
