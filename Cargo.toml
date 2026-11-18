@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/render", "crates/shelldata", "crates/taskbar-proto", "crates/taskbar-egui", "crates/explorer-proto"]
+members = ["crates/render", "crates/shelldata", "crates/taskbar-proto", "crates/taskbar-egui", "crates/explorer-proto", "crates/guard", "crates/uwp-host"]
 
 [workspace.package]
 edition = "2024"
