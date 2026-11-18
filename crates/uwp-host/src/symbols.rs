@@ -84,7 +84,14 @@ fn module(module_name: &str) -> Result<Arc<ModuleSymbols>, String> {
     if !pdb_path.exists() {
         download_pdb(&pdb_name, &key, &pdb_path)?;
     }
-    validate_pdb(&pdb_path, &key, codeview.age())?;
+    if let Err(error) = validate_pdb(&pdb_path, &key, codeview.age()) {
+        // explorust: a damaged cache entry heals itself once instead of failing every logon.
+        tracing::warn!(%error, "symbol cache entry is damaged: downloading it again");
+        let _ = fs::remove_file(&pdb_path);
+        let _ = fs::remove_file(&manifest);
+        download_pdb(&pdb_name, &key, &pdb_path)?;
+        validate_pdb(&pdb_path, &key, codeview.age())?;
+    }
     let resolved = read_manifest(&manifest)?;
     let module = Arc::new(ModuleSymbols {
         base: handle.0 as usize,

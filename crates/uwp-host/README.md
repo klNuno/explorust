@@ -8,5 +8,6 @@ It hosts the immersive shell controller of `twinui.pcshell.dll` so that UWP apps
 present their frames when explorer.exe is not running. Private entry points are resolved from
 Microsoft's public PDBs and cached under `%LOCALAPPDATA%\Nickel\symbols`.
 
-Changes from upstream: the package and library are renamed `uwp-host` / `uwp_host`; the source is
+Changes from upstream: the package and library are renamed `uwp-host` / `uwp_host`; `symbols.rs`
+downloads a cached PDB again once when it fails validation (marked `explorust:`). The source is
 otherwise unchanged. Keep local changes small and listed here so the upstream diff stays readable.
