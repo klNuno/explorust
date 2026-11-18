@@ -12,10 +12,8 @@ use std::cell::{Cell, RefCell};
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
-use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::Graphics::Dwm::{
-    DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_CLOAK, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmFlush, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CLOAK, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmFlush, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint};
 use windows::Win32::Security::Authentication::Identity::{GetUserNameExW, NameDisplay};
@@ -34,6 +32,8 @@ use windows_core::{HSTRING, PCWSTR, PWSTR, w};
 const WM_LOADED: u32 = WM_APP + 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const MENU_CLASS: PCWSTR = w!("explorust.start.menu");
+/// Acrylic tint, ABGR: Windows 11's dark Start base (#202020) at about 75%.
+const TINT: u32 = 0xC020_2020;
 
 struct Loaded {
     apps: Vec<App>,
@@ -118,13 +118,9 @@ fn create() -> windows_core::Result<()> {
         )?;
         MENU.with(|m| m.set(hwnd.0 as isize));
         cloak(hwnd, true);
-        // DWM's own acrylic (the transient-window backdrop, shown while Start is active, which it
-        // always is when visible) keeps Windows 11's rounded corners and border.
-        let dark: i32 = 1;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 });
-        let acrylic = DWMSBT_TRANSIENTWINDOW;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &acrylic as *const _ as _, 4);
+        // The accent acrylic of `render` (the look of session 1); DWM's transient-window backdrop
+        // came out light grey over the black desktop of g1 and is not used.
+        render::backdrop::apply(hwnd, render::backdrop::Backdrop::Acrylic { tint_abgr: TINT });
         let round = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &round as *const _ as _, 4);
         let border = 0x003A_3A3Au32;
