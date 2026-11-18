@@ -10,7 +10,14 @@ path = "src/main.rs"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 uwp-host = { path = "../uwp-host" }
+bus = { path = "../bus" }
+taskbar = { path = "../taskbar" }
+desktop = { path = "../desktop" }
+start = { path = "../start" }
+switcher = { path = "../switcher" }
+notify = { path = "../notify" }
+files = { path = "../files" }
 windows = { workspace = true, features = [
   "Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_System_SystemInformation",
-  "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Dwm",
+  "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Dwm", "Win32_System_LibraryLoader", "Win32_Security",
 ] }

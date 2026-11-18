@@ -12,7 +12,12 @@ pub const FALLBACK_EVENT: &str = r"Local\explorust-guard-fallback";
 enum End {
     Failed(String),
     Fallback(String),
+    /// explorust exited with code 5 (`explorust --reload`).
+    Reload,
 }
+
+/// The exit code of `explorust --reload`.
+const RELOAD: u32 = 5;
 
 /// `adopt`: the pid of a running explorust whose guard died; it is watched instead of starting one.
 pub fn run(adopt: Option<u32>) -> u32 {
@@ -56,6 +61,7 @@ pub fn run(adopt: Option<u32>) -> u32 {
             }
         };
         match end {
+            End::Reload => swap_next(&exe),
             End::Fallback(why) => {
                 log::line(&format!("fallback: {why}"));
                 return explorer_forever();
@@ -112,6 +118,7 @@ fn watch(child: &Child, fallback: &Event) -> End {
     match wait_any(&[child.handle, fallback.0], None) {
         Some(0) => match child.exit_code() {
             0 => End::Fallback("explorust exited cleanly".into()),
+            RELOAD => End::Reload,
             code => End::Failed(format!("crashed after ready, code {code:#x}")),
         },
         _ => {
@@ -119,6 +126,26 @@ fn watch(child: &Child, fallback: &Event) -> End {
             End::Fallback("hotkey or --fallback".into())
         }
     }
+}
+
+/// A reload: `explorust.next.exe` beside explorust.exe, if present, replaces it before the restart.
+fn swap_next(exe: &Path) {
+    let next = exe.with_file_name("explorust.next.exe");
+    if !next.exists() {
+        log::line("reload: restarting explorust");
+        return;
+    }
+    // The old process has exited, but its image can stay mapped for a moment.
+    for _ in 0..20 {
+        match std::fs::rename(&next, exe) {
+            Ok(()) => {
+                log::line("reload: explorust.next.exe swapped in");
+                return;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    log::line("reload: explorust.exe still locked after 2 s, restarting the old one");
 }
 
 fn shell_exe() -> PathBuf {

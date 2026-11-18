@@ -1,7 +1,7 @@
 //! Argument parsing and the process lifetime: host thread up, optional self-test, ready signal,
 //! then wait for a quit request or the host's end.
 
-use crate::{events, guardwatch, log, selftest};
+use crate::{actions, components, events, guardwatch, hotkeys, log, selftest};
 use std::sync::mpsc;
 use std::time::Duration;
 use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
@@ -10,6 +10,8 @@ pub const CLEAN: i32 = 0;
 pub const HOST_FAILED: i32 = 2;
 pub const OTHER_SHELL: i32 = 3;
 pub const SELF_TEST_FAILED: i32 = 4;
+/// `--reload`: the guard swaps in `explorust.next.exe` if present and starts explorust again.
+pub const RELOAD: i32 = 5;
 
 /// How long the host gets to publish the shell window and start the controller. A first run on a
 /// new Windows build downloads twinui's PDB (tens of MB) before it is ready.
@@ -20,10 +22,11 @@ struct Args {
     guard: Option<u32>,
     self_test: bool,
     quit: bool,
+    reload: bool,
 }
 
 fn parse() -> Result<Args, String> {
-    let mut args = Args { ready_event: None, guard: None, self_test: false, quit: false };
+    let mut args = Args { ready_event: None, guard: None, self_test: false, quit: false, reload: false };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -31,6 +34,7 @@ fn parse() -> Result<Args, String> {
             "--guard" => args.guard = it.next().and_then(|p| p.parse().ok()),
             "--self-test" => args.self_test = true,
             "--quit" => args.quit = true,
+            "--reload" => args.reload = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -45,11 +49,12 @@ pub fn main() -> i32 {
             return HOST_FAILED;
         }
     };
-    if args.quit {
-        return match events::set_existing(events::QUIT_EVENT) {
+    if args.quit || args.reload {
+        let event = if args.quit { events::QUIT_EVENT } else { events::RELOAD_EVENT };
+        return match events::set_existing(event) {
             Ok(()) => CLEAN,
             Err(e) => {
-                log::line(&format!("--quit: no running explorust ({e})"));
+                log::line(&format!("--quit/--reload: no running explorust ({e})"));
                 1
             }
         };
@@ -66,7 +71,9 @@ fn shell(args: &Args) -> i32 {
         log::line("another shell owns the shell window: exiting");
         return OTHER_SHELL;
     }
-    let quit = match events::Owned::create(events::QUIT_EVENT) {
+    components::log_panics();
+    let made = events::Owned::create(events::QUIT_EVENT).and_then(|q| Ok((q, events::Owned::create(events::RELOAD_EVENT)?)));
+    let (quit, reload) = match made {
         Ok(q) => q,
         Err(e) => {
             log::line(&e);
@@ -104,6 +111,9 @@ fn shell(args: &Args) -> i32 {
             }
         }
     }
+    actions::spawn();
+    hotkeys::spawn();
+    components::spawn_all();
     if let Some(pid) = args.guard {
         guardwatch::spawn(pid);
     }
@@ -115,7 +125,13 @@ fn shell(args: &Args) -> i32 {
     loop {
         if quit.wait(250) {
             log::line("quit requested");
+            components::shutdown_all();
             return CLEAN;
+        }
+        if reload.wait(0) {
+            log::line("reload requested");
+            components::shutdown_all();
+            return RELOAD;
         }
         if done_rx.try_recv().is_ok() {
             return HOST_FAILED;
