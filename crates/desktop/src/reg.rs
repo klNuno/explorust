@@ -1,6 +1,6 @@
 //! Reads of the current user's settings that Windows keeps in the registry.
 
-use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW};
 use windows_core::HSTRING;
 
 pub fn string(key: &str, value: &str) -> Option<String> {
@@ -42,4 +42,25 @@ pub fn dword(key: &str, value: &str) -> Option<u32> {
         )
     };
     r.is_ok().then_some(v)
+}
+
+pub fn binary(key: &str, value: &str) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; 4096];
+    let mut len = buf.len() as u32;
+    // SAFETY: the buffer and its byte length are valid for the call.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(key),
+            &HSTRING::from(value),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut len),
+        )
+    };
+    r.is_ok().then(|| {
+        buf.truncate(len as usize);
+        buf
+    })
 }

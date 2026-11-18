@@ -9,6 +9,7 @@
 
 pub mod layout;
 pub mod toggle;
+pub mod transcoded;
 
 #[cfg(target_os = "windows")]
 mod browser;
@@ -28,6 +29,8 @@ mod showdesktop;
 mod view;
 #[cfg(target_os = "windows")]
 mod wallpaper;
+#[cfg(target_os = "windows")]
+mod workerw;
 
 /// Runs the desktop until shutdown.
 pub fn run() {

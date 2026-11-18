@@ -5,11 +5,11 @@
 use crate::layout::Rect;
 use crate::view::{self, Desk};
 use crate::wallpaper::{self, Frame, Surface, WM_WALLPAPER};
-use crate::{command, log, screen};
+use crate::{command, log, screen, workerw};
 use std::cell::RefCell;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, FillRect, GetSysColorBrush, COLOR_BACKGROUND, HDC, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetSysColorBrush, COLOR_BACKGROUND, HDC, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE,
     RDW_INVALIDATE, RedrawWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -20,9 +20,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_BOTTOM, IDC_ARROW, IsWindow, LoadCursorW, MSG, MoveWindow, PostQuitMessage, RegisterClassExW, SPI_SETDESKWALLPAPER,
     SPI_SETWORKAREA, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetWindowPos,
     ShowWindow, TranslateMessage, UnregisterClassW, WA_INACTIVE, WINDOWPOS, WM_ACTIVATE, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_KEYFIRST, WM_KEYLAST, WM_PAINT, WM_PRINTCLIENT, WM_SETFOCUS, WM_SETTINGCHANGE,
-    WM_SIZE, WM_SYSCOLORCHANGE, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW,
-    WS_POPUP,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYFIRST, WM_KEYLAST, WM_PAINT, WM_PRINTCLIENT, WM_SETFOCUS, WM_SETTINGCHANGE,
+    WM_SIZE, WM_SYSCOLORCHANGE, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows_core::{PCWSTR, w};
 
@@ -34,6 +34,10 @@ struct State {
     surface: Option<Surface>,
     generation: usize,
     desk: Option<Desk>,
+    /// The 24H2 layout: Progman has no GDI content, the DefView is a layered child.
+    layered: bool,
+    /// The WorkerW child, once a wallpaper app raised the desktop (0x052C).
+    workerw: Option<HWND>,
 }
 
 thread_local! {
@@ -100,8 +104,10 @@ unsafe fn create() -> windows_core::Result<HWND> {
         };
         RegisterClassExW(&wc);
         let v = screen::virtual_screen();
+        let layered = workerw::supported();
+        let ex = if layered { WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP } else { WS_EX_TOOLWINDOW };
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+            ex,
             CLASS,
             w!("Program Manager"),
             WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
@@ -115,13 +121,24 @@ unsafe fn create() -> windows_core::Result<HWND> {
             None,
         )?;
         STATE.with(|s| {
-            *s.borrow_mut() = Some(State { hwnd, origin: (v.x, v.y), surface: None, generation: 1, desk: None })
+            *s.borrow_mut() = Some(State {
+                hwnd,
+                origin: (v.x, v.y),
+                surface: None,
+                generation: 1,
+                desk: None,
+                layered,
+                workerw: None,
+            })
         });
         wallpaper::spawn(hwnd, 1);
         match view::create(hwnd, Rect::new(0, 0, v.w, v.h)) {
             Ok(desk) => {
                 let dv = desk.hwnd;
                 with(|s| s.desk = Some(desk));
+                if layered && !workerw::layer_view(dv, false) {
+                    log::line("DefView not layered: the desktop shows no content (needs the Windows 10 manifest)");
+                }
                 view::apply_work_areas(dv, (v.x, v.y));
             }
             Err(e) => log::line(&format!("desktop view not created: {e}")),
@@ -152,7 +169,24 @@ unsafe fn pump() {
     }
 }
 
+/// The list view background (Progman's erase and print): the wallpaper, or the key color once
+/// the WorkerW paints the wallpaper under the view.
 fn paint_into(hdc: HDC, r: Rect) {
+    if with(|s| s.workerw.is_some()).unwrap_or(false) {
+        let rc = windows::Win32::Foundation::RECT { left: r.x, top: r.y, right: r.right(), bottom: r.bottom() };
+        // SAFETY: a brush created, used and freed here.
+        unsafe {
+            let b = CreateSolidBrush(workerw::KEY);
+            FillRect(hdc, &rc, b);
+            let _ = DeleteObject(b.into());
+        }
+        return;
+    }
+    paint_wallpaper(hdc, r);
+}
+
+/// Draws the wallpaper (client coordinates of Progman) into `hdc`.
+pub fn paint_wallpaper(hdc: HDC, r: Rect) {
     let drawn = with(|s| s.surface.as_ref().map(|sf| sf.blit(hdc, r)).is_some()).unwrap_or(false);
     if !drawn {
         let rc = windows::Win32::Foundation::RECT { left: r.x, top: r.y, right: r.right(), bottom: r.bottom() };
@@ -162,8 +196,9 @@ fn paint_into(hdc: HDC, r: Rect) {
 }
 
 /// The whole screen changed (resolution, monitors): cover the virtual screen again.
-fn relayout(hwnd: HWND) {
+fn relayout(hwnd: HWND, why: &str) {
     let v = screen::virtual_screen();
+    log::line(&format!("{why}: virtual screen {v:?}"));
     let generation = with(|s| {
         s.origin = (v.x, v.y);
         s.generation += 1;
@@ -243,12 +278,16 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             Some(LRESULT(0))
         }
         WM_SIZE => {
-            if let Some(dv) = defview() {
-                let (w, h) = ((lp.0 & 0xFFFF) as i32, ((lp.0 >> 16) & 0xFFFF) as i32);
-                // SAFETY: resizes the child view window.
-                let _ = unsafe { MoveWindow(dv, 0, 0, w, h, true) };
+            let (w, h) = ((lp.0 & 0xFFFF) as i32, ((lp.0 >> 16) & 0xFFFF) as i32);
+            for child in [defview(), with(|s| s.workerw).flatten()].into_iter().flatten() {
+                // SAFETY: resizes a child window of this thread.
+                let _ = unsafe { MoveWindow(child, 0, 0, w, h, true) };
             }
             None
+        }
+        workerw::MSG_RAISE => {
+            raise(hwnd, wp, lp);
+            Some(LRESULT(0))
         }
         WM_WALLPAPER => {
             // SAFETY: lParam is the Box<Frame> posted by `wallpaper::spawn`; taken once here.
@@ -260,12 +299,19 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
                 with(|s| s.surface = sf);
                 // SAFETY: repaints this window and the view over it.
                 let _ = unsafe { RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN) };
+                // The layered children have surfaces of their own: invalidate them by name.
+                if let Some(w) = with(|s| s.workerw).flatten() {
+                    // SAFETY: invalidates a child window of this thread.
+                    let _ = unsafe { windows::Win32::Graphics::Gdi::InvalidateRect(Some(w), None, true) };
+                }
+                workerw::repaint_list();
             }
             Some(LRESULT(0))
         }
         WM_SETTINGCHANGE => {
             let action = wp.0 as u32;
             if action == SPI_SETDESKWALLPAPER.0 {
+                log::line("SPI_SETDESKWALLPAPER: reloading the wallpaper");
                 if let Some(g) = with(|s| {
                     s.generation += 1;
                     s.generation
@@ -282,6 +328,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             Some(LRESULT(0))
         }
         WM_SYSCOLORCHANGE => {
+            log::line("WM_SYSCOLORCHANGE: reloading the wallpaper");
             if let Some(g) = with(|s| {
                 s.generation += 1;
                 s.generation
@@ -292,7 +339,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             Some(LRESULT(0))
         }
         WM_DISPLAYCHANGE => {
-            relayout(hwnd);
+            relayout(hwnd, "WM_DISPLAYCHANGE");
             forward(msg, wp, lp);
             Some(LRESULT(0))
         }
@@ -311,7 +358,49 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             unsafe { PostQuitMessage(0) };
             Some(LRESULT(0))
         }
+        WM_DPICHANGED => {
+            relayout(hwnd, &format!("WM_DPICHANGED {}", wp.0 & 0xFFFF));
+            forward(msg, wp, lp);
+            Some(LRESULT(0))
+        }
+        m if (0x400..0x8000).contains(&m) => {
+            // What Windows and apps send to Progman (explorer's private messages): logged once each.
+            if SEEN.with(|s| s.borrow_mut().insert(m)) {
+                log::line(&format!("Progman got message {m:#x} ({:#x}, {:#x})", wp.0, lp.0));
+            }
+            None
+        }
         _ => None,
+    }
+}
+
+thread_local! {
+    static SEEN: RefCell<std::collections::HashSet<u32>> = RefCell::new(Default::default());
+}
+
+/// 0x052C from a wallpaper app: the WorkerW goes under the view and the view turns transparent.
+fn raise(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
+    let (layered, existing) = with(|s| (s.layered, s.workerw)).unwrap_or((false, None));
+    if let Some(w) = existing {
+        log::line(&format!("0x052C ({:#x}, {:#x}): already raised, WorkerW {:?}", wp.0, lp.0, w.0));
+        return;
+    }
+    if !layered {
+        log::line(&format!("0x052C ({:#x}, {:#x}) ignored: no layered layout", wp.0, lp.0));
+        return;
+    }
+    match workerw::create(hwnd) {
+        Ok(w) => {
+            with(|s| s.workerw = Some(w));
+            if let Some(dv) = defview() {
+                workerw::layer_view(dv, true);
+            }
+            log::line(&format!("0x052C ({:#x}, {:#x}): raised, WorkerW {:?}", wp.0, lp.0, w.0));
+            // SAFETY: repaints this window and its children (view background now the key color).
+            let _ = unsafe { RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN) };
+            workerw::repaint_list();
+        }
+        Err(e) => log::line(&format!("0x052C: WorkerW not created: {e}")),
     }
 }
 

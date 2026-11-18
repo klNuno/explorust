@@ -12,6 +12,10 @@ path = "src/bin/desktop-dev.rs"
 name = "desktop-mouse"
 path = "src/bin/desktop-mouse.rs"
 
+[[bin]]
+name = "desktop-lively"
+path = "src/bin/desktop-lively.rs"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 bus = { path = "../bus" }
 windows-core.workspace = true

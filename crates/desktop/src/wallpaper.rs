@@ -53,10 +53,13 @@ pub fn settings() -> Settings {
     let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     let set = if ok { String::from_utf16_lossy(&buf[..n]) } else { String::new() };
     // Explorer draws Windows' transcoded copy, not the source file: it matches explorer's capture
-    // closer (mean gray diff 4.6 against 5.8 from the source, ffmpeg scaled).
+    // closer (mean gray diff 4.6 against 5.8 from the source, ffmpeg scaled). Only while it was
+    // made from the current wallpaper: SPI_SETDESKWALLPAPER without explorer leaves it stale.
+    let fresh = reg::binary(r"Control Panel\Desktop", "TranscodedImageCache")
+        .is_some_and(|b| crate::transcoded::matches(&b, &set));
     let transcoded = std::env::var_os("APPDATA")
         .map(|a| PathBuf::from(a).join(r"Microsoft\Windows\Themes\TranscodedWallpaper"))
-        .filter(|p| p.exists());
+        .filter(|p| fresh && p.exists());
     let path = if set.is_empty() {
         None
     } else {
