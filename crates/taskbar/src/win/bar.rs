@@ -131,6 +131,7 @@ fn teardown() {
         }
         // SAFETY: windows of this thread.
         unsafe {
+            set_taskman(HWND::default());
             let _ = DeregisterShellHookWindow(bar.hwnd);
             let _ = DestroyWindow(bar.hwnd);
             let _ = DestroyWindow(bar.cmd);
@@ -139,6 +140,19 @@ fn teardown() {
         drop(bar.work.take());
     }
     BAR_HWND.with(|h| h.set(0));
+}
+
+/// `SetTaskmanWindow` (user32, undocumented, what explorer calls for its bar): Windows asks
+/// that window for HSHELL_GETMINRECT when a window minimizes.
+fn set_taskman(hwnd: HWND) -> bool {
+    use windows::Win32::System::LibraryLoader::GetProcAddress;
+    // SAFETY: resolves the user32 export and calls it with its documented-by-use signature.
+    unsafe {
+        let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else { return false };
+        let Some(f) = GetProcAddress(user32, windows_core::s!("SetTaskmanWindow")) else { return false };
+        let set: unsafe extern "system" fn(HWND) -> windows_core::BOOL = std::mem::transmute(f);
+        set(hwnd).as_bool()
+    }
 }
 
 fn primary_monitor() -> RECT {
@@ -202,6 +216,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         let work = WorkArea::reserve(monitor, h_px);
         let shellhook = RegisterWindowMessageW(w!("SHELLHOOK"));
         let hooked = RegisterShellHookWindow(hwnd).as_bool();
+        let taskman = set_taskman(hwnd);
         let mut hooks = Vec::new();
         for (a, b) in [
             (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
@@ -234,7 +249,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         model.set_active((!fg.is_invalid()).then_some(fg.0 as isize));
         let dpi = GetDpiForWindow(hwnd);
         log::line(&format!(
-            "started: monitor {}x{} dpi {dpi} bar {h_px} px, shell hook {hooked}, {} win hooks, {} pins, {} windows in {} ms",
+            "started: monitor {}x{} dpi {dpi} bar {h_px} px, shell hook {hooked}, taskman {taskman}, {} win hooks, {} pins, {} windows in {} ms",
             width,
             monitor.bottom - monitor.top,
             hooks.len(),
@@ -562,6 +577,9 @@ impl Bar {
 
     fn on_shellhook(&mut self, code: usize, lp: LPARAM) -> LRESULT {
         let h = HWND(lp.0 as _);
+        if code as u32 != HSHELL_REDRAW {
+            log::line(&format!("shell hook {code:#x} {:#x}", lp.0));
+        }
         match code as u32 {
             HSHELL_WINDOWCREATED | HSHELL_REDRAW | HSHELL_WINDOWREPLACED => self.refresh(h),
             HSHELL_WINDOWDESTROYED => {

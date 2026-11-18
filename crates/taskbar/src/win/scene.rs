@@ -91,13 +91,18 @@ impl Scene {
                     ctx.FillRoundedRectangle(&rr, &self.brush(theme.attention_bg)?);
                 }
                 if fill > 0.0 {
+                    // Windows draws a 38 px fill inside a 1 px stroke that closes the 40 px box.
                     let c = theme.active_bg;
-                    ctx.FillRoundedRectangle(&rr, &self.brush((c.0, c.1, c.2, fill))?);
-                    if theme.active_stroke.3 > 0.0 && (b.active || b.hover > 0.0) {
-                        let a = theme.active_stroke.3 * if b.active { 1.0 } else { b.hover };
-                        let sr = D2D1_ROUNDED_RECT { rect: rect(bg.left - 0.5, bg.top - 0.5, w + 1.0, h + 1.0), radiusX: G::BUTTON_RADIUS + 0.5, radiusY: G::BUTTON_RADIUS + 0.5 };
+                    let inner = D2D1_ROUNDED_RECT { rect: rect(bg.left + 1.0, bg.top + 1.0, w - 2.0, h - 2.0), radiusX: G::BUTTON_RADIUS - 1.0, radiusY: G::BUTTON_RADIUS - 1.0 };
+                    ctx.FillRoundedRectangle(&inner, &self.brush((c.0, c.1, c.2, fill))?);
+                    let k = if b.active { 1.0 } else { b.hover };
+                    if theme.active_stroke.3 > 0.0 && k > 0.0 {
+                        let sr = D2D1_ROUNDED_RECT { rect: rect(bg.left + 0.5, bg.top + 0.5, w - 1.0, h - 1.0), radiusX: G::BUTTON_RADIUS - 0.5, radiusY: G::BUTTON_RADIUS - 0.5 };
                         let c = theme.active_stroke;
-                        ctx.DrawRoundedRectangle(&sr, &self.brush((c.0, c.1, c.2, a))?, 1.0, None);
+                        ctx.DrawRoundedRectangle(&sr, &self.brush((c.0, c.1, c.2, c.3 * k))?, 1.0, None);
+                        let c = theme.active_stroke_bottom;
+                        let line = rect(bg.left + G::BUTTON_RADIUS, bg.bottom - 1.0, w - 2.0 * G::BUTTON_RADIUS, 1.0);
+                        ctx.FillRectangle(&line, &self.brush((c.0, c.1, c.2, c.3 * k))?);
                     }
                 }
                 if b.focused {

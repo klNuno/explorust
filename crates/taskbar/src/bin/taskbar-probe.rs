@@ -3,23 +3,26 @@
 //!
 //! `click:x,y` `mclick:x,y` `sclick:x,y` (Shift+click) `move:x,y` `wait:<s>` `fg` (foreground
 //! title) `state:<title part>` (rect, minimized) `max:<title part>` `restore:<title part>`
-//! `close:<title part>` `workarea` `shutdown` (bus Shutdown to the taskbar).
+//! `close:<title part>` `workarea` `shutdown` (bus Shutdown to the taskbar) `run:<file or uri>`
+//! `win:<key>` (Win+key, a digit or letter) `shot:<name>` (the screen to `<name>.bmp` beside the exe).
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 #[cfg(target_os = "windows")]
 fn main() {
     use std::io::Write;
-    let mut out = vec![format!("--- {:?}", std::env::args().skip(1).collect::<Vec<_>>())];
+    let path = std::env::current_exe().unwrap_or_default().with_file_name("taskbar-probe.log");
+    let log = |line: String| {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{line}");
+        }
+    };
+    log(format!("--- {:?}", std::env::args().skip(1).collect::<Vec<_>>()));
     for arg in std::env::args().skip(1) {
         let (cmd, val) = arg.split_once(':').unwrap_or((arg.as_str(), ""));
         let line = probe::step(cmd, val);
-        out.push(format!("{arg}: {line}"));
+        log(format!("{arg}: {line}"));
         std::thread::sleep(std::time::Duration::from_millis(120));
-    }
-    let path = std::env::current_exe().unwrap_or_default().with_file_name("taskbar-probe.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{}", out.join("\r\n"));
     }
 }
 
@@ -98,8 +101,63 @@ mod probe {
                 let _ = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut r as *mut _ as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) };
                 format!("{},{} {}x{}", r.left, r.top, r.right - r.left, r.bottom - r.top)
             }
+            "run" => {
+                let f: Vec<u16> = val.encode_utf16().chain(Some(0)).collect();
+                // SAFETY: opens a file or URI through the shell.
+                let r = unsafe { windows::Win32::UI::Shell::ShellExecuteW(None, windows_core::w!("open"), windows_core::PCWSTR(f.as_ptr()), None, None, SW_SHOWNORMAL) };
+                format!("{}", r.0 as isize)
+            }
+            "win" => {
+                let Some(c) = val.chars().next() else { return "no key".into() };
+                // SAFETY: input injection.
+                unsafe {
+                    key(VK_LWIN, false);
+                    key(VIRTUAL_KEY(c.to_ascii_uppercase() as u16), false);
+                    key(VIRTUAL_KEY(c.to_ascii_uppercase() as u16), true);
+                    key(VK_LWIN, true);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                format!("sent, foreground {}", title(unsafe { GetForegroundWindow() }))
+            }
+            "shot" => shot(val),
             "shutdown" => format!("posted={}", bus::post_to(bus::Owner::Taskbar, bus::Command::Shutdown, 0)),
             _ => "unknown step".into(),
+        }
+    }
+
+    /// Saves the screen as a 24-bit BMP beside the exe.
+    fn shot(name: &str) -> String {
+        use windows::Win32::Graphics::Gdi::*;
+        // SAFETY: GDI capture of the screen into a DIB we own and free.
+        unsafe {
+            let (w, h) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(mem, bmp.into());
+            let _ = BitBlt(mem, 0, 0, w, h, Some(screen), 0, 0, SRCCOPY | CAPTUREBLT);
+            SelectObject(mem, old);
+            let stride = ((w * 3 + 3) & !3) as usize;
+            let mut px = vec![0u8; stride * h as usize];
+            let mut info = BITMAPINFO::default();
+            info.bmiHeader = BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: h, biPlanes: 1, biBitCount: 24, biCompression: BI_RGB.0, ..Default::default() };
+            GetDIBits(mem, bmp, 0, h as u32, Some(px.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            let mut f = Vec::with_capacity(54 + px.len());
+            f.extend_from_slice(b"BM");
+            f.extend_from_slice(&((54 + px.len()) as u32).to_le_bytes());
+            f.extend_from_slice(&0u32.to_le_bytes());
+            f.extend_from_slice(&54u32.to_le_bytes());
+            let ih = std::slice::from_raw_parts(&info.bmiHeader as *const _ as *const u8, 40);
+            f.extend_from_slice(ih);
+            f.extend_from_slice(&px);
+            let path = std::env::current_exe().unwrap_or_default().with_file_name(format!("{name}.bmp"));
+            match std::fs::write(&path, f) {
+                Ok(()) => format!("saved {}", path.display()),
+                Err(e) => format!("{e}"),
+            }
         }
     }
 

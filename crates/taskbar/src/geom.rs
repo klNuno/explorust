@@ -15,9 +15,9 @@ pub const ACTIVE_W: f32 = 16.0;
 pub const START_SQ: f32 = 11.0;
 pub const START_TOP: f32 = 13.0;
 /// Clock: right edge of the text from the bar's right end, baselines from the top.
-pub const CLOCK_RIGHT: f32 = 20.0;
+pub const CLOCK_RIGHT: f32 = 19.0;
 pub const LINE1_BASELINE: f32 = 20.0;
-pub const LINE2_BASELINE: f32 = 37.0;
+pub const LINE2_BASELINE: f32 = 36.0;
 pub const TEXT_PX: f32 = 12.0;
 /// Width of the clock's click area from the bar's right end.
 pub const CLOCK_HIT_W: f32 = 100.0;

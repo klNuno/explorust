@@ -14,6 +14,8 @@ pub struct Theme {
     /// Fill of the active app's button, and its 1 px stroke.
     pub active_bg: Rgba,
     pub active_stroke: Rgba,
+    /// Extra darkening of the stroke's bottom edge (Windows' elevation border).
+    pub active_stroke_bottom: Rgba,
     /// Added on hover (scaled by the hover fade).
     pub hover_bg: Rgba,
     pub press_bg: Rgba,
@@ -33,6 +35,7 @@ impl Theme {
                 text: (0, 0, 0, 0.896),
                 active_bg: (255, 255, 255, 0.53),
                 active_stroke: (0, 0, 0, 0.03),
+                active_stroke_bottom: (0, 0, 0, 0.06),
                 hover_bg: (255, 255, 255, 0.53),
                 press_bg: (255, 255, 255, 0.30),
                 attention_bg: (255, 140, 0, 0.35),
@@ -48,6 +51,7 @@ impl Theme {
                 text: (255, 255, 255, 1.0),
                 active_bg: (255, 255, 255, 0.07),
                 active_stroke: (255, 255, 255, 0.0),
+                active_stroke_bottom: (255, 255, 255, 0.0),
                 hover_bg: (255, 255, 255, 0.09),
                 press_bg: (255, 255, 255, 0.05),
                 attention_bg: (255, 140, 0, 0.30),
