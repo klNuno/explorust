@@ -22,7 +22,7 @@ fn main() {
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
     }
     let viewport = egui::ViewportBuilder::default()
-        .with_title("shellac taskbar B")
+        .with_title("explorust taskbar B")
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(false)
@@ -33,7 +33,7 @@ fn main() {
         .with_inner_size([w as f32, shelldata::layout::BAR_H]);
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     let r = eframe::run_native(
-        "shellac taskbar B",
+        "explorust taskbar B",
         options,
         Box::new(move |cc| Ok(Box::new(bar::Bar::new(cc, w as f32, secs, bench)))),
     );

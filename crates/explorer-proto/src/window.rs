@@ -67,15 +67,15 @@ pub fn run(o: Opts) -> windows_core::Result<()> {
         let class = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: inst.into(),
-            lpszClassName: w!("ShellacExplorerProto"),
+            lpszClassName: w!("ExplorustExplorerProto"),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             ..Default::default()
         };
         RegisterClassW(&class);
         let hwnd = CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-            w!("ShellacExplorerProto"),
-            w!("shellac explorer"),
+            w!("ExplorustExplorerProto"),
+            w!("explorust explorer"),
             WS_OVERLAPPEDWINDOW,
             o.x,
             o.y,

@@ -1,4 +1,4 @@
-//! Rendering layer for shellac maquettes: Direct2D 1.1 on a composition swap chain hosted
+//! Rendering layer for explorust maquettes: Direct2D 1.1 on a composition swap chain hosted
 //! by DirectComposition, DirectWrite text, and the DWM backdrop under it.
 
 pub mod backdrop;

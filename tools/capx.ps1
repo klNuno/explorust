@@ -154,11 +154,11 @@ if ($Proto) {
   Start-Sleep -Milliseconds 300
   $protoPid = [X]::Launch("`"$Proto`" --x $PX --y $Y --w $W --h $H --secs 9 --select $PSelect --hover $PHover")
   $sw2 = [Diagnostics.Stopwatch]::StartNew()
-  while (-not ([X]::Top("ShellacExplorerProto") | ? { [X]::IsWindowVisible($_) }) -and $sw2.ElapsedMilliseconds -lt 6000) { Start-Sleep -Milliseconds 5 }
+  while (-not ([X]::Top("ExplorustExplorerProto") | ? { [X]::IsWindowVisible($_) }) -and $sw2.ElapsedMilliseconds -lt 6000) { Start-Sleep -Milliseconds 5 }
   $log += "proto pid=$protoPid window_seen_ms=$($sw2.ElapsedMilliseconds)"
   Start-Sleep -Milliseconds 2500
 } else { Start-Sleep -Milliseconds 600 }
-$ph = if ($Proto) { [X]::Find("ShellacExplorerProto") } else { [IntPtr]::Zero }
+$ph = if ($Proto) { [X]::Find("ExplorustExplorerProto") } else { [IntPtr]::Zero }
 $ok = $false
 for ($a = 1; $a -le 2 -and -not $ok; $a++) {
   if ($hwnd -ne [IntPtr]::Zero) { [X]::SetWindowPos($hwnd, [IntPtr]::Zero, 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0010) | Out-Null }

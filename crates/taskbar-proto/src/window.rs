@@ -35,15 +35,15 @@ pub fn run(o: Opts) -> windows_core::Result<()> {
         let class = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: inst.into(),
-            lpszClassName: w!("ShellacTaskbarProto"),
+            lpszClassName: w!("ExplorustTaskbarProto"),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             ..Default::default()
         };
         RegisterClassW(&class);
         let hwnd = CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-            w!("ShellacTaskbarProto"),
-            w!("shellac taskbar A"),
+            w!("ExplorustTaskbarProto"),
+            w!("explorust taskbar A"),
             WS_POPUP,
             o.x,
             o.y,
