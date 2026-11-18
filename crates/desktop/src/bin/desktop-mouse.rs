@@ -1,6 +1,7 @@
 //! desktop-mouse.exe: a guest test tool for the desktop. Clicks through SendInput from a process
 //! with no window. `desktop-mouse rclick:600,400 wait:1 dclick:40,40`: each argument is
-//! `move|click|rclick|dclick:<x>,<y>` in screen pixels, or `wait:<s>`. The window under each point
+//! `move|click|rclick|dclick:<x>,<y>` in screen pixels, `wait:<s>`, or `workarea:<bottom>` (sets
+//! the primary monitor's work area bottom edge, not saved, as a taskbar would; logs the old one). The window under each point
 //! and the foreground go to `desktop-mouse.log` beside the exe.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
@@ -18,6 +19,10 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs_f32(s.parse().unwrap_or(1.0)));
                 format!("{arg}: ok")
             }
+            Some(("workarea", b)) => match b.parse() {
+                Ok(b) => format!("{arg}: {}", win::work_area(b)),
+                Err(_) => format!("{arg}: bad bottom"),
+            },
             Some((what, at)) => match at.split_once(',').and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?))) {
                 Some((x, y)) => win::act(what, x, y).map_or_else(|e| format!("{arg}: {e}"), |s| format!("{arg}: {s}")),
                 None => format!("{arg}: bad point"),
@@ -47,6 +52,23 @@ mod win {
         GetClassNameW, GetForegroundWindow, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
         SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WindowFromPoint,
     };
+
+    /// Sets the primary work area's bottom edge (SPIF_SENDCHANGE, not written to the profile).
+    pub fn work_area(bottom: i32) -> String {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SPI_GETWORKAREA, SPI_SETWORKAREA, SPIF_SENDCHANGE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+        };
+        let mut rc = RECT::default();
+        // SAFETY: RECT in and out of SystemParametersInfo.
+        unsafe {
+            let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some((&mut rc as *mut RECT).cast()), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+            let was = format!("was {},{},{},{}", rc.left, rc.top, rc.right, rc.bottom);
+            rc.bottom = bottom;
+            let r = SystemParametersInfoW(SPI_SETWORKAREA, 0, Some((&mut rc as *mut RECT).cast()), SPIF_SENDCHANGE);
+            format!("{was}, set bottom {bottom}: {r:?}")
+        }
+    }
 
     fn input(x: i32, y: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
         // SAFETY: plain metric queries.

@@ -52,15 +52,15 @@ pub fn settings() -> Settings {
     .is_ok();
     let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     let set = if ok { String::from_utf16_lossy(&buf[..n]) } else { String::new() };
+    // Explorer draws Windows' transcoded copy, not the source file: it matches explorer's capture
+    // closer (mean gray diff 4.6 against 5.8 from the source, ffmpeg scaled).
+    let transcoded = std::env::var_os("APPDATA")
+        .map(|a| PathBuf::from(a).join(r"Microsoft\Windows\Themes\TranscodedWallpaper"))
+        .filter(|p| p.exists());
     let path = if set.is_empty() {
         None
-    } else if std::path::Path::new(&set).exists() {
-        Some(PathBuf::from(set))
     } else {
-        // The source was moved or deleted: Windows keeps the copy it shows here.
-        std::env::var_os("APPDATA")
-            .map(|a| PathBuf::from(a).join(r"Microsoft\Windows\Themes\TranscodedWallpaper"))
-            .filter(|p| p.exists())
+        transcoded.or_else(|| Some(PathBuf::from(&set)).filter(|p| p.exists()))
     };
     let num = |v: &str| reg::string(r"Control Panel\Desktop", v).and_then(|s| s.trim().parse::<u32>().ok());
     let fit = Fit::from_registry(num("WallpaperStyle").unwrap_or(10), num("TileWallpaper").unwrap_or(0));
