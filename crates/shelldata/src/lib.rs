@@ -1,11 +1,19 @@
 //! Real shell data for the maquettes: pinned and running taskbar apps with their icons,
-//! the system clock, and in-process bench counters. Windows only.
+//! the system clock, and in-process bench counters. The data modules are Windows only;
+//! `layout` and `taskband` are plain logic and build everywhere.
 
+#[cfg(target_os = "windows")]
 pub mod apps;
+#[cfg(target_os = "windows")]
 pub mod bench;
+#[cfg(target_os = "windows")]
 pub mod clock;
+#[cfg(target_os = "windows")]
 pub mod icons;
+#[cfg(target_os = "windows")]
+pub mod items;
 pub mod layout;
+pub mod taskband;
 
 /// A 32-bit BGRA image with straight (non-premultiplied) alpha, rows top-down.
 #[derive(Clone)]

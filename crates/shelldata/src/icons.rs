@@ -7,15 +7,27 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC,
 };
 use windows::Win32::UI::Shell::{
-    IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
 };
-use windows_core::PCWSTR;
+use windows_core::{Interface, PCWSTR};
 
 /// Icon of a file, shortcut or exe at `size` px. COM must be initialised on this thread.
 pub fn icon_for_path(path: &str, size: i32) -> Option<Image> {
     unsafe {
         let w = wide(path);
         let factory: IShellItemImageFactory = SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None).ok()?;
+        icon_from_factory(&factory, size)
+    }
+}
+
+/// Icon of any shell item (an AppsFolder app, a pinned shortcut) at `size` px.
+pub fn icon_for_item(item: &IShellItem, size: i32) -> Option<Image> {
+    let factory: IShellItemImageFactory = item.cast().ok()?;
+    icon_from_factory(&factory, size)
+}
+
+fn icon_from_factory(factory: &IShellItemImageFactory, size: i32) -> Option<Image> {
+    unsafe {
         let hbmp = factory
             .GetImage(SIZE { cx: size, cy: size }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
             .ok()?;
