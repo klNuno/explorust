@@ -14,6 +14,7 @@
 //! runs its message loop and returns on `bus::Command::Shutdown` or `WM_QUIT`.
 
 pub mod model;
+pub mod seen;
 
 #[cfg(target_os = "windows")]
 mod log;
@@ -36,6 +37,22 @@ pub fn dev_shell_ready() {
 #[cfg(target_os = "windows")]
 pub fn helper(parent: u32, hwnd: isize) -> i32 {
     win::helper::run(parent, hwnd)
+}
+
+/// `explorust-notify.exe --toast <text>` (dev): a toast sent as the helper's package.
+#[cfg(target_os = "windows")]
+pub fn helper_toast(text: &str) -> i32 {
+    win::helper::toast(text)
+}
+
+/// Dev: activates the helper through its package so that it sends a toast (`helper_toast`).
+#[cfg(target_os = "windows")]
+pub fn dev_toast(text: &str) -> bool {
+    // SAFETY: COM for this dev process's only thread.
+    let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+    let r = win::helper::activate(&format!("--toast \"{}\"", text.replace('"', "'")));
+    log::line(&format!("notify-dev: toast through {}: {r:?}", win::helper::AUMID));
+    r.is_ok()
 }
 
 /// Runs the component until shutdown.

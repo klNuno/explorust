@@ -1,7 +1,8 @@
 //! notify-dev.exe: runs explorust's toasts beside the running shell. `--post center|clipboard|emoji
 //! [arg]` sends that bus command to a running notify instead (test sessions where the shell's
-//! hotkey hook does not see the keys). `--shell-ready` publishes the shell-ready signal twinui's
-//! notification center waits for, when nobody did in this session.
+//! hotkey hook does not see the keys). `--toast <text>` sends a toast as the helper's package.
+//! `--shell-ready` publishes the shell-ready signal twinui's notification center waits for, when
+//! nobody did in this session.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -13,6 +14,10 @@ fn main() {
         let n = |k: usize, d: u64| args.get(i + k).and_then(|a| a.parse().ok()).unwrap_or(d);
         notify::dev_wnf_scan(std::path::Path::new(out), n(2, 6), n(3, 10));
         return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--toast") {
+        let text = args.get(i + 1).map(String::as_str).unwrap_or("toast from explorust-notify.exe");
+        std::process::exit(if notify::dev_toast(text) { 0 } else { 1 });
     }
     if args.iter().any(|a| a == "--shell-ready") {
         notify::dev_shell_ready();

@@ -5,7 +5,7 @@ use crate::log;
 use super::{helper, wnf};
 use crate::model::Toast;
 use std::ffi::c_void;
-use std::collections::HashSet;
+use crate::seen::Seen;
 use windows::Foundation::TypedEventHandler;
 use windows::UI::Notifications::Management::{UserNotificationListener, UserNotificationListenerAccessStatus};
 use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds, UserNotification, UserNotificationChangedKind};
@@ -64,19 +64,25 @@ fn listen(target: HWND) {
             Err(e) => return log::line(&format!("listener: access request failed: {e}")),
         }
     }
-    let existing = listener
+    let at_start: Vec<u32> = listener
         .GetNotificationsAsync(NotificationKinds::Toast)
         .and_then(|op| op.join())
-        .map(|v| v.Size().unwrap_or(0))
-        .unwrap_or(0);
+        .map(|v| v.into_iter().filter_map(|n| n.Id().ok()).collect())
+        .unwrap_or_default();
+    let existing = at_start.len();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Seen::start(at_start)));
     let target_bits = target.0 as isize;
     let handler = TypedEventHandler::new(move |l: windows_core::Ref<UserNotificationListener>, args: windows_core::Ref<windows::UI::Notifications::UserNotificationChangedEventArgs>| {
         let (Some(l), Some(args)) = (l.as_ref(), args.as_ref()) else { return Ok(()) };
         let id = args.UserNotificationId()?;
         let target = HWND(target_bits as _);
         if args.ChangeKind()? == UserNotificationChangedKind::Removed {
+            seen.lock().map(|mut s| s.gone(id)).ok();
             // SAFETY: posting to our UI window; a stale handle only fails the call.
             let _ = unsafe { PostMessageW(Some(target), MSG_REMOVED, WPARAM(id as usize), LPARAM(0)) };
+            return Ok(());
+        }
+        if !seen.lock().map(|mut s| s.fresh(id)).unwrap_or(true) {
             return Ok(());
         }
         match l.GetNotification(id).and_then(|n| read(&n)) {
@@ -114,7 +120,7 @@ fn watch(listener: &UserNotificationListener, target: HWND) {
             .unwrap_or_default()
     };
     let t0 = std::time::Instant::now();
-    let mut seen: HashSet<u32> = ids(listener).into_iter().map(|(id, _)| id).collect();
+    let mut seen = Seen::start(ids(listener).into_iter().map(|(id, _)| id));
     let first_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let _ = LISTENER.set(std::thread::current());
     let mut helper = start_helper(target);
@@ -142,27 +148,24 @@ fn watch(listener: &UserNotificationListener, target: HWND) {
         for attempt in 0..2 {
             let t = std::time::Instant::now();
             let now = ids(listener);
-            let now_ids: HashSet<u32> = now.iter().map(|(id, _)| *id).collect();
-            let mut changed = false;
-            for (id, n) in &now {
-                if seen.contains(id) {
-                    continue;
-                }
-                changed = true;
+            let diff = seen.update(now.iter().map(|(id, _)| *id));
+            let changed = !(diff.added.is_empty() && diff.removed.is_empty() && diff.returned.is_empty());
+            for (id, n) in now.iter().filter(|(id, _)| diff.added.contains(id)) {
                 match read(n) {
                     Ok(t) => post_added(target, t),
                     Err(e) => log::line(&format!("listener: notification {id} unreadable: {e}")),
                 }
             }
-            for id in seen.difference(&now_ids) {
-                changed = true;
+            for id in &diff.removed {
                 // SAFETY: posting to our UI window; a stale handle only fails the call.
                 let _ = unsafe { PostMessageW(Some(target), MSG_REMOVED, WPARAM(*id as usize), LPARAM(0)) };
+            }
+            if !diff.returned.is_empty() {
+                log::line(&format!("listener: {:?} back in the center, already seen: no card", diff.returned));
             }
             if woken {
                 log::line(&format!("listener: diff {attempt} in {:.1} ms, changed {changed}", t.elapsed().as_secs_f64() * 1000.0));
             }
-            seen = now_ids;
             if changed || !woken {
                 break;
             }

@@ -224,8 +224,12 @@ fn added(toast: Toast) {
     log::line(&format!("toast shown in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
 }
 
-/// Windows' "Dismiss notifications after this amount of time" (Accessibility), 5 s by default.
+/// Windows' "Dismiss notifications after this amount of time" (Accessibility), 5 s by default;
+/// `EXPLORUST_NOTIFY_HOLD_S` (dev only) holds a card longer, long enough for a capture.
 fn duration_ms() -> u32 {
+    if let Some(s) = std::env::var("EXPLORUST_NOTIFY_HOLD_S").ok().and_then(|v| v.parse::<u32>().ok()).filter(|s| *s > 0) {
+        return s.saturating_mul(1000);
+    }
     let mut secs = 0u32;
     // SAFETY: reads one u32.
     let ok = unsafe { SystemParametersInfoW(SPI_GETMESSAGEDURATION, 0, Some(&mut secs as *mut _ as _), Default::default()) }.is_ok();
