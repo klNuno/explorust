@@ -2,6 +2,7 @@
 //! Win+Tab, Win+N, Win+X, Win+1..9 and the rest, plus Alt+Tab. A low-level keyboard hook on its own
 //! thread turns them into bus commands. A chord is swallowed only when a part answers it, so Win+A
 //! (answered by Windows' own quick settings host) and anything unowned pass through untouched.
+//! While Alt+Tab is open, the arrows, Enter and Delete drive it as in Windows.
 //! Ctrl+Win+D/Left/Right/F4 drive virtual desktops; Win+R, Win+I, Win+Shift+S and a few more are
 //! one-line shell actions. Win+L and Ctrl+Alt+Del never reach a hook.
 
@@ -10,7 +11,7 @@ use bus::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, MSG,
+    ASFW_ANY, AllowSetForegroundWindow, CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, MSG,
     SetWindowsHookExW, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
@@ -25,6 +26,12 @@ static SWITCHING: AtomicBool = AtomicBool::new(false);
 static SWALLOWED: AtomicU32 = AtomicU32::new(0);
 
 const VK_TAB: u32 = 0x09;
+const VK_RETURN: u32 = 0x0D;
+const VK_LEFT: u32 = 0x25;
+const VK_UP: u32 = 0x26;
+const VK_RIGHT: u32 = 0x27;
+const VK_DOWN: u32 = 0x28;
+const VK_DELETE: u32 = 0x2E;
 const VK_SHIFT: u32 = 0x10;
 const VK_CTRL: u32 = 0x11;
 const VK_LCTRL: u32 = 0xA2;
@@ -82,7 +89,7 @@ fn win_chord(vk: u32, ctrl: bool, shift: bool) -> Option<WinChord> {
         0x53 => Bus(Command::Search, 0),                // S
         VK_TAB => Bus(Command::TaskView, 0),            // Tab
         0x4E => Bus(Command::NotificationCenter, 0),    // N
-        0x41 => Bus(Command::QuickSettings, 0),         // A
+        // Win+A stays with Windows' own quick settings host until the notify part answers it.
         0x58 => Bus(Command::WinX, 0),                  // X
         0x31..=0x39 => Bus(Command::TaskbarNth, (vk - 0x30) as isize), // 1..9
         0x54 => Bus(Command::TaskbarFocus, 0),          // T
@@ -137,7 +144,7 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
             } else {
                 WIN.store(false, Relaxed);
                 if !WIN_USED.swap(true, Relaxed) {
-                    bus::post(Command::StartToggle, 0);
+                    post(Command::StartToggle, 0);
                 }
             }
             return None;
@@ -154,18 +161,50 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
     if WIN.load(Relaxed) {
         WIN_USED.store(true, Relaxed);
         let handled = match win_chord(vk, CTRL.load(Relaxed), SHIFT.load(Relaxed))? {
-            WinChord::Bus(cmd, arg) => bus::post(cmd, arg),
+            WinChord::Bus(cmd, arg) => {
+                let ok = post(cmd, arg);
+                if !ok {
+                    log::line(&format!("hotkeys: {cmd:?} has no owner, Win+{vk:#x} passed through"));
+                }
+                ok
+            }
             WinChord::Action(a) => actions::send(a),
         };
         return handled.then(|| swallow(vk));
     }
-    if vk == VK_TAB && alt && bus::post(Command::SwitcherNext, SHIFT.load(Relaxed) as isize) {
+    if vk == VK_TAB && alt && post(Command::SwitcherNext, SHIFT.load(Relaxed) as isize) {
         SWITCHING.store(true, Relaxed);
         return Some(swallow(vk));
     }
-    if vk == VK_ESC && SWITCHING.swap(false, Relaxed) {
-        bus::post(Command::SwitcherCancel, 0);
-        return Some(swallow(vk));
+    if !SWITCHING.load(Relaxed) {
+        return None;
     }
-    None
+    let (cmd, arg) = switcher_key(vk)?;
+    if matches!(cmd, Command::SwitcherCancel | Command::SwitcherCommit) {
+        SWITCHING.store(false, Relaxed);
+    }
+    post(cmd, arg);
+    Some(swallow(vk))
+}
+
+/// What a key does while Alt+Tab is open.
+fn switcher_key(vk: u32) -> Option<(Command, isize)> {
+    Some(match vk {
+        VK_ESC => (Command::SwitcherCancel, 0),
+        VK_RETURN => (Command::SwitcherCommit, 0),
+        VK_LEFT => (Command::SwitcherMove, 0),
+        VK_RIGHT => (Command::SwitcherMove, 1),
+        VK_UP => (Command::SwitcherMove, 2),
+        VK_DOWN => (Command::SwitcherMove, 3),
+        VK_DELETE => (Command::SwitcherClose, 0),
+        _ => return None,
+    })
+}
+
+/// Posts a command, first letting its part take the foreground: the key went to the hook, not to
+/// the part, so Windows would otherwise refuse the window the part brings up.
+fn post(cmd: Command, arg: isize) -> bool {
+    // SAFETY: plain call; it only widens who may set the foreground until the next input.
+    let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+    bus::post(cmd, arg)
 }

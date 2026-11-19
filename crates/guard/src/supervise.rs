@@ -3,7 +3,7 @@
 
 use crate::policy::{Next, Policy, ready_timeout};
 use crate::proc::{Child, Event, wait_any};
-use crate::{hotkey, log, reg};
+use crate::{folders, hotkey, log, reg};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -97,6 +97,7 @@ fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &E
         Some(0) => return End::Failed(format!("exited before ready, code {}", child.exit_code())),
         Some(1) => {
             log::line(&format!("explorust ready (self-test: {self_test})"));
+            folders::handler(true);
             if self_test && let Err(e) = reg::set_last_good_build(build) {
                 log::line(&format!("could not record the good build: {e}"));
             }
@@ -161,6 +162,7 @@ pub fn explorer_path() -> PathBuf {
 /// Keeps a plain explorer.exe running as the shell for the rest of the session, restarting it when it
 /// ends (at most 5 times in 5 minutes).
 fn explorer_forever() -> u32 {
+    folders::handler(false);
     let path = explorer_path();
     let mut starts: Vec<Instant> = Vec::new();
     loop {

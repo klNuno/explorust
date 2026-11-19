@@ -455,6 +455,51 @@ fn on_next(back: bool) {
     }
 }
 
+/// An arrow key while Alt is held: Left and Right step like Shift+Tab and Tab, Up and Down go to
+/// the nearest tile of the next row.
+fn on_move(dir: isize) {
+    match dir {
+        0 => on_next(true),
+        1 => on_next(false),
+        2 | 3 => {
+            with(|s| {
+                if s.phase == Phase::Idle {
+                    return;
+                }
+                if let Some(i) = s.layout.vertical(s.sel, dir == 3) {
+                    s.select(i);
+                }
+            });
+        }
+        _ => {}
+    }
+}
+
+/// Delete while Alt is held: closes the selected window, as its close button does.
+fn close_selected() {
+    let Some((h, title)) = with(|s| {
+        if s.phase == Phase::Idle {
+            return None;
+        }
+        s.entries.get(s.sel).map(|e| (e.hwnd, e.title.clone()))
+    })
+    .flatten() else {
+        return;
+    };
+    close_window(h, &title, "delete key");
+}
+
+fn close_window(h: HWND, title: &str, why: &str) {
+    // SAFETY: asks the window to close, as its own close button does.
+    let _ = unsafe { PostMessageW(Some(h), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0)) };
+    log::line(&format!("close ({why}): {title:?}"));
+    with(|s| {
+        s.refreshes = 0;
+        // SAFETY: a timer on our own window.
+        unsafe { SetTimer(Some(s.panel), T_REFRESH, 150, None) };
+    });
+}
+
 fn mask_alt() {
     let key = |up: bool| INPUT {
         r#type: INPUT_KEYBOARD,
@@ -545,6 +590,8 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 Some((bus::Command::SwitcherNext, arg)) => on_next(arg == 1),
                 Some((bus::Command::SwitcherCommit, _)) => commit("alt up"),
                 Some((bus::Command::SwitcherCancel, _)) => cancel(),
+                Some((bus::Command::SwitcherMove, dir)) => on_move(dir),
+                Some((bus::Command::SwitcherClose, _)) => close_selected(),
                 Some((bus::Command::TaskView, _)) => crate::taskview::toggle(),
                 Some((bus::Command::SnapLayouts, _)) => crate::snap::toggle(),
                 Some((bus::Command::DesktopNew, _)) => crate::desktops::new_desktop(),
@@ -645,16 +692,7 @@ fn on_click(lp: LPARAM) {
     match act {
         Act::None => {}
         Act::Commit => commit("click"),
-        Act::Close(h, title) => {
-            // SAFETY: asks the window to close, as its own close button does.
-            let _ = unsafe { PostMessageW(Some(h), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0)) };
-            log::line(&format!("close button: {title:?}"));
-            with(|s| {
-                s.refreshes = 0;
-                // SAFETY: a timer on our own window.
-                unsafe { SetTimer(Some(s.panel), T_REFRESH, 150, None) };
-            });
-        }
+        Act::Close(h, title) => close_window(h, &title, "close button"),
     }
 }
 

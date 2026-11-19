@@ -10,6 +10,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod folders;
 mod hotkey;
 mod log;
 mod policy;
@@ -114,6 +115,7 @@ fn restore() -> u32 {
             1
         }
     };
+    folders::handler(false);
     let _ = proc::Event::set_existing(supervise::FALLBACK_EVENT);
     code
 }

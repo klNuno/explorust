@@ -55,6 +55,10 @@ pub enum Command {
     ClipboardHistory = 20,
     /// Win+. and Win+;.
     EmojiPanel = 21,
+    /// An arrow key while the switcher is open: lParam 0 left, 1 right, 2 up, 3 down.
+    SwitcherMove = 22,
+    /// Delete while the switcher is open: close the selected window.
+    SwitcherClose = 23,
 }
 
 impl Command {
@@ -82,6 +86,8 @@ impl Command {
             19 => SnapLayouts,
             20 => ClipboardHistory,
             21 => EmojiPanel,
+            22 => SwitcherMove,
+            23 => SwitcherClose,
             _ => return None,
         })
     }
@@ -91,8 +97,8 @@ impl Command {
         use Command::*;
         match self {
             StartToggle | Search => Owner::Start,
-            TaskView | SwitcherNext | SwitcherCommit | SwitcherCancel | DesktopNew | DesktopSwitch
-            | DesktopClose | SnapLayouts => Owner::Switcher,
+            TaskView | SwitcherNext | SwitcherCommit | SwitcherCancel | SwitcherMove | SwitcherClose
+            | DesktopNew | DesktopSwitch | DesktopClose | SnapLayouts => Owner::Switcher,
             NotificationCenter | QuickSettings | ClipboardHistory | EmojiPanel => Owner::Notify,
             WinX | TaskbarNth | TaskbarFocus | TrayFocus => Owner::Taskbar,
             FilesOpen => Owner::Files,
@@ -189,11 +195,11 @@ mod tests {
 
     #[test]
     fn every_command_round_trips() {
-        for v in 1..=21 {
+        for v in 1..=23 {
             let c = Command::from_u32(v).unwrap();
             assert_eq!(c as u32, v);
         }
         assert!(Command::from_u32(0).is_none());
-        assert!(Command::from_u32(22).is_none());
+        assert!(Command::from_u32(24).is_none());
     }
 }

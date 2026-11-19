@@ -6,11 +6,12 @@
 # Usage: tools/g1-deploy.sh [--guard]
 set -eu
 cd /home/boite/projects/explorust
-os job run --wait -- cargo build --release --target x86_64-pc-windows-gnu -p shell -p guard -p devkeys
+os job run --wait -- cargo build --release --target x86_64-pc-windows-gnu -p shell -p guard -p devkeys -p files
 t=target/x86_64-pc-windows-gnu/release
 mkdir -p dist
 cp "$t/explorust.exe" dist/explorust.next.exe
-cp "$t/explorust.exe" "$t/explorust-guard.exe" "$t/keys.exe" tools/g1-state.ps1 dist/
+cp "$t/explorust.exe" "$t/explorust-guard.exe" "$t/keys.exe" "$t/explorust-open.exe" tools/g1-state.ps1 dist/
+timeout 120 os win push g1 dist/explorust-open.exe 'C:\explorust' >/dev/null
 timeout 120 os win push g1 dist/explorust.next.exe 'C:\explorust' >/dev/null
 timeout 120 os win push g1 dist/keys.exe 'C:\explorust' >/dev/null
 timeout 120 os win push g1 dist/g1-state.ps1 'C:\explorust' >/dev/null

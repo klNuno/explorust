@@ -111,6 +111,8 @@ fn shell(args: &Args) -> i32 {
             }
         }
     }
+    // Dark menus and shell views for every part (uxtheme's app mode is process-wide).
+    files::dark_mode_for_process();
     actions::spawn();
     hotkeys::spawn();
     components::spawn_all();

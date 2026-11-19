@@ -90,6 +90,30 @@ impl Layout {
     pub fn hit(&self, x: f32, y: f32) -> Option<usize> {
         self.tiles.iter().position(|t| t.rect.contains(x, y))
     }
+    /// The tile in the row above (`down` false) or below `sel` whose center is nearest in x, as
+    /// Windows' Alt+Tab moves with Up and Down. None on the first or last row.
+    pub fn vertical(&self, sel: usize, down: bool) -> Option<usize> {
+        let cur = &self.tiles.get(sel)?.rect;
+        let cx = cur.x + cur.w / 2.0;
+        let row_y = self
+            .tiles
+            .iter()
+            .map(|t| t.rect.y)
+            .filter(|&y| if down { y > cur.y + 0.5 } else { y < cur.y - 0.5 })
+            .fold(None, |best: Option<f32>, y| match best {
+                Some(b) if (down && b <= y) || (!down && b >= y) => Some(b),
+                _ => Some(y),
+            })?;
+        self.tiles
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| (t.rect.y - row_y).abs() < 0.5)
+            .min_by(|(_, a), (_, b)| {
+                let d = |r: &Rect| (r.x + r.w / 2.0 - cx).abs();
+                d(&a.rect).total_cmp(&d(&b.rect))
+            })
+            .map(|(i, _)| i)
+    }
     /// Panel origin that centers it in a work area.
     pub fn origin(&self, area: Rect) -> (f32, f32) {
         (area.x + ((area.w - self.w) / 2.0).round(), area.y + ((area.h - self.h) / 2.0).round())
@@ -170,6 +194,24 @@ fn place(aspects: &[f32], rows: &[Vec<usize>], th: f32, total_h: f32) -> Layout 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn up_and_down_pick_the_nearest_tile_of_the_next_row() {
+        let t = |x: f32, y: f32| Tile { rect: Rect::new(x, y, 100.0, 80.0), thumb: Rect::default() };
+        // Row 0: three tiles; row 1: two tiles centered under them.
+        let l = Layout {
+            w: 340.0,
+            h: 200.0,
+            tiles: vec![t(0.0, 0.0), t(120.0, 0.0), t(240.0, 0.0), t(60.0, 100.0), t(180.0, 100.0)],
+        };
+        assert_eq!(l.vertical(0, true), Some(3));
+        assert_eq!(l.vertical(2, true), Some(4));
+        // Ties go to the leftmost tile.
+        assert_eq!(l.vertical(4, false), Some(1));
+        assert_eq!(l.vertical(3, false), Some(0));
+        assert_eq!(l.vertical(0, false), None);
+        assert_eq!(l.vertical(3, true), None);
+    }
 
     #[test]
     fn one_row_centered() {
