@@ -8,7 +8,7 @@ use windows::UI::Notifications::Management::UserNotificationListener;
 use windows::UI::Notifications::UserNotificationChangedEventArgs;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, WaitForSingleObject};
+use windows::Win32::System::Threading::{GetCurrentProcess, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 pub const EXE: &str = "explorust-notify.exe";
@@ -42,6 +42,10 @@ pub fn run(parent: u32, hwnd: isize) -> i32 {
             // SAFETY: a plain wait on our own handle; the listener stays alive meanwhile.
             unsafe { WaitForSingleObject(parent_handle, INFINITE) };
             log::line("helper: parent gone, exiting");
+            // Releasing the sinks and the subscription calls into WpnUserService, which kept the
+            // process alive after its parent left (g1, notify-6): end it without them.
+            // SAFETY: ends this process; nothing is left to flush (the log line is written).
+            unsafe { let _ = TerminateProcess(GetCurrentProcess(), 0); }
             0
         }
         Err(e) => {

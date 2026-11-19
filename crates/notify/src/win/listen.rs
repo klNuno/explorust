@@ -177,11 +177,12 @@ fn watch(listener: &UserNotificationListener, target: HWND) {
 const POLL_MS: u64 = 1000;
 const HELPER_CHECK_S: u64 = 60;
 
-/// Starts `explorust-notify.exe` and waits up to 5 s for its answer; its handle when it subscribed.
+/// Starts `explorust-notify.exe` and waits up to 15 s for its answer (its push channel sink alone
+/// may take 10 s); its handle when it subscribed.
 fn start_helper(target: HWND) -> Option<windows::Win32::Foundation::HANDLE> {
     let h = helper::start(target)?;
     let t0 = std::time::Instant::now();
-    while HELPER.load(std::sync::atomic::Ordering::Acquire) == 0 && t0.elapsed().as_secs() < 5 && helper::alive(h) {
+    while HELPER.load(std::sync::atomic::Ordering::Acquire) == 0 && t0.elapsed().as_secs() < 15 && helper::alive(h) {
         std::thread::park_timeout(std::time::Duration::from_millis(200));
     }
     if HELPER.load(std::sync::atomic::Ordering::Acquire) == 1 {
