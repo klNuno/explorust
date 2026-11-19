@@ -26,4 +26,7 @@ mod wrapper_inspect;
 mod xaml_islands;
 
 #[cfg(target_os = "windows")]
+pub use xaml_islands::islands_allowed;
+
+#[cfg(target_os = "windows")]
 pub use host::{run_embedded_host, run_host, run_managed_host};

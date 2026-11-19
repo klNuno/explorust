@@ -6,7 +6,9 @@
 //! refuses islands with E_UNEXPECTED (`CQuirksMode2::QuirkBlockXamlIslands`) unless the process is
 //! inbox or its manifest declares a `maxversiontested` of 10.0.18226 or later, and the
 //! confirmator turns that error into a fail-fast (combase, 0xC000027B, 8000ffff): the shell dies.
-//! The fix belongs in the exe's manifest; this module only logs the state at host start.
+//! The confirmator host is registered by twinui.dll's `CAudioFlyoutController::RegisterConfirmatorHost`
+//! (the volume flyout), so skipping a component is no fix. The fix belongs in the exe's manifest;
+//! this module logs the state at host start and answers `islands_allowed()`.
 
 /// XAML islands need a tested version of at least 10.0.18226 (Windows 10 1903 previews).
 pub(crate) const ISLANDS_MIN: u64 = (10 << 48) | (18226 << 16);
@@ -42,6 +44,15 @@ pub(crate) fn max_version_tested() -> Result<Option<u64>, String> {
         .filter(|i| buffer[1 + i * 4 + 2] as u32 == ELEMENT_MAXVERSIONTESTED)
         .map(|i| buffer[1 + i * 4 + 3])
         .max())
+}
+
+/// Whether this process may run XAML islands, so whether a virtual desktop switch is safe for
+/// the immersive shell hosted here (false: twinui's audio flyout hides its hardware confirmator
+/// through an island on the switch and fails fast). Callers such as the switcher gate desktop
+/// writes on it.
+#[cfg(target_os = "windows")]
+pub fn islands_allowed() -> bool {
+    matches!(max_version_tested(), Ok(Some(v)) if v >= ISLANDS_MIN)
 }
 
 pub(crate) fn format_version(v: u64) -> String {
