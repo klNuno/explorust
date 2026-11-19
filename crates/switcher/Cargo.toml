@@ -16,6 +16,7 @@ path = "src/bin/switcher-keys.rs"
 bus = { path = "../bus" }
 render = { path = "../render" }
 shelldata = { path = "../shelldata" }
+uwp-host = { path = "../uwp-host" }
 windows-core.workspace = true
 windows-numerics = "0.3.1"
 windows = { workspace = true, features = [

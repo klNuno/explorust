@@ -294,7 +294,8 @@ pub fn toggle() {
             let mon = MonitorFromWindow(if t.orig.is_invalid() { t.hwnd } else { t.orig }, MONITOR_DEFAULTTOPRIMARY);
             let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
             let _ = GetMonitorInfoW(mon, &mut mi);
-            t.mon = mi.rcMonitor;
+            // The work area, not the monitor: Windows 11 keeps the taskbar visible under Task View.
+            t.mon = mi.rcWork;
             let rc = t.mon;
             let _ = SetWindowPos(t.hwnd, Some(HWND_TOPMOST), rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOACTIVATE);
             t.scale = GetDpiForWindow(t.hwnd).max(96) as f32 / 96.0;

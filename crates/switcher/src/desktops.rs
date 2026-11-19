@@ -12,18 +12,22 @@ thread_local! {
 }
 
 /// Runs `f` on the service, connecting (or reconnecting once after an error) as needed.
-/// Changing desktops is off unless `EXPLORUST_VD_WRITE` is set: in g1, SwitchDesktop made
-/// explorust.exe (the process hosting the immersive shell) fail fast in combase.dll (8000ffff)
-/// 3 s later, twice, and the guard fell back to explorer. Reading the desktops is safe.
+/// Changing desktops needs the process to allow XAML islands (`maxversiontested` in the exe's
+/// manifest): without it, the hosted twinui's volume flyout fails fast in combase (8000ffff) on a
+/// switch and the shell dies (uwp-3, `crates/uwp-host/src/xaml_islands.rs`). `EXPLORUST_VD_WRITE=0`
+/// turns writes off; reading the desktops is always safe.
 pub fn writable() -> bool {
-    std::env::var_os("EXPLORUST_VD_WRITE").is_some()
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        std::env::var_os("EXPLORUST_VD_WRITE").is_none_or(|v| v != "0") && uwp_host::islands_allowed()
+    })
 }
 
 fn refuse(what: &str) -> bool {
     if writable() {
         return false;
     }
-    log::line(&format!("{what}: off, Windows' desktop switch crashes the shell's immersive shell (set EXPLORUST_VD_WRITE to try)"));
+    log::line(&format!("{what}: off (EXPLORUST_VD_WRITE=0, or XAML islands not allowed in this process: a switch would crash the hosted immersive shell)"));
     true
 }
 
