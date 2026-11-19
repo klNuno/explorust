@@ -8,8 +8,7 @@ use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
-use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, GetNamedPipeServerSessionId};
 
 /// FILE_GENERIC_READ plus FILE_WRITE_DATA: what the pipe's ACL grants the user (no
 /// FILE_APPEND_DATA, which on a pipe is the right to create an instance).
@@ -24,10 +23,11 @@ fn connect() -> io::Result<File> {
     let f = OpenOptions::new().read(true).write(true).access_mode(ACCESS).open(crate::PIPE)?;
     let h = HANDLE(f.as_raw_handle());
     let (mut pid, mut session) = (0u32, u32::MAX);
-    // SAFETY: queries on a handle owned by `f`, writing into locals.
+    // SAFETY: queries on a handle owned by `f`, writing into locals (a medium-integrity client
+    // cannot open the service's process, so the session comes from the pipe).
     unsafe {
         GetNamedPipeServerProcessId(h, &mut pid).map_err(io::Error::other)?;
-        ProcessIdToSessionId(pid, &mut session).map_err(io::Error::other)?;
+        GetNamedPipeServerSessionId(h, &mut session).map_err(io::Error::other)?;
     }
     if session != 0 {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("pipe served by pid {pid} in session {session}, not a service")));
