@@ -22,8 +22,9 @@ const CERT: &[u8] = include_bytes!("../res/explorust-codesign.cer");
 const STORES: [&str; 2] = ["Root", "TrustedPublisher"];
 /// What runs from the install folder: the guard, the shell, the folder handler, the UWP probe
 /// some host builds start beside explorust.exe, the toast listener's helper with its sparse
-/// package (`package.rs`), the UI-access keyboard hook and the file index service.
-const FILES: [&str; 9] = [
+/// package (`package.rs`), the UI-access keyboard hook, the file index service and the default
+/// handlers (image viewer, Task Manager for Win+X).
+const FILES: [&str; 11] = [
     "explorust-guard.exe",
     "explorust.exe",
     "explorust-open.exe",
@@ -33,6 +34,8 @@ const FILES: [&str; 9] = [
     "explorust-keys.exe",
     "explorust_inject.dll",
     INDEX,
+    crate::folders::VIEWER_EXE,
+    "explorust-taskman.exe",
 ];
 /// The MFT/USN index (`crates/index`), registered as the service `explorust-index`.
 const INDEX: &str = "explorust-index.exe";

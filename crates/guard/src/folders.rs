@@ -7,6 +7,9 @@ use crate::log;
 use crate::proc::{Child, wait_any};
 
 const OPEN_EXE: &str = "explorust-open.exe";
+/// The image viewer: `--register` lists it in Open with and Settings > Default apps for the user
+/// (it changes no default), `--unregister` removes those keys.
+pub const VIEWER_EXE: &str = "explorust-viewer.exe";
 
 /// `register` true: folders open in explorust; false: Windows' handler answers again. Waits up to
 /// 3 s for the helper so a fallback's explorer starts with the verbs already gone.
@@ -22,5 +25,21 @@ pub fn handler(register: bool) {
             log::line(&format!("folder handler {arg}: {}", if done { format!("exit {}", child.exit_code()) } else { "still running".into() }));
         }
         Err(e) => log::line(&format!("folder handler {arg}: {e}")),
+    }
+}
+
+/// Registers (or removes) the viewer found in `dir` for the current user; waits up to 3 s.
+pub fn viewer(dir: &std::path::Path, register: bool) {
+    let exe = dir.join(VIEWER_EXE);
+    if !exe.exists() {
+        return;
+    }
+    let arg = if register { "--register" } else { "--unregister" };
+    match Child::spawn(&exe, arg) {
+        Ok(child) => {
+            let done = wait_any(&[child.handle], Some(3000)).is_some();
+            log::line(&format!("viewer {arg}: {}", if done { format!("exit {}", child.exit_code()) } else { "still running".into() }));
+        }
+        Err(e) => log::line(&format!("viewer {arg}: {e}")),
     }
 }

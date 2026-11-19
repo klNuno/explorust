@@ -120,6 +120,7 @@ fn install() -> u32 {
         Ok(p) => say(&format!("install: notification helper package {p}, external location {}", dir.display())),
         Err(e) => say(&format!("install: notification helper package not installed ({e}); toasts are polled")),
     }
+    folders::viewer(&dir, true);
     match reg::set_shell(&format!("\"{}\"", guard.display())) {
         Ok(()) => {
             say(&format!("installed: next logon starts {}", guard.display()));
@@ -148,6 +149,7 @@ fn restore() -> u32 {
         }
     };
     folders::handler(false);
+    folders::viewer(&install::dir(), false);
     let _ = proc::Event::set_existing(supervise::FALLBACK_EVENT);
     match package::remove() {
         Ok(r) => say(&format!("restore: notification helper package {r}")),
