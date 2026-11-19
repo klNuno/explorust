@@ -109,14 +109,14 @@ fn open(cmd: HWND, path: Option<&str>, t0: Instant, queued_ms: u32) {
     };
     frame::set_opened(hwnd, t0);
     let before = t0.elapsed().as_secs_f64() * 1000.0;
-    let (show_ms, fg_ms, draw_ms) = frame::show(hwnd);
-    let presented = t0.elapsed().as_secs_f64() * 1000.0;
+    let (show_ms, draw_ms, activate_ms) = frame::show(hwnd);
+    let presented = before + show_ms + draw_ms;
     let _ = unsafe { DwmFlush() };
-    let shown = t0.elapsed().as_secs_f64() * 1000.0;
+    let composed = t0.elapsed().as_secs_f64() * 1000.0;
     log::line(&format!(
         "open {}: first frame presented {presented:.1} ms after the command ({from}, queued {queued_ms} ms; \
-         prepare {before:.1}, ShowWindow {show_ms:.1}, foreground {fg_ms:.1}, draw and Present {draw_ms:.1}), \
-         composed by {shown:.1} ms",
+         prepare {before:.1}, ShowWindow {show_ms:.1}, draw and Present {draw_ms:.1}), activated after it in \
+         {activate_ms:.1} ms, composed by {composed:.1} ms",
         path.unwrap_or("Home")
     ));
     if let Some(p) = later {

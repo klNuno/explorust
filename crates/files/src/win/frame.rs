@@ -169,23 +169,25 @@ pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
 }
 
 /// Shows a window made by `create`, draws its first frame and returns when it is presented.
-/// Returns where the time went: show, foreground, draw (ms).
+/// Shows the window without activating it, presents the chrome, then activates it (the view's
+/// focus work runs after the first frame). Returns where the time went: show, draw and Present,
+/// activation (ms).
 pub fn show(hwnd: HWND) -> (f64, f64, f64) {
     let t = Instant::now();
     let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
     unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        let _ = ShowWindow(hwnd, SW_SHOWNA);
     }
     let shown = ms(t);
+    with(hwnd, |f| {
+        f.window_active = true;
+        f.draw();
+    });
+    let drawn = ms(t);
     unsafe {
         let _ = SetForegroundWindow(hwnd);
     }
-    let fg = ms(t);
-    with(hwnd, |f| {
-        f.window_active = unsafe { GetForegroundWindow() } == hwnd;
-        f.draw();
-    });
-    (shown, fg - shown, ms(t) - fg)
+    (shown, drawn - shown, ms(t) - drawn)
 }
 
 /// Hides the active view until its next navigation completes (a ready window sent elsewhere
