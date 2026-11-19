@@ -1,9 +1,35 @@
-//! explorust's File Explorer windows, the folder handler. Placeholder until step 9 of `.agents/TODO.md`.
+//! explorust's File Explorer windows, the folder handler.
+//!
+//! Windows' own folder view is hosted in our window through `IExplorerBrowser`
+//! (CLSID_ExplorerBrowser) with its frames on, so the items view (columns, icons, thumbnails,
+//! the context menu with third-party handlers, rename, drag and drop, ZIP folders) and the
+//! navigation pane (an `INameSpaceTreeControl` the browser hosts) come from Windows. The chrome
+//! above it (tab strip, back, forward, up, refresh, the breadcrumb and its edit mode, the search
+//! box, the command bar) is drawn with Direct2D on a DirectComposition swap chain over Mica.
+//!
+//! `bus::Command::FilesOpen` (Win+E) opens a window on Home; `explorust-open.exe <path>` hands a
+//! path over with `WM_COPYDATA` (`handover`). A hidden window is kept ready so a new one shows in
+//! one frame.
 //!
 //! Contract with the shell (`crates/shell/src/components.rs`): `run()` is called on a thread of
-//! its own, creates its windows (its command window has the class `bus::class_of(Owner::..)`),
-//! runs its message loop and returns on `bus::Command::Shutdown` or `WM_QUIT`. A panic is caught
-//! and logged by the shell, which starts `run()` again (at most 3 times in 5 minutes).
+//! its own, creates its windows (its command window has the class `bus::class_of(Owner::Files)`),
+//! runs its message loop and returns on `bus::Command::Shutdown` or `WM_QUIT`.
 
-/// Runs the component until shutdown. The placeholder returns at once.
-pub fn run() {}
+pub mod edit;
+pub mod handover;
+pub mod history;
+pub mod layout;
+pub mod text;
+pub mod uri;
+
+#[cfg(target_os = "windows")]
+mod win;
+
+#[cfg(target_os = "windows")]
+pub use win::dark_mode_for_process;
+
+/// Runs the component until shutdown.
+pub fn run() {
+    #[cfg(target_os = "windows")]
+    win::run();
+}
