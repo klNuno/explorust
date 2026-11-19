@@ -24,6 +24,8 @@ static CTRL: AtomicBool = AtomicBool::new(false);
 static SWITCHING: AtomicBool = AtomicBool::new(false);
 /// The key whose down was swallowed, so its up is swallowed too.
 static SWALLOWED: AtomicU32 = AtomicU32::new(0);
+/// A part answered a chord (or the tap) since Win went down: Win up is masked.
+static WIN_ANSWERED: AtomicBool = AtomicBool::new(false);
 
 const VK_TAB: u32 = 0x09;
 const VK_RETURN: u32 = 0x0D;
@@ -44,6 +46,10 @@ const VK_LALT: u32 = 0xA4;
 const VK_RALT: u32 = 0xA5;
 const VK_LWIN: u32 = 0x5B;
 const VK_RWIN: u32 = 0x5C;
+/// Unassigned virtual key, sent before a swallowed Win up so Windows never sees a bare Win tap.
+const VK_MASK: u16 = 0xE8;
+/// dwExtraInfo of the keys explorust injects, so its own hook lets them pass.
+const OWN_INPUT: usize = 0x6578_706C;
 
 pub fn spawn() {
     let _ = std::thread::Builder::new().name("hotkeys".into()).spawn(|| {
@@ -119,6 +125,10 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         // SAFETY: for WH_KEYBOARD_LL, lParam points to a KBDLLHOOKSTRUCT for this call.
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        if kb.dwExtraInfo == OWN_INPUT {
+            // SAFETY: our own mask key and Win up go on untouched.
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
         if let Some(r) = key(kb.vkCode, down, kb.flags.0 & LLKHF_ALTDOWN.0 != 0) {
             return r;
         }
@@ -140,11 +150,21 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
             if down {
                 if !WIN.swap(true, Relaxed) {
                     WIN_USED.store(false, Relaxed);
+                    WIN_ANSWERED.store(false, Relaxed);
                 }
             } else {
                 WIN.store(false, Relaxed);
-                if !WIN_USED.swap(true, Relaxed) {
-                    post(Command::StartToggle, 0);
+                let answered = if WIN_USED.swap(true, Relaxed) {
+                    WIN_ANSWERED.swap(false, Relaxed)
+                } else {
+                    post(Command::StartToggle, 0)
+                };
+                // Windows opens its own Start or search when it sees Win go down and up alone,
+                // which is what a swallowed chord leaves. When explorust answered, this Win up is
+                // swallowed and sent again after an unassigned key, as AutoHotkey does.
+                if answered {
+                    release_win_masked(vk);
+                    return Some(LRESULT(1));
                 }
             }
             return None;
@@ -170,6 +190,9 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
             }
             WinChord::Action(a) => actions::send(a),
         };
+        if handled {
+            WIN_ANSWERED.store(true, Relaxed);
+        }
         return handled.then(|| swallow(vk));
     }
     if vk == VK_TAB && alt && post(Command::SwitcherNext, SHIFT.load(Relaxed) as isize) {
@@ -199,6 +222,24 @@ fn switcher_key(vk: u32) -> Option<(Command, isize)> {
         VK_DELETE => (Command::SwitcherClose, 0),
         _ => return None,
     })
+}
+
+/// Sends the mask key down and up, then `win` up, marked as explorust's own input.
+fn release_win_masked(win: u32) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
+    };
+    let key = |vk: u16, flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), dwFlags: flags, dwExtraInfo: OWN_INPUT, ..Default::default() } },
+    };
+    let inputs = [
+        key(VK_MASK, KEYBD_EVENT_FLAGS(0)),
+        key(VK_MASK, KEYEVENTF_KEYUP),
+        key(win as u16, KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY),
+    ];
+    // SAFETY: SendInput reads the three INPUTs from a live array.
+    unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
 }
 
 /// Posts a command, first letting its part take the foreground: the key went to the hook, not to
