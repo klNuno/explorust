@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/bus", "crates/taskbar", "crates/desktop", "crates/start", "crates/switcher", "crates/notify", "crates/files", "crates/render", "crates/shelldata", "crates/taskbar-proto", "crates/taskbar-egui", "crates/explorer-proto", "crates/guard", "crates/uwp-host", "crates/shell", "crates/devkeys", "crates/keys"]
+members = ["crates/bus", "crates/taskbar", "crates/desktop", "crates/start", "crates/switcher", "crates/notify", "crates/files", "crates/render", "crates/shelldata", "crates/taskbar-proto", "crates/taskbar-egui", "crates/explorer-proto", "crates/guard", "crates/uwp-host", "crates/shell", "crates/devkeys", "crates/keys", "crates/viewer", "crates/taskman"]
 
 [workspace.package]
 edition = "2024"
