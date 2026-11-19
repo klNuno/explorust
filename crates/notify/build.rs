@@ -1,5 +1,5 @@
-//! Embeds `res/explorust-notify.manifest` in explorust-notify.exe only: its `msix` element gives
-//! that helper the identity of the sparse package in `package/` (see `src/win/helper.rs`).
+//! Embeds `res/explorust-notify.manifest` in explorust-notify.exe only (assembly identity; the
+//! package identity comes from activating it through its AUMID, see `src/win/helper.rs`).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -27,6 +27,6 @@ fn main() {
     if ok {
         println!("cargo:rustc-link-arg-bin=explorust-notify={}", out.display());
     } else {
-        println!("cargo:warning=windres failed: explorust-notify.exe built without its package identity");
+        println!("cargo:warning=windres failed: explorust-notify.exe built without its manifest");
     }
 }

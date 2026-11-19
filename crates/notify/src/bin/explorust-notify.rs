@@ -2,7 +2,7 @@
 //! identity (the sparse package of `crates/notify/package`, installed with C:\explorust as its
 //! external location). `UserNotificationListener.NotificationChanged` refuses a process without
 //! identity, so the notify part (inside explorust.exe, which keeps no identity: its children must
-//! not inherit one) starts this helper and waits; the helper subscribes to the event and posts
+//! not inherit one) activates this helper through the package's AUMID and waits; the helper subscribes to the event and posts
 //! `MSG_WAKE` to the part's window on every change. It exits with its parent.
 //! Usage: explorust-notify.exe --parent <pid> --hwnd <command window>
 

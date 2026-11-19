@@ -89,6 +89,11 @@ fn create() -> windows_core::Result<HWND> {
         RegisterClassW(&wc);
         let cmd = CreateWindowExW(Default::default(), &cmd_class, w!("explorust notify"), WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(inst.into()), None)?;
         bus::listen(cmd);
+        // explorust.exe runs with uiAccess (a higher integrity than the helper's medium): let the
+        // helper's wake-ups through UIPI.
+        for m in [listen::MSG_WAKE, listen::MSG_HELPER] {
+            let _ = ChangeWindowMessageFilterEx(cmd, m, MSGFLT_ALLOW, None);
+        }
         Ok(cmd)
     }
 }

@@ -8,7 +8,7 @@ use windows::UI::Notifications::Management::UserNotificationListener;
 use windows::UI::Notifications::UserNotificationChangedEventArgs;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+use windows::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 pub const EXE: &str = "explorust-notify.exe";
@@ -55,30 +55,51 @@ pub fn run(parent: u32, hwnd: isize) -> i32 {
     code
 }
 
-/// Starts the helper next to the current exe. Returns its process handle, or None when it is
-/// missing, turned off (`EXPLORUST_NOTIFY_HELPER=0`) or did not start.
+/// The helper's application in the sparse package of `crates/notify/package` (family name from
+/// its name and unsigned publisher).
+pub const AUMID: &str = "explorust.notify_m23m5a37cevzy!notify";
+
+/// Starts the helper with package identity: activated through its AUMID, so the package's
+/// external location (the folder of explorust-notify.exe) decides which exe runs. Windows' side by
+/// side loader refuses the unsigned publisher in an exe manifest's `msix` element ("The msix
+/// publisher must be valid according to MSIX packaging rules", SideBySide event, 26300.9974), so
+/// a direct start can never give it the identity. Returns its process handle, or None when it is
+/// turned off (`EXPLORUST_NOTIFY_HELPER=0`), the package is missing or it did not start.
 pub fn start(target: HWND) -> Option<HANDLE> {
     if std::env::var("EXPLORUST_NOTIFY_HELPER").as_deref() == Ok("0") {
         log::line("listener: helper turned off (EXPLORUST_NOTIFY_HELPER=0)");
         return None;
     }
-    let exe = std::env::current_exe().ok()?.with_file_name(EXE);
-    if !exe.exists() {
-        log::line(&format!("listener: no {EXE} beside this exe"));
-        return None;
-    }
-    let child = std::process::Command::new(&exe)
-        .args(["--parent", &std::process::id().to_string(), "--hwnd", &(target.0 as isize).to_string()])
-        .spawn();
-    match child {
-        Ok(c) => {
-            use std::os::windows::io::IntoRawHandle;
-            Some(HANDLE(c.into_raw_handle() as _))
+    let args = format!("--parent {} --hwnd {}", std::process::id(), target.0 as isize);
+    let t0 = std::time::Instant::now();
+    let pid = match activate(&args) {
+        Ok(pid) => pid,
+        Err(e) => {
+            log::line(&format!("listener: {AUMID} not activated: {e}"));
+            return None;
+        }
+    };
+    // SAFETY: a handle to wait on the helper; closed by nobody, it lives as long as we watch it.
+    match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) } {
+        Ok(h) => {
+            log::line(&format!("listener: {EXE} activated as {AUMID}, pid {pid}, in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
+            Some(h)
         }
         Err(e) => {
-            log::line(&format!("listener: {EXE} not started: {e}"));
+            log::line(&format!("listener: {EXE} pid {pid} not opened: {e}"));
             None
         }
+    }
+}
+
+fn activate(args: &str) -> windows_core::Result<u32> {
+    use windows::Win32::System::Com::{CLSCTX_LOCAL_SERVER, CoCreateInstance};
+    use windows::Win32::UI::Shell::{AO_NOERRORUI, ApplicationActivationManager, IApplicationActivationManager};
+    use windows_core::HSTRING;
+    // SAFETY: plain COM activation and one call with owned strings.
+    unsafe {
+        let m: IApplicationActivationManager = CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
+        m.ActivateApplication(&HSTRING::from(AUMID), &HSTRING::from(args), AO_NOERRORUI)
     }
 }
 
