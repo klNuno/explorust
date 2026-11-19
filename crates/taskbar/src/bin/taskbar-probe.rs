@@ -5,7 +5,9 @@
 //! title) `state:<title part>` (rect, minimized) `max:<title part>` `restore:<title part>`
 //! `close:<title part>` `workarea` `shutdown` (bus Shutdown to the taskbar) `run:<file or uri>`
 //! `win:<key>` (Win+key, a digit or letter) `shot:<name>` (the screen to `<name>.bmp` beside the exe)
-//! `rclick:x,y` `esc` `trays` (every `Shell_TrayWnd` with its process id).
+//! `rclick:x,y` `esc` `trays` (every `Shell_TrayWnd` with its process id) `flash:<title part>`
+//! (FlashWindowEx with FLASHW_TRAY | FLASHW_TIMERNOFG) `winx` `trayfocus` `taskfocus` (bus commands)
+//! `key:left|right|enter|apps|esc`.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -121,6 +123,25 @@ mod probe {
                     let _ = GetWindowRect(h, &mut r);
                     format!("{} rect {},{} {}x{} minimized={} maximized={}", title(h), r.left, r.top, r.right - r.left, r.bottom - r.top, IsIconic(h).as_bool(), IsZoomed(h).as_bool())
                 }
+            }
+            "flash" => {
+                let Some(h) = find(val) else { return "not found".into() };
+                let fi = FLASHWINFO { cbSize: size_of::<FLASHWINFO>() as u32, hwnd: h, dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG, uCount: 0, dwTimeout: 0 };
+                // SAFETY: flashes a found window's taskbar button until it comes to the foreground.
+                let was = unsafe { FlashWindowEx(&fi) }.as_bool();
+                format!("FlashWindowEx {} ({:#x}): was active {was}", title(h), h.0 as usize)
+            }
+            "winx" => format!("posted={}", bus::post(bus::Command::WinX, 0)),
+            "trayfocus" => format!("posted={}", bus::post(bus::Command::TrayFocus, 0)),
+            "taskfocus" => format!("posted={}", bus::post(bus::Command::TaskbarFocus, 0)),
+            "key" => {
+                let vk = match val { "left" => VK_LEFT, "right" => VK_RIGHT, "enter" => VK_RETURN, "apps" => VK_APPS, _ => VK_ESCAPE };
+                // SAFETY: input injection.
+                unsafe {
+                    key(vk, false);
+                    key(vk, true);
+                }
+                "sent".into()
             }
             "workarea" => {
                 let mut r = RECT::default();

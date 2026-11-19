@@ -3,14 +3,20 @@
 mod actions;
 mod appbars;
 mod bar;
+mod jumplist;
 mod log;
+mod menu;
 mod popup;
 mod scene;
 mod side;
 mod status;
 mod tasks;
+mod thumbs;
 mod trayhost;
 mod workarea;
+mod winx;
+
+pub use winx::set_dry_power;
 
 pub fn run() {
     bar::run();

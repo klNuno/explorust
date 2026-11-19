@@ -35,6 +35,8 @@ pub struct RightView<'a> {
     pub glyphs: &'a [char],
     pub hover: Option<Hit>,
     pub pressed: Option<Hit>,
+    /// Keyboard focus (Win+B).
+    pub focus: Option<Hit>,
 }
 
 pub struct Scene {
@@ -134,6 +136,10 @@ impl Scene {
                 let rr = D2D1_ROUNDED_RECT { rect: rect(a, top, b - a, h), radiusX: G::BUTTON_RADIUS, radiusY: G::BUTTON_RADIUS };
                 ctx.FillRoundedRectangle(&rr, &self.brush((c.0, c.1, c.2, alpha))?);
             }
+            if let Some((a, b)) = v.focus.and_then(|f| l.span(f)) {
+                let fr = D2D1_ROUNDED_RECT { rect: rect(a + 1.0, top + 1.0, b - a - 2.0, h - 2.0), radiusX: G::BUTTON_RADIUS, radiusY: G::BUTTON_RADIUS };
+                ctx.DrawRoundedRectangle(&fr, &self.brush(theme.focus)?, 2.0, None);
+            }
             let ink = self.brush(theme.text)?;
             if let Some((a, b)) = l.chevron {
                 text::draw(ctx, &self.text, &self.chevron_fmt, "\u{E70E}", a, b, G::CHEVRON_BASELINE, &ink, false);
@@ -182,7 +188,7 @@ impl Scene {
                 if b.flashing {
                     ctx.FillRoundedRectangle(&rr, &self.brush(theme.attention_bg)?);
                 }
-                if fill > 0.0 {
+                if fill > 0.0 && !b.flashing {
                     // Windows draws a 38 px fill inside a 1 px stroke that closes the 40 px box.
                     let c = theme.active_bg;
                     let inner = D2D1_ROUNDED_RECT { rect: rect(bg.left + 1.0, bg.top + 1.0, w - 2.0, h - 2.0), radiusX: G::BUTTON_RADIUS - 1.0, radiusY: G::BUTTON_RADIUS - 1.0 };
@@ -219,7 +225,13 @@ impl Scene {
                     ctx.DrawBitmap(bmp, Some(&r), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
                 }
                 if b.running {
-                    let (w, c) = if b.active { (G::ACTIVE_W, theme.active_ind) } else { (G::RUNNING_W, theme.running) };
+                    let (w, c) = if b.flashing {
+                        (G::ATTENTION_W, theme.attention_ind)
+                    } else if b.active {
+                        (G::ACTIVE_W, theme.active_ind)
+                    } else {
+                        (G::RUNNING_W, theme.running)
+                    };
                     let ir = D2D1_ROUNDED_RECT { rect: rect(cx - w / 2.0, G::INDICATOR_Y, w, G::INDICATOR_H), radiusX: 1.5, radiusY: 1.5 };
                     ctx.FillRoundedRectangle(&ir, &self.brush(c)?);
                 }

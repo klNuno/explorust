@@ -9,5 +9,7 @@ fn main() {
         use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
+    // Shut down, restart, sleep and sign out stay dry unless asked: a test never powers g1 off.
+    taskbar::set_dry_power(!std::env::args().any(|a| a == "--live-power"));
     taskbar::run();
 }

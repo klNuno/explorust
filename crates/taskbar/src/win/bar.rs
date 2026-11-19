@@ -6,7 +6,10 @@
 use super::actions::{self, Launch};
 use super::scene::{RightView, Scene, Slot};
 use super::side::{self, Asks, Ctx, Side};
-use super::{popup, trayhost};
+use super::{jumplist, menu, popup, trayhost, winx};
+use super::thumbs::ThumbFlyout;
+use crate::jump;
+use crate::right::Hit;
 use super::tasks;
 use super::workarea::WorkArea;
 use super::log;
@@ -28,7 +31,7 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWi
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE, VK_LEFT, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_SPACE,
+    VK_APPS, VK_RIGHT, VK_SHIFT, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_core::{HSTRING, PCWSTR, w};
@@ -45,6 +48,10 @@ const WM_APP_CLOSE_FLYOUT: u32 = WM_APP + 4;
 const WM_COPYGLOBALDATA: u32 = 0x0049;
 const TIMER_ANIM: usize = 1;
 const TIMER_CLOCK: usize = 2;
+/// The hover delay before the thumbnails open, and the grace before they close.
+const TIMER_THUMB_OPEN: usize = 5;
+const TIMER_THUMB_CLOSE: usize = 6;
+const THUMB_CLOSE_MS: u32 = 300;
 const HSHELL_RUDEAPPACTIVATED: usize = 0x8004;
 const HSHELL_FLASH: usize = 0x8006;
 const EVENT_MINIMIZESTART: u32 = 0x0016;
@@ -67,6 +74,10 @@ enum Effect {
     Topmost(bool),
     Reposition,
     Quit,
+    /// The Win+X menu above Start.
+    WinX,
+    /// The jump list of slot n.
+    JumpList(usize),
 }
 
 struct Bar {
@@ -95,6 +106,11 @@ struct Bar {
     dirty_posted: bool,
     effects: Vec<Effect>,
     side: Side,
+    thumbs: Option<ThumbFlyout>,
+    /// The slot whose hover delay runs.
+    thumb_want: Option<usize>,
+    /// Keyboard focus on the right side (Win+B): index in `tray_hits()`.
+    tray_focus: Option<usize>,
 }
 
 pub fn run() {
@@ -299,6 +315,9 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             dirty_posted: false,
             effects: Vec::new(),
             side: Side::new(hwnd, WM_APP_STATUS),
+            thumbs: None,
+            thumb_want: None,
+            tray_focus: None,
         };
         BAR.with(|b| *b.borrow_mut() = Some(bar));
         with_bar(|b| {
@@ -396,6 +415,29 @@ fn run_effect(e: Effect) {
         Effect::Reposition => {
             let _ = with_bar(|b| b.reposition());
         }
+        Effect::WinX => {
+            let at = with_bar(|b| {
+                b.close_thumbs();
+                let (l, _, _, _) = b.row().slot_rect(0);
+                let wr = b.window_rect();
+                (b.hwnd, wr.left + (l * b.scale()).round() as i32, wr.top)
+            });
+            if let Some((owner, x, y)) = at {
+                log::line(&format!("win+x menu at {x},{y}"));
+                if let Some(c) = winx::show(owner, x, y) {
+                    let ok = bus::post(c, 0);
+                    log::line(&format!("bus {c:?}: {}", if ok { "posted" } else { "no owner" }));
+                }
+            }
+        }
+        Effect::JumpList(i) => {
+            let Some((owner, x, y, nodes, recent)) = with_bar(|b| b.jump_list(i)).flatten() else { return };
+            let id = menu::track(owner, x, y, &nodes, TPM_CENTERALIGN | TPM_BOTTOMALIGN);
+            log::line(&format!("jump list {i}: picked {id}"));
+            if let Some(p) = jump::pick(id) {
+                let _ = with_bar(|b| b.jump_pick(i, p, &recent));
+            }
+        }
         Effect::Quit => {
             teardown();
             // SAFETY: ends this thread's loop.
@@ -482,24 +524,16 @@ impl Bar {
     }
 
     fn load_icons(&mut self) {
-        let Some(scene) = self.scene.as_mut() else { return };
+        let Some(scene) = self.scene.as_ref() else { return };
         let px = scene.icon_px();
-        for g in &self.groups {
-            if scene.has_icon(&g.key) {
-                continue;
-            }
+        let missing: Vec<Group> = self.groups.iter().filter(|g| !scene.has_icon(&g.key)).cloned().collect();
+        for g in &missing {
             let t = Instant::now();
-            let mut img = g.pin.and_then(|p| shelldata::icons::icon_for_item(&self.pins[p].item, px));
-            if img.is_none() && !g.key.contains('\\') {
-                let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
-                img = items::apps_folder_item(&id).and_then(|i| shelldata::icons::icon_for_item(&i, px));
-            }
-            if img.is_none() {
-                let exe = g.wins.first().and_then(|h| self.exes.get(h)).cloned().unwrap_or_else(|| g.key.clone());
-                img = shelldata::icons::icon_for_path(&exe, px);
-            }
+            let img = self.group_image(g, px);
             log::line(&format!("icon {} {}: {} ms", g.key, if img.is_some() { "loaded" } else { "missing" }, t.elapsed().as_millis()));
-            scene.set_icon(&g.key, img);
+            if let Some(scene) = self.scene.as_mut() {
+                scene.set_icon(&g.key, img);
+            }
         }
     }
 
@@ -569,7 +603,8 @@ impl Bar {
         }
         let hicons = self.side.visible_hicons();
         let glyphs = self.side.glyphs();
-        let right = RightView { layout: &self.side.layout, icons: &hicons, glyphs: &glyphs, hover: self.side.hover, pressed: self.side.pressed };
+        let focus = self.tray_focus.and_then(|i| self.tray_hits().get(i).copied());
+        let right = RightView { layout: &self.side.layout, icons: &hicons, glyphs: &glyphs, hover: self.side.hover, pressed: self.side.pressed, focus };
         if let Err(e) = scene.draw(&self.theme, &slots, &self.clock, &right) {
             log::line(&format!("draw failed: {e}"));
         }
@@ -711,6 +746,216 @@ impl Bar {
         LRESULT(1)
     }
 
+    fn window_rect(&self) -> RECT {
+        let mut wr = RECT::default();
+        // SAFETY: reads our own window's rect.
+        let _ = unsafe { GetWindowRect(self.hwnd, &mut wr) };
+        wr
+    }
+
+    /// The icon of a group: its pin, its AppsFolder entry, then its exe.
+    fn group_image(&self, g: &Group, px: i32) -> Option<shelldata::Image> {
+        let mut img = g.pin.and_then(|p| shelldata::icons::icon_for_item(&self.pins[p].item, px));
+        if img.is_none() && !g.key.contains('\\') {
+            let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
+            img = items::apps_folder_item(&id).and_then(|i| shelldata::icons::icon_for_item(&i, px));
+        }
+        if img.is_none() {
+            let exe = g.wins.first().and_then(|h| self.exes.get(h)).cloned().unwrap_or_else(|| g.key.clone());
+            img = shelldata::icons::icon_for_path(&exe, px);
+        }
+        img
+    }
+
+    fn close_thumbs(&mut self) {
+        self.thumbs = None;
+        self.thumb_want = None;
+        // SAFETY: our own timers.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_THUMB_OPEN);
+            let _ = KillTimer(Some(self.hwnd), TIMER_THUMB_CLOSE);
+        }
+    }
+
+    /// The pointer is over `slot` (None: elsewhere): starts, switches or ends the thumbnails.
+    fn thumb_hover(&mut self, slot: Option<usize>) {
+        let slot = slot.filter(|&i| i > 0 && self.groups.get(i - 1).is_some_and(|g| !g.wins.is_empty()));
+        let open = self.thumbs.as_ref().map(|f| f.slot);
+        // SAFETY: timers on our own window.
+        unsafe {
+            match (open, slot) {
+                (Some(o), Some(i)) if o == i => {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_THUMB_CLOSE);
+                }
+                (Some(_), Some(i)) => self.open_thumbs(i),
+                (Some(_), None) => {
+                    SetTimer(Some(self.hwnd), TIMER_THUMB_CLOSE, THUMB_CLOSE_MS, None);
+                }
+                (None, Some(i)) => {
+                    if self.thumb_want != Some(i) {
+                        self.thumb_want = Some(i);
+                        let mut ms = 400u32;
+                        let _ = SystemParametersInfoW(SPI_GETMOUSEHOVERTIME, 0, Some(&mut ms as *mut _ as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+                        SetTimer(Some(self.hwnd), TIMER_THUMB_OPEN, ms.max(1), None);
+                    }
+                }
+                (None, None) => {
+                    self.thumb_want = None;
+                    let _ = KillTimer(Some(self.hwnd), TIMER_THUMB_OPEN);
+                }
+            }
+        }
+    }
+
+    fn open_thumbs(&mut self, i: usize) {
+        self.thumbs = None;
+        // SAFETY: our own timer.
+        let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_THUMB_CLOSE) };
+        let Some(g) = self.groups.get(i - 1).cloned() else { return };
+        let wins: Vec<HWND> = g.wins.iter().map(|h| HWND(*h as _)).collect();
+        let k = self.scale();
+        let icon = self.group_image(&g, (16.0 * k).round() as i32);
+        let wr = self.window_rect();
+        let anchor = wr.left + (self.row().cx(i) * k).round() as i32;
+        let t = Instant::now();
+        match ThumbFlyout::open(i, wins, icon, anchor, wr.top, k, &self.theme) {
+            Ok(f) => {
+                let mut r = RECT::default();
+                // SAFETY: reads the flyout's rect.
+                let _ = unsafe { GetWindowRect(f.hwnd, &mut r) };
+                log::line(&format!("thumbnails open: button {i} {}, {} windows at {},{} {}x{} in {} ms", g.key, g.wins.len(), r.left, r.top, r.right - r.left, r.bottom - r.top, t.elapsed().as_millis()));
+                self.thumbs = Some(f);
+            }
+            Err(e) => log::line(&format!("thumbnails: {e}")),
+        }
+    }
+
+    /// A mouse message on the thumbnail flyout.
+    fn thumbs_mouse(&mut self, msg: u32, x: i32, y: i32) {
+        let Some(f) = self.thumbs.as_mut() else { return };
+        let hwnd = self.hwnd;
+        match msg {
+            WM_MOUSEMOVE => {
+                let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: f.hwnd, dwHoverTime: 0 };
+                // SAFETY: tracks the pointer leaving our flyout; stops its close timer.
+                unsafe {
+                    let _ = TrackMouseEvent(&mut tme);
+                    let _ = KillTimer(Some(hwnd), TIMER_THUMB_CLOSE);
+                }
+                let h = f.hit(x, y);
+                if h != f.hover {
+                    f.hover = h;
+                    f.draw(&self.theme);
+                }
+            }
+            WM_MOUSELEAVE => {
+                f.hover = None;
+                f.draw(&self.theme);
+                // SAFETY: a timer on our own window.
+                unsafe { SetTimer(Some(hwnd), TIMER_THUMB_CLOSE, THUMB_CLOSE_MS, None) };
+            }
+            WM_LBUTTONUP => {
+                let Some((i, close)) = f.hit(x, y) else { return };
+                let Some(&w) = f.wins.get(i) else { return };
+                if close {
+                    log::line(&format!("thumbnail close {:?}", w.0));
+                    // SAFETY: asks the window to close, like its own close button.
+                    let _ = unsafe { PostMessageW(Some(w), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0)) };
+                } else {
+                    log::line(&format!("thumbnail click {:?}", w.0));
+                    self.effects.push(Effect::Activate(w));
+                }
+                self.close_thumbs();
+            }
+            _ => {}
+        }
+    }
+
+    /// Jump list of slot `i`: (owner, anchor, menu, recent paths).
+    #[allow(clippy::type_complexity)]
+    fn jump_list(&mut self, i: usize) -> Option<(HWND, i32, i32, Vec<menu::Node>, Vec<String>)> {
+        self.close_thumbs();
+        let g = self.groups.get(i - 1)?.clone();
+        let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
+        let exe = g.wins.first().and_then(|h| self.exes.get(h)).cloned().unwrap_or_else(|| g.key.clone());
+        let t = Instant::now();
+        let recent = if g.key.contains('\\') { Vec::new() } else { jumplist::recent(&id, 10) };
+        let app = match g.pin {
+            Some(p) if !self.pins[p].name.is_empty() => self.pins[p].name.clone(),
+            _ => jumplist::app_name(&id, &exe),
+        };
+        let input = jump::Input {
+            app,
+            recent: recent.iter().map(|r| r.0.clone()).collect(),
+            pinned_to_bar: g.pin.is_some(),
+            windows: g.wins.len(),
+            ..Default::default()
+        };
+        let fr = menu::french();
+        let nodes = jump::build(&input, fr)
+            .into_iter()
+            .map(|e| match e {
+                jump::Entry::Header(h) => menu::Node::Header(h.to_string()),
+                jump::Entry::Item(id, l) => menu::Node::Item(id, l),
+                jump::Entry::Separator => menu::Node::Separator,
+            })
+            .collect::<Vec<_>>();
+        log::line(&format!("jump list {i} {} (app id {id}): {} recent, {} entries in {} ms", g.key, recent.len(), nodes.len(), t.elapsed().as_millis()));
+        let k = self.scale();
+        let wr = self.window_rect();
+        let x = wr.left + (self.row().cx(i) * k).round() as i32;
+        Some((self.hwnd, x, wr.top, nodes, recent.into_iter().map(|r| r.1).collect()))
+    }
+
+    fn jump_pick(&mut self, i: usize, p: jump::Pick, recent: &[String]) {
+        let Some(g) = self.groups.get(i - 1).cloned() else { return };
+        log::line(&format!("jump list {} {}: {p:?}", i, g.key));
+        match p {
+            jump::Pick::Launch => self.activate_slot(i, true),
+            jump::Pick::Close => {
+                for h in &g.wins {
+                    // SAFETY: asks each window to close, like its own close button.
+                    let _ = unsafe { PostMessageW(Some(HWND(*h as _)), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0)) };
+                }
+            }
+            jump::Pick::Pin => {
+                if let Some(pi) = g.pin {
+                    self.pins.remove(pi);
+                    self.model.pins.remove(pi);
+                    log::line(&format!("unpinned {} (this session; Taskband not written)", g.key));
+                } else {
+                    let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
+                    let exe = g.wins.first().and_then(|h| self.exes.get(h)).cloned().unwrap_or_default();
+                    if let Some(item) = jumplist::pin_item(&g.key, &id, &exe) {
+                        self.pins.push(item);
+                        self.model.pins.push(g.key.clone());
+                        log::line(&format!("pinned {} (this session; Taskband not written)", g.key));
+                    }
+                }
+                self.dirty();
+            }
+            jump::Pick::Recent(n) => {
+                if let Some(path) = recent.get(n) {
+                    self.effects.push(Effect::Launch(Launch::Path(path.clone())));
+                }
+            }
+            jump::Pick::Pinned(_) | jump::Pick::Task(_) => {}
+        }
+    }
+
+    /// What Win+B moves over, left to right.
+    fn tray_hits(&self) -> Vec<Hit> {
+        let l = &self.side.layout;
+        let mut v = Vec::new();
+        if l.chevron.is_some() {
+            v.push(Hit::Chevron);
+        }
+        v.extend((0..l.icons.len()).map(Hit::Icon));
+        v.push(Hit::QuickSettings);
+        v.push(Hit::Clock);
+        v
+    }
+
     fn on_command(&mut self, cmd: bus::Command, arg: isize) {
         log::line(&format!("command {cmd:?} {arg}"));
         match cmd {
@@ -720,7 +965,15 @@ impl Bar {
                     self.activate_slot(n, false);
                 }
             }
+            bus::Command::WinX => self.effects.push(Effect::WinX),
+            bus::Command::TrayFocus => {
+                self.focus = None;
+                self.tray_focus = Some(0);
+                self.effects.push(Effect::FocusBar);
+                self.paint();
+            }
             bus::Command::TaskbarFocus => {
+                self.tray_focus = None;
                 self.focus = Some(if self.groups.is_empty() { 0 } else { 1 });
                 self.effects.push(Effect::FocusBar);
                 self.paint();
@@ -730,8 +983,42 @@ impl Bar {
         }
     }
 
+    fn on_tray_key(&mut self, f: usize, vk: u16) -> bool {
+        let hits = self.tray_hits();
+        let n = hits.len();
+        match vk {
+            v if v == VK_LEFT.0 => self.tray_focus = Some((f + n - 1) % n),
+            v if v == VK_RIGHT.0 => self.tray_focus = Some((f + 1) % n),
+            v if v == VK_RETURN.0 || v == VK_SPACE.0 => {
+                let hit = hits.get(f).copied();
+                log::line(&format!("tray key select {hit:?}"));
+                let (hw, m, k) = self.ctx();
+                let cx = Ctx { hwnd: hw, monitor: m, scale: k, theme: &self.theme };
+                self.side.on_down(hit, false);
+                let a = self.side.on_up(hit, false, &cx);
+                self.asks(a);
+            }
+            v if v == VK_ESCAPE.0 => {
+                self.tray_focus = None;
+                if let Some(a) = self.model.active {
+                    self.effects.push(Effect::Activate(HWND(a as _)));
+                }
+            }
+            _ => return false,
+        }
+        self.paint();
+        true
+    }
+
     fn on_key(&mut self, vk: u16) -> bool {
+        if let Some(f) = self.tray_focus {
+            return self.on_tray_key(f, vk);
+        }
         let Some(f) = self.focus else { return false };
+        if vk == VK_APPS.0 {
+            self.effects.push(if f == 0 { Effect::WinX } else { Effect::JumpList(f) });
+            return true;
+        }
         let n = self.groups.len() + 1;
         match vk {
             v if v == VK_LEFT.0 => self.focus = Some((f + n - 1) % n),
@@ -811,6 +1098,13 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         }),
         WM_RBUTTONUP => with_bar(|b| {
             let h = b.right_hit(lp);
+            if h.is_none() && b.side.pressed.is_none() {
+                if let (Some(i), _) = b.slot_at(lp) {
+                    log::line(&format!("right click on button {i}"));
+                    b.effects.push(if i == 0 { Effect::WinX } else { Effect::JumpList(i) });
+                    return LRESULT(0);
+                }
+            }
             let (hw, m, k) = b.ctx();
             let cx = Ctx { hwnd: hw, monitor: m, scale: k, theme: &b.theme };
             let a = b.side.on_up(h, true, &cx);
@@ -851,7 +1145,9 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             let _ = unsafe { TrackMouseEvent(&mut tme) };
             let rh = b.right_hit(lp);
             let (slot, _) = b.slot_at(lp);
-            b.set_hover(if rh.is_some() { None } else { slot });
+            let task_slot = if rh.is_some() { None } else { slot };
+            b.set_hover(task_slot);
+            b.thumb_hover(task_slot);
             let (hw, m, k) = b.ctx();
             let cx = Ctx { hwnd: hw, monitor: m, scale: k, theme: &b.theme };
             if b.side.on_move(rh, &cx) {
@@ -861,6 +1157,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         }),
         WM_MOUSELEAVE => with_bar(|b| {
             b.set_hover(None);
+            b.thumb_hover(None);
             if b.side.on_leave() {
                 b.paint();
             }
@@ -874,6 +1171,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
                 return LRESULT(0);
             }
             let (slot, _) = b.slot_at(lp);
+            b.close_thumbs();
             b.pressed = slot;
             b.effects.push(Effect::Capture(true));
             b.animate();
@@ -911,7 +1209,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         WM_ACTIVATE => {
             if (wp.0 & 0xffff) as u32 == WA_INACTIVE {
                 with_bar(|b| {
-                    if b.focus.take().is_some() {
+                    if b.focus.take().is_some() | b.tray_focus.take().is_some() {
                         b.paint();
                     }
                 });
@@ -926,6 +1224,19 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
                         let _ = unsafe { KillTimer(Some(hwnd), TIMER_ANIM) };
                     }
                     b.paint();
+                }
+                TIMER_THUMB_OPEN => {
+                    // SAFETY: our own timer.
+                    let _ = unsafe { KillTimer(Some(hwnd), TIMER_THUMB_OPEN) };
+                    if let Some(i) = b.thumb_want.take().filter(|i| b.hover == Some(*i)) {
+                        b.open_thumbs(i);
+                    }
+                }
+                TIMER_THUMB_CLOSE => {
+                    if b.thumbs.is_some() {
+                        log::line("thumbnails closed");
+                    }
+                    b.close_thumbs();
                 }
                 side::TIMER_TIP => {
                     let (hw, m, k) = b.ctx();
@@ -980,6 +1291,21 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
 
 /// Messages of the bar's popups (the flyout); None leaves them to DefWindowProc.
 fn popup_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    let is_thumbs = BAR.with(|b| b.try_borrow().ok().and_then(|g| g.as_ref().and_then(|b| b.thumbs.as_ref().map(|f| f.hwnd == hwnd)))) == Some(true);
+    if is_thumbs {
+        return match msg {
+            WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
+            WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONUP => {
+                let (x, y) = ((lp.0 & 0xffff) as i16 as i32, (lp.0 >> 16 & 0xffff) as i16 as i32);
+                with_bar(|b| {
+                    b.thumbs_mouse(msg, x, y);
+                    LRESULT(0)
+                })
+            }
+            WM_LBUTTONDOWN => Some(LRESULT(0)),
+            _ => None,
+        };
+    }
     match msg {
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP => {
             let (x, y) = ((lp.0 & 0xffff) as i16 as i32, (lp.0 >> 16 & 0xffff) as i16 as i32);

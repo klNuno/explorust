@@ -10,15 +10,26 @@
 
 pub mod appbar;
 pub mod geom;
+pub mod jump;
 pub mod model;
 pub mod right;
 pub mod theme;
+pub mod thumbs;
 pub mod tray;
+pub mod winx;
 
 #[cfg(target_os = "windows")]
 mod win;
 
 /// Runs the taskbar until shutdown.
+/// Power items of the Win+X menu only log the call they would make (the dev exe's default).
+pub fn set_dry_power(dry: bool) {
+    #[cfg(target_os = "windows")]
+    win::set_dry_power(dry);
+    #[cfg(not(target_os = "windows"))]
+    let _ = dry;
+}
+
 pub fn run() {
     #[cfg(target_os = "windows")]
     win::run();

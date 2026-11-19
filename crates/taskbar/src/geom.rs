@@ -11,6 +11,8 @@ pub const INDICATOR_Y: f32 = 40.0;
 pub const INDICATOR_H: f32 = 3.0;
 pub const RUNNING_W: f32 = 6.0;
 pub const ACTIVE_W: f32 = 16.0;
+/// Indicator of a button in the attention state (measured on the owner's bar).
+pub const ATTENTION_W: f32 = 20.0;
 /// Start logo: four squares and a 1 px gap.
 pub const START_SQ: f32 = 11.0;
 pub const START_TOP: f32 = 13.0;
