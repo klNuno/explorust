@@ -25,8 +25,12 @@ pub const MSG_HELPER: u32 = 0x8000 + 0x204;
 /// 0 no answer yet, 1 the helper subscribed, 2 it was refused.
 static HELPER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// Set by `wake`, taken by the listener: whether a park ended on a change rather than a timeout.
+static WOKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// UI thread, on `MSG_WAKE`: the listener diffs the center now.
 pub fn wake() {
+    WOKEN.store(true, std::sync::atomic::Ordering::Release);
     if let Some(t) = LISTENER.get() {
         t.unpark();
     }
@@ -130,6 +134,8 @@ fn watch(listener: &UserNotificationListener, target: HWND) {
         (false, true) => log::line(&format!("listener: waiting on WNF, {} toasts already in the center, one diff {first_ms:.2} ms", seen.len())),
         (false, false) => log::line(&format!("listener: no WNF subscription, polling every {POLL_MS} ms, {} toasts in the center", seen.len())),
     }
+    // The helper's own answer woke this thread once already.
+    WOKEN.store(false, std::sync::atomic::Ordering::Release);
     loop {
         if let Some(h) = helper {
             // A safety net only: the helper wakes this thread on every change.
@@ -144,7 +150,9 @@ fn watch(listener: &UserNotificationListener, target: HWND) {
         } else {
             std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         }
-        // The platform may signal before the toast is readable: one late retry.
+        // A change signal (helper or WNF) may come before the toast is readable: one late retry.
+        // The helper's 60 s safety net only checks once, quietly.
+        let signalled = WOKEN.swap(false, std::sync::atomic::Ordering::AcqRel) || (woken && helper.is_none());
         for attempt in 0..2 {
             let t = std::time::Instant::now();
             let now = ids(listener);
@@ -163,10 +171,10 @@ fn watch(listener: &UserNotificationListener, target: HWND) {
             if !diff.returned.is_empty() {
                 log::line(&format!("listener: {:?} back in the center, already seen: no card", diff.returned));
             }
-            if woken {
+            if signalled {
                 log::line(&format!("listener: diff {attempt} in {:.1} ms, changed {changed}", t.elapsed().as_secs_f64() * 1000.0));
             }
-            if changed || !woken {
+            if changed || !signalled {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(400));
