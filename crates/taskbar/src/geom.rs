@@ -21,6 +21,10 @@ pub const LINE2_BASELINE: f32 = 36.0;
 pub const TEXT_PX: f32 = 12.0;
 /// Width of the clock's click area from the bar's right end.
 pub const CLOCK_HIT_W: f32 = 100.0;
+/// Quick settings glyphs (16 px Segoe Fluent Icons) and the chevron: their baselines.
+pub const GLYPH_BASELINE: f32 = 32.0;
+pub const CHEVRON_PX: f32 = 12.0;
+pub const CHEVRON_BASELINE: f32 = 30.0;
 /// Pointer-over fade, XAML ControlFasterAnimationDuration (83 ms) in, 167 ms out.
 pub const HOVER_IN_MS: f32 = 83.0;
 pub const HOVER_OUT_MS: f32 = 167.0;

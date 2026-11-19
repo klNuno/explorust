@@ -4,7 +4,9 @@
 //! are queued as effects and run once the state is released.
 
 use super::actions::{self, Launch};
-use super::scene::{Scene, Slot};
+use super::scene::{RightView, Scene, Slot};
+use super::side::{self, Asks, Ctx, Side};
+use super::{popup, trayhost};
 use super::tasks;
 use super::workarea::WorkArea;
 use super::log;
@@ -36,6 +38,11 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_APP_DIRTY: u32 = WM_APP + 1;
 /// A WinEvent, forwarded from the hook callback: wParam = hwnd, lParam = event.
 const WM_APP_EVENT: u32 = WM_APP + 2;
+/// The volume or the network changed (posted by their callbacks).
+const WM_APP_STATUS: u32 = WM_APP + 3;
+/// The flyout lost the activation: close it outside its own message.
+const WM_APP_CLOSE_FLYOUT: u32 = WM_APP + 4;
+const WM_COPYGLOBALDATA: u32 = 0x0049;
 const TIMER_ANIM: usize = 1;
 const TIMER_CLOCK: usize = 2;
 const HSHELL_RUDEAPPACTIVATED: usize = 0x8004;
@@ -57,6 +64,7 @@ enum Effect {
     Capture(bool),
     FocusBar,
     WorkArea,
+    Topmost(bool),
     Reposition,
     Quit,
 }
@@ -86,6 +94,7 @@ struct Bar {
     hooks: Vec<HWINEVENTHOOK>,
     dirty_posted: bool,
     effects: Vec<Effect>,
+    side: Side,
 }
 
 pub fn run() {
@@ -206,6 +215,11 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             Some(inst.into()),
             None,
         )?;
+        // Tray icons and AppBars arrive as WM_COPYDATA, also from lower-integrity processes.
+        for m in [WM_COPYDATA, WM_COPYGLOBALDATA] {
+            let _ = ChangeWindowMessageFilterEx(hwnd, m, MSGFLT_ALLOW, None);
+        }
+        popup::register(Some(wndproc));
         let cmd = CreateWindowExW(WINDOW_EX_STYLE(0), PCWSTR(class.as_ptr()), w!(""), WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(inst.into()), None)?;
         bus::listen(cmd);
         BAR_HWND.with(|h| h.set(hwnd.0 as isize));
@@ -284,6 +298,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             hooks,
             dirty_posted: false,
             effects: Vec::new(),
+            side: Side::new(hwnd, WM_APP_STATUS),
         };
         BAR.with(|b| *b.borrow_mut() = Some(bar));
         with_bar(|b| {
@@ -292,6 +307,8 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             b.log_groups();
         });
         SetTimer(Some(hwnd), TIMER_CLOCK, shelldata::clock::ms_to_next_minute() as u32, None);
+        // Running apps add their icons again.
+        trayhost::broadcast_created();
         Ok(())
     }
 }
@@ -358,11 +375,24 @@ fn run_effect(e: Effect) {
         }
         Effect::WorkArea => {
             let _ = with_bar(|b| {
-                if let Some(w) = &b.work {
-                    w.apply(b.monitor, b.h_px)
+                let mut bar = RECT::default();
+                // SAFETY: reads our own window's rect.
+                let _ = unsafe { GetWindowRect(b.hwnd, &mut bar) };
+                if b.work.is_some() {
+                    let r = b.side.work_area(b.monitor, bar);
+                    super::workarea::apply_rect(RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom });
                 }
             });
         }
+        // SAFETY: z-order of our own window.
+        Effect::Topmost(on) => unsafe {
+            let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+            let _ = SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if !on {
+                let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            log::line(&format!("bar topmost {on}"));
+        },
         Effect::Reposition => {
             let _ = with_bar(|b| b.reposition());
         }
@@ -479,7 +509,50 @@ impl Bar {
         }
     }
 
+    fn ctx(&self) -> (HWND, RECT, f32) {
+        (self.hwnd, self.monitor, self.scale())
+    }
+
+    fn asks(&mut self, a: Asks) {
+        if a.redraw {
+            self.dirty();
+        }
+        if a.work_area {
+            self.effects.push(Effect::WorkArea);
+        }
+        if let Some(c) = a.post {
+            self.effects.push(Effect::Post(c));
+        }
+        if let Some(t) = a.topmost {
+            self.effects.push(Effect::Topmost(t));
+        }
+    }
+
+    /// Lays the right side out for the current clock and icons, and loads new tray icon images.
+    fn layout_right(&mut self) {
+        let Some(scene) = self.scene.as_mut() else { return };
+        let cw = scene.clock_width(&self.clock);
+        self.side.relayout(scene.width, scene.width - G::CLOCK_RIGHT, cw);
+        let all = self.side.all_hicons();
+        let px = scene.tray_px();
+        for h in self.side.visible_hicons() {
+            if !scene.has_tray_icon(h) {
+                scene.set_tray_icon(h, trayhost::icon_image(h, px));
+            }
+        }
+        scene.keep_tray_icons(&all);
+    }
+
+    /// DIP point of a mouse lParam, and the right side's hit there.
+    fn right_hit(&self, lp: LPARAM) -> Option<crate::right::Hit> {
+        let k = self.scale();
+        let x = (lp.0 & 0xffff) as i16 as f32 / k;
+        let y = (lp.0 >> 16 & 0xffff) as i16 as f32 / k;
+        self.side.layout.hit(x, y)
+    }
+
     fn paint(&mut self) {
+        self.layout_right();
         let Some(scene) = self.scene.as_ref() else { return };
         let mut slots = Vec::with_capacity(self.groups.len() + 1);
         slots.push(Slot { key: None, running: false, active: false, flashing: false, hover: self.hover_v[0], press: self.press_v[0], focused: self.focus == Some(0) });
@@ -494,7 +567,10 @@ impl Bar {
                 focused: self.focus == Some(i + 1),
             });
         }
-        if let Err(e) = scene.draw(&self.theme, &slots, &self.clock) {
+        let hicons = self.side.visible_hicons();
+        let glyphs = self.side.glyphs();
+        let right = RightView { layout: &self.side.layout, icons: &hicons, glyphs: &glyphs, hover: self.side.hover, pressed: self.side.pressed };
+        if let Err(e) = scene.draw(&self.theme, &slots, &self.clock, &right) {
             log::line(&format!("draw failed: {e}"));
         }
     }
@@ -583,6 +659,8 @@ impl Bar {
         match code as u32 {
             HSHELL_WINDOWCREATED | HSHELL_REDRAW | HSHELL_WINDOWREPLACED => self.refresh(h),
             HSHELL_WINDOWDESTROYED => {
+                let a = self.side.prune();
+                self.asks(a);
                 self.exes.remove(&(lp.0));
                 if self.model.remove(lp.0) {
                     self.dirty();
@@ -696,7 +774,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         return Some(LRESULT(0));
     }
     if hwnd != bar_hwnd() {
-        return None;
+        return popup_message(hwnd, msg, wp, lp);
     }
     let shellhook = BAR.with(|b| b.try_borrow().ok().and_then(|g| g.as_ref().map(|b| b.shellhook)));
     if shellhook.is_some_and(|m| m == msg) {
@@ -704,6 +782,43 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
     }
     match msg {
         WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
+        WM_COPYDATA => with_bar(|b| {
+            // SAFETY: for WM_COPYDATA, lParam points to a COPYDATASTRUCT valid for this message.
+            let cds = unsafe { &*(lp.0 as *const windows::Win32::System::DataExchange::COPYDATASTRUCT) };
+            let (h, m, k) = b.ctx();
+            let cx = Ctx { hwnd: h, monitor: m, scale: k, theme: &b.theme };
+            let (r, a) = b.side.on_copydata(cds, &cx);
+            b.asks(a);
+            LRESULT(r)
+        }),
+        WM_APP_STATUS | WM_POWERBROADCAST => with_bar(|b| {
+            if b.side.refresh_status() {
+                b.paint();
+            }
+            LRESULT(1)
+        }),
+        WM_APP_CLOSE_FLYOUT => with_bar(|b| {
+            b.side.close_flyout();
+            LRESULT(0)
+        }),
+        WM_RBUTTONDOWN => with_bar(|b| {
+            let h = b.right_hit(lp);
+            if b.side.on_down(h, true) {
+                b.effects.push(Effect::Capture(true));
+                b.paint();
+            }
+            LRESULT(0)
+        }),
+        WM_RBUTTONUP => with_bar(|b| {
+            let h = b.right_hit(lp);
+            let (hw, m, k) = b.ctx();
+            let cx = Ctx { hwnd: hw, monitor: m, scale: k, theme: &b.theme };
+            let a = b.side.on_up(h, true, &cx);
+            b.effects.push(Effect::Capture(false));
+            b.asks(a);
+            b.paint();
+            LRESULT(0)
+        }),
         WM_APP_DIRTY => with_bar(|b| {
             b.dirty_posted = false;
             b.rebuild();
@@ -713,7 +828,14 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         WM_APP_EVENT => with_bar(|b| {
             let h = HWND(wp.0 as _);
             match lp.0 as u32 {
-                EVENT_SYSTEM_FOREGROUND | EVENT_MINIMIZEEND => b.set_active(h),
+                EVENT_SYSTEM_FOREGROUND => {
+                    b.set_active(h);
+                    let (hw, m, k) = b.ctx();
+                    let cx = Ctx { hwnd: hw, monitor: m, scale: k, theme: &b.theme };
+                    let a = b.side.on_foreground(h, &cx);
+                    b.asks(a);
+                }
+                EVENT_MINIMIZEEND => b.set_active(h),
                 EVENT_MINIMIZESTART => {
                     // SAFETY: a plain query.
                     let fg = unsafe { GetForegroundWindow() };
@@ -727,15 +849,30 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
             // SAFETY: tracks the pointer leaving our own window.
             let _ = unsafe { TrackMouseEvent(&mut tme) };
+            let rh = b.right_hit(lp);
             let (slot, _) = b.slot_at(lp);
-            b.set_hover(slot);
+            b.set_hover(if rh.is_some() { None } else { slot });
+            let (hw, m, k) = b.ctx();
+            let cx = Ctx { hwnd: hw, monitor: m, scale: k, theme: &b.theme };
+            if b.side.on_move(rh, &cx) {
+                b.paint();
+            }
             LRESULT(0)
         }),
         WM_MOUSELEAVE => with_bar(|b| {
             b.set_hover(None);
+            if b.side.on_leave() {
+                b.paint();
+            }
             LRESULT(0)
         }),
         WM_LBUTTONDOWN => with_bar(|b| {
+            let rh = b.right_hit(lp);
+            if b.side.on_down(rh, false) {
+                b.effects.push(Effect::Capture(true));
+                b.paint();
+                return LRESULT(0);
+            }
             let (slot, _) = b.slot_at(lp);
             b.pressed = slot;
             b.effects.push(Effect::Capture(true));
@@ -743,6 +880,16 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             LRESULT(0)
         }),
         WM_LBUTTONUP | WM_MBUTTONUP => with_bar(|b| {
+            if msg == WM_LBUTTONUP && b.side.pressed.is_some() {
+                let rh = b.right_hit(lp);
+                let (hw, m, k) = b.ctx();
+                let cx = Ctx { hwnd: hw, monitor: m, scale: k, theme: &b.theme };
+                let a = b.side.on_up(rh, false, &cx);
+                b.effects.push(Effect::Capture(false));
+                b.asks(a);
+                b.paint();
+                return LRESULT(0);
+            }
             let (slot, clock) = b.slot_at(lp);
             let pressed = b.pressed.take();
             b.effects.push(Effect::Capture(false));
@@ -780,7 +927,14 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
                     }
                     b.paint();
                 }
+                side::TIMER_TIP => {
+                    let (hw, m, k) = b.ctx();
+                    let cx = Ctx { hwnd: hw, monitor: m, scale: k, theme: &b.theme };
+                    b.side.on_tip_timer(&cx);
+                }
                 TIMER_CLOCK => {
+                    let a = b.side.prune();
+                    b.asks(a);
                     b.clock = shelldata::clock::now();
                     b.paint();
                     // SAFETY: our own timer.
@@ -820,6 +974,29 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             Some(LRESULT(0))
         }
         WM_CLOSE => Some(LRESULT(0)),
+        _ => None,
+    }
+}
+
+/// Messages of the bar's popups (the flyout); None leaves them to DefWindowProc.
+fn popup_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    match msg {
+        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP => {
+            let (x, y) = ((lp.0 & 0xffff) as i16 as i32, (lp.0 >> 16 & 0xffff) as i16 as i32);
+            with_bar(|b| {
+                if b.side.is_flyout(hwnd) {
+                    b.side.flyout_mouse(msg, x, y, &b.theme);
+                }
+                LRESULT(0)
+            })
+        }
+        WM_ACTIVATE => {
+            // SAFETY: a plain post to the bar.
+            if (wp.0 & 0xffff) as u32 == WA_INACTIVE && with_bar(|b| b.side.is_flyout(hwnd)) == Some(true) {
+                let _ = unsafe { PostMessageW(Some(bar_hwnd()), WM_APP_CLOSE_FLYOUT, WPARAM(0), LPARAM(0)) };
+            }
+            None
+        }
         _ => None,
     }
 }

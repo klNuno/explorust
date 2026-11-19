@@ -2,6 +2,7 @@
 //! and press states, the clock. Everything is laid out in DIPs and scaled to the monitor's DPI.
 
 use crate::geom::{self as G, Row};
+use crate::right::{self, Hit, Layout};
 use crate::theme::{Rgba, Theme};
 use render::text::{self, Align, Text};
 use render::{Surface, rgba};
@@ -11,7 +12,7 @@ use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, ID2D1Bitmap1, ID2D1Brush, ID2D1SolidColorBrush,
 };
-use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_WEIGHT_NORMAL, IDWriteTextFormat};
+use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS, IDWriteTextFormat};
 use windows_core::{Interface, Result};
 use windows_numerics::Matrix3x2;
 
@@ -26,12 +27,25 @@ pub struct Slot<'a> {
     pub focused: bool,
 }
 
+/// The right side as drawn.
+pub struct RightView<'a> {
+    pub layout: &'a Layout,
+    /// Icon handles of the promoted tray icons, left to right.
+    pub icons: &'a [isize],
+    pub glyphs: &'a [char],
+    pub hover: Option<Hit>,
+    pub pressed: Option<Hit>,
+}
+
 pub struct Scene {
     surface: Surface,
     text: Text,
     clock_fmt: IDWriteTextFormat,
+    glyph_fmt: IDWriteTextFormat,
+    chevron_fmt: IDWriteTextFormat,
     start: ID2D1Bitmap1,
     icons: HashMap<String, Option<ID2D1Bitmap1>>,
+    tray: HashMap<isize, Option<ID2D1Bitmap1>>,
     pub scale: f32,
     pub width: f32,
 }
@@ -41,9 +55,11 @@ impl Scene {
         let surface = Surface::new(hwnd, w_px, h_px)?;
         let text = Text::new()?;
         let clock_fmt = text.format("Segoe UI Variable Text", G::TEXT_PX, DWRITE_FONT_WEIGHT_NORMAL, Align::Trailing)?;
+        let glyph_fmt = text.format("Segoe Fluent Icons", right::GLYPH, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?;
+        let chevron_fmt = text.format("Segoe Fluent Icons", G::CHEVRON_PX, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?;
         let logo = start_image(theme.light, (G::START_SQ * scale).round() as u32);
         let start = surface.bitmap(logo.width, logo.height, &logo.to_premultiplied_bgra())?;
-        Ok(Scene { surface, text, clock_fmt, start, icons: HashMap::new(), scale, width: w_px as f32 / scale })
+        Ok(Scene { surface, text, clock_fmt, glyph_fmt, chevron_fmt, start, icons: HashMap::new(), tray: HashMap::new(), scale, width: w_px as f32 / scale })
     }
 
     pub fn icon_px(&self) -> i32 {
@@ -59,12 +75,88 @@ impl Scene {
         self.icons.insert(key.to_string(), bmp);
     }
 
+    pub fn tray_px(&self) -> i32 {
+        (right::TRAY_ICON * self.scale).round() as i32
+    }
+
+    pub fn has_tray_icon(&self, hicon: isize) -> bool {
+        self.tray.contains_key(&hicon)
+    }
+
+    pub fn set_tray_icon(&mut self, hicon: isize, img: Option<shelldata::Image>) {
+        let bmp = img.and_then(|i| self.surface.bitmap(i.width, i.height, &i.to_premultiplied_bgra()).ok());
+        self.tray.insert(hicon, bmp);
+    }
+
+    /// Forgets the bitmaps of icon handles no longer shown.
+    pub fn keep_tray_icons(&mut self, live: &[isize]) {
+        self.tray.retain(|h, _| live.contains(h));
+    }
+
+    /// Width of the clock text in DIPs: the wider of its two lines.
+    pub fn clock_width(&self, clock: &(String, String)) -> f32 {
+        let measure = |s: &str| {
+            let w: Vec<u16> = s.encode_utf16().collect();
+            // SAFETY: a DirectWrite layout measured and dropped.
+            unsafe {
+                let Ok(l) = self.text.factory.CreateTextLayout(&w, &self.clock_fmt, 400.0, 100.0) else { return 0.0 };
+                let t = self.text.factory.CreateTypography().ok();
+                if let Some(t) = &t {
+                    let f = windows::Win32::Graphics::DirectWrite::DWRITE_FONT_FEATURE {
+                        nameTag: windows::Win32::Graphics::DirectWrite::DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES,
+                        parameter: 1,
+                    };
+                    let _ = t.AddFontFeature(f);
+                    let _ = l.SetTypography(t, windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_RANGE { startPosition: 0, length: w.len() as u32 });
+                }
+                let mut m = DWRITE_TEXT_METRICS::default();
+                let _ = l.GetMetrics(&mut m);
+                m.width
+            }
+        };
+        measure(&clock.0).max(measure(&clock.1))
+    }
+
+    /// Chevron, promoted tray icons, quick settings glyphs and the hover states of the right side.
+    fn draw_right(&self, theme: &Theme, v: &RightView) -> Result<()> {
+        let ctx = &self.surface.ctx;
+        let l = v.layout;
+        let (top, h) = (right::BUTTON_TOP, right::BUTTON_H);
+        // SAFETY: drawing calls between BeginDraw and EndDraw on this thread's context.
+        unsafe {
+            for hit in [v.hover, v.pressed].into_iter().flatten() {
+                if hit == Hit::ShowDesktop {
+                    continue;
+                }
+                let Some((a, b)) = l.span(hit) else { continue };
+                let c = theme.active_bg;
+                let alpha = if v.pressed == Some(hit) { theme.press_bg.3 } else { theme.hover_bg.3 };
+                let rr = D2D1_ROUNDED_RECT { rect: rect(a, top, b - a, h), radiusX: G::BUTTON_RADIUS, radiusY: G::BUTTON_RADIUS };
+                ctx.FillRoundedRectangle(&rr, &self.brush((c.0, c.1, c.2, alpha))?);
+            }
+            let ink = self.brush(theme.text)?;
+            if let Some((a, b)) = l.chevron {
+                text::draw(ctx, &self.text, &self.chevron_fmt, "\u{E70E}", a, b, G::CHEVRON_BASELINE, &ink, false);
+            }
+            for (i, (a, b)) in l.icons.iter().enumerate() {
+                let Some(Some(bmp)) = v.icons.get(i).and_then(|h| self.tray.get(h)) else { continue };
+                let s = right::TRAY_ICON;
+                let x = ((a + b) / 2.0 - s / 2.0).round();
+                ctx.DrawBitmap(bmp, Some(&rect(x, right::GLYPH_TOP, s, s)), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
+            }
+            for (g, x) in v.glyphs.iter().zip(&l.glyphs) {
+                text::draw(ctx, &self.text, &self.glyph_fmt, &g.to_string(), *x, x + right::GLYPH, G::GLYPH_BASELINE, &ink, false);
+            }
+        }
+        Ok(())
+    }
+
     fn brush(&self, c: Rgba) -> Result<ID2D1Brush> {
         let b: ID2D1SolidColorBrush = self.surface.brush(rgba(c.0, c.1, c.2, c.3))?;
         b.cast()
     }
 
-    pub fn draw(&self, theme: &Theme, slots: &[Slot], clock: &(String, String)) -> Result<()> {
+    pub fn draw(&self, theme: &Theme, slots: &[Slot], clock: &(String, String), right: &RightView) -> Result<()> {
         let s = &self.surface;
         let ctx = &s.ctx;
         let row = Row { width: self.width, buttons: slots.len() };
@@ -132,10 +224,11 @@ impl Scene {
                     ctx.FillRoundedRectangle(&ir, &self.brush(c)?);
                 }
             }
-            let right = self.width - G::CLOCK_RIGHT;
+            self.draw_right(theme, right)?;
+            let r = self.width - G::CLOCK_RIGHT;
             let tb = self.brush(theme.text)?;
-            text::draw(ctx, &self.text, &self.clock_fmt, &clock.0, right - 100.0, right, G::LINE1_BASELINE, &tb, true);
-            text::draw(ctx, &self.text, &self.clock_fmt, &clock.1, right - 100.0, right, G::LINE2_BASELINE, &tb, true);
+            text::draw(ctx, &self.text, &self.clock_fmt, &clock.0, r - 200.0, r, G::LINE1_BASELINE, &tb, true);
+            text::draw(ctx, &self.text, &self.clock_fmt, &clock.1, r - 200.0, r, G::LINE2_BASELINE, &tb, true);
         }
         s.end()
     }

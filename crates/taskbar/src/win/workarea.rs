@@ -27,6 +27,14 @@ pub fn set(r: RECT) {
     log::line(&format!("work area {},{} {}x{}: {}", r.left, r.top, r.right - r.left, r.bottom - r.top, if res.is_ok() { "set" } else { "refused" }));
 }
 
+/// Sets the work area to `want` unless it already is.
+pub fn apply_rect(want: RECT) {
+    let cur = get();
+    if (cur.left, cur.top, cur.right, cur.bottom) != (want.left, want.top, want.right, want.bottom) {
+        set(want);
+    }
+}
+
 impl WorkArea {
     /// Reserves `bar_h` px at the bottom of `monitor`.
     pub fn reserve(monitor: RECT, bar_h: i32) -> WorkArea {

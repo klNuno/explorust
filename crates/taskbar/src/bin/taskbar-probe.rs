@@ -4,7 +4,8 @@
 //! `click:x,y` `mclick:x,y` `sclick:x,y` (Shift+click) `move:x,y` `wait:<s>` `fg` (foreground
 //! title) `state:<title part>` (rect, minimized) `max:<title part>` `restore:<title part>`
 //! `close:<title part>` `workarea` `shutdown` (bus Shutdown to the taskbar) `run:<file or uri>`
-//! `win:<key>` (Win+key, a digit or letter) `shot:<name>` (the screen to `<name>.bmp` beside the exe).
+//! `win:<key>` (Win+key, a digit or letter) `shot:<name>` (the screen to `<name>.bmp` beside the exe)
+//! `rclick:x,y` `esc` `trays` (every `Shell_TrayWnd` with its process id).
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -46,7 +47,32 @@ mod probe {
                 std::thread::sleep(std::time::Duration::from_secs_f32(val.parse().unwrap_or(1.0)));
                 "ok".into()
             }
-            "click" | "mclick" | "sclick" | "move" => {
+            "esc" => {
+                // SAFETY: input injection.
+                unsafe {
+                    key(VK_ESCAPE, false);
+                    key(VK_ESCAPE, true);
+                }
+                "sent".into()
+            }
+            "trays" => {
+                let mut out = Vec::new();
+                let mut after: Option<HWND> = None;
+                // SAFETY: window lookups by class name.
+                unsafe {
+                    while let Ok(h) = FindWindowExW(None, after, windows_core::w!("Shell_TrayWnd"), None) {
+                        if h.is_invalid() {
+                            break;
+                        }
+                        let mut pid = 0;
+                        GetWindowThreadProcessId(h, Some(&mut pid));
+                        out.push(format!("{:#x} pid {pid}", h.0 as usize));
+                        after = Some(h);
+                    }
+                }
+                format!("{} [{}]", out.len(), out.join(", "))
+            }
+            "click" | "mclick" | "sclick" | "move" | "rclick" => {
                 let Some((x, y)) = xy() else { return "bad x,y".into() };
                 // SAFETY: input injection and cursor moves.
                 unsafe {
@@ -54,6 +80,7 @@ mod probe {
                     std::thread::sleep(std::time::Duration::from_millis(60));
                     let (down, up) = match cmd {
                         "mclick" => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+                        "rclick" => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
                         _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
                     };
                     if cmd != "move" {

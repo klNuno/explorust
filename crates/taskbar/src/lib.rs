@@ -8,9 +8,12 @@
 //! runs its message loop and returns on `bus::Command::Shutdown` or `WM_QUIT`. A panic is caught
 //! and logged by the shell, which starts `run()` again (at most 3 times in 5 minutes).
 
+pub mod appbar;
 pub mod geom;
 pub mod model;
+pub mod right;
 pub mod theme;
+pub mod tray;
 
 #[cfg(target_os = "windows")]
 mod win;
