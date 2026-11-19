@@ -26,6 +26,18 @@ pub fn dev_wnf_scan(out: &std::path::Path, quiet: u64, after: u64) {
     win::wnf::scan(out, quiet, after);
 }
 
+/// Dev probe: publishes the shell-ready WNF signal if nobody did (see `win/wnf.rs`), logs it.
+#[cfg(target_os = "windows")]
+pub fn dev_shell_ready() {
+    log::line(&format!("notify-dev: {}", win::wnf::ensure_shell_ready()));
+}
+
+/// `explorust-notify.exe`: the change-event helper with package identity (`win/helper.rs`).
+#[cfg(target_os = "windows")]
+pub fn helper(parent: u32, hwnd: isize) -> i32 {
+    win::helper::run(parent, hwnd)
+}
+
 /// Runs the component until shutdown.
 pub fn run() {
     #[cfg(target_os = "windows")]

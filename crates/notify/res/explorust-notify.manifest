@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" name="explorust.notify.helper"/>
+  <!-- Package identity from the sparse package of ../package/AppxManifest.xml (same publisher,
+       name and application id). -->
+  <msix xmlns="urn:schemas-microsoft-com:msix.v1"
+    publisher="CN=explorust, OID.2.25.311729368913984317654407730594956997722=1"
+    packageName="explorust.notify"
+    applicationId="notify"/>
+</assembly>

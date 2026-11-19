@@ -2,6 +2,7 @@
 //! screen, stacked above the taskbar's right side.
 
 mod card;
+pub mod helper;
 mod listen;
 mod system;
 mod twinui;
@@ -36,6 +37,8 @@ pub fn run() {
     // SAFETY: COM for this thread only (STA, the UI thread).
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
     log::line("notify: run");
+    // Without explorer nobody says the shell is up, and Windows' notification center refuses to open.
+    log::line(&format!("notify: {}", wnf::ensure_shell_ready()));
     match create() {
         Err(e) => log::line(&format!("notify: windows not created: {e}")),
         Ok(cmd) => {
@@ -110,6 +113,14 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             added(*toast);
             LRESULT(0)
         }
+        listen::MSG_WAKE => {
+            listen::wake();
+            LRESULT(0)
+        }
+        listen::MSG_HELPER => {
+            listen::helper_said(wparam.0 == 1);
+            LRESULT(0)
+        }
         listen::MSG_REMOVED => {
             let id = wparam.0 as u32;
             let hwnd = ST.with(|c| c.borrow().as_ref().and_then(|s| s.cards.iter().find(|k| k.toast.id == id).map(|k| k.hwnd)));
@@ -133,7 +144,15 @@ fn panel(cmd: bus::Command, arg: isize) {
         let t0 = std::time::Instant::now();
         let r = match cmd {
             bus::Command::NotificationCenter if arg > 0 => twinui::notification_center_hotkey(arg as u32 - 1).map(|_| format!("hotkey {} sent", arg - 1)),
-            bus::Command::NotificationCenter => twinui::toggle_notification_center().map(|v| format!("visible {v}")),
+            bus::Command::NotificationCenter => twinui::toggle_notification_center().or_else(|e| {
+                // E_UNEXPECTED: the center still waits for the shell-ready signal; give it and retry.
+                if e.code().0 as u32 != 0x8000FFFF {
+                    return Err(e);
+                }
+                log::line(&format!("notify: center not ready ({e}), {}", wnf::ensure_shell_ready()));
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                twinui::toggle_notification_center()
+            }).map(|v| format!("visible {v}")),
             bus::Command::ClipboardHistory => twinui::show_clipboard_history().map(|_| "shown".into()),
             bus::Command::EmojiPanel => {
                 let kind = if arg > 0 { arg as u32 } else { twinui::HOTKEY_EMOJI };

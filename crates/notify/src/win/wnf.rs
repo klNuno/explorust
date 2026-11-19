@@ -17,7 +17,13 @@ use windows_core::{s, w};
 pub const SHEL_TOAST_PUBLISHED: u64 = 0x0d83063ea3bd0035;
 /// `WNF_SHEL_NOTIFICATIONS`.
 pub const SHEL_NOTIFICATIONS: u64 = 0x0d83063ea3bc1035;
+/// `WNF_SHEL_SESSION_LOGON_COMPLETE`, session scope. Explorer publishes it (no data) once its
+/// desktop is up; twinui's notification center refuses to show (`Show` returns E_UNEXPECTED,
+/// "skipped due to shell not ready") until it has data, and its toast center waits on it too.
+/// Name and value read from twinui.pcshell.dll and explorer.exe of 26300.9974 (step notify-4).
+pub const SHEL_SESSION_LOGON_COMPLETE: u64 = 0x0d83063ea3be3835;
 
+type Publish = unsafe extern "system" fn(u64, *const c_void, *const c_void, u32, *const c_void) -> i32;
 type Query = unsafe extern "system" fn(*const u64, *const c_void, *const c_void, *mut u32, *mut c_void, *mut u32) -> i32;
 pub type Callback = unsafe extern "system" fn(u64, u32, *const c_void, *mut c_void, *const c_void, u32) -> i32;
 type Subscribe = unsafe extern "system" fn(*mut *mut c_void, u64, u32, Callback, *mut c_void, *const c_void, u32, u32) -> i32;
@@ -42,6 +48,29 @@ pub fn query(name: u64) -> Result<(u32, Vec<u8>), i32> {
     }
     buf.truncate(size as usize);
     Ok((stamp, buf))
+}
+
+/// Publishes `name` with no data, as explorer does for its logon signals.
+pub fn publish(name: u64) -> Result<(), i32> {
+    let f = proc(s!("RtlPublishWnfStateData")).ok_or(-1)?;
+    // SAFETY: RtlPublishWnfStateData(name, type id, buffer, length, scope) since Windows 8.
+    let f: Publish = unsafe { std::mem::transmute(f) };
+    // SAFETY: no buffer, no type id, the caller's own scope.
+    let st = unsafe { f(name, std::ptr::null(), std::ptr::null(), 0, std::ptr::null()) };
+    if st < 0 { Err(st) } else { Ok(()) }
+}
+
+/// Tells twinui's experiences that the shell is up, when nobody (explorer) did in this session:
+/// publishes `WNF_SHEL_SESSION_LOGON_COMPLETE` if it was never published. Returns what it did.
+pub fn ensure_shell_ready() -> String {
+    match query(SHEL_SESSION_LOGON_COMPLETE) {
+        Ok((stamp, _)) if stamp > 0 => format!("session logon complete already published (stamp {stamp})"),
+        Ok(_) => match publish(SHEL_SESSION_LOGON_COMPLETE) {
+            Ok(()) => format!("session logon complete published, stamp now {:?}", query(SHEL_SESSION_LOGON_COMPLETE).map(|(s, _)| s)),
+            Err(st) => format!("session logon complete not published: 0x{st:08x}"),
+        },
+        Err(st) => format!("session logon complete unreadable: 0x{st:08x}"),
+    }
 }
 
 /// Calls `cb(context)` on ntdll's WNF thread on every change of `name` after its current stamp.

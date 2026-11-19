@@ -8,6 +8,10 @@ publish.workspace = true
 name = "notify-dev"
 path = "src/bin/notify-dev.rs"
 
+[[bin]]
+name = "explorust-notify"
+path = "src/bin/explorust-notify.rs"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 bus = { path = "../bus" }
 render = { path = "../render" }

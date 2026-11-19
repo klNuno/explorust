@@ -2,7 +2,7 @@
 //! thread of its own (MTA), and posts each one to the UI thread's command window.
 
 use crate::log;
-use super::wnf;
+use super::{helper, wnf};
 use crate::model::Toast;
 use std::ffi::c_void;
 use std::collections::HashSet;
@@ -17,6 +17,26 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 pub const MSG_ADDED: u32 = 0x8000 + 0x201;
 /// wParam = the notification id that left the center.
 pub const MSG_REMOVED: u32 = 0x8000 + 0x202;
+/// From `explorust-notify.exe`: the center changed (wParam = notification id).
+pub const MSG_WAKE: u32 = 0x8000 + 0x203;
+/// From `explorust-notify.exe`: wParam 1 when it subscribed to the change event, 0 when refused.
+pub const MSG_HELPER: u32 = 0x8000 + 0x204;
+
+/// 0 no answer yet, 1 the helper subscribed, 2 it was refused.
+static HELPER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// UI thread, on `MSG_WAKE`: the listener diffs the center now.
+pub fn wake() {
+    if let Some(t) = LISTENER.get() {
+        t.unpark();
+    }
+}
+
+/// UI thread, on `MSG_HELPER`.
+pub fn helper_said(ok: bool) {
+    HELPER.store(if ok { 1 } else { 2 }, std::sync::atomic::Ordering::Release);
+    wake();
+}
 
 /// Starts the listener thread; it lives as long as the process (the event keeps it registered).
 pub fn spawn(target: HWND) {
@@ -83,9 +103,9 @@ fn listen(target: HWND) {
 }
 
 /// The fallback when the platform refuses the change event (any process without package
-/// identity): diffs the toasts of the center by id each time a WNF state name given in
-/// `EXPLORUST_NOTIFY_WNF` changes (`wnf.rs`), else once a second. No name that changes on a
-/// published toast is known yet, so the default is the 1 s diff (about 7 ms CPU each).
+/// identity): diffs the toasts of the center by id each time `explorust-notify.exe` (which has
+/// the identity, `helper.rs`) says the center changed, or a WNF state name given in
+/// `EXPLORUST_NOTIFY_WNF` changes (`wnf.rs`), else once a second (about 7 ms CPU each).
 fn watch(listener: &UserNotificationListener, target: HWND) {
     let ids = |l: &UserNotificationListener| -> Vec<(u32, UserNotification)> {
         l.GetNotificationsAsync(NotificationKinds::Toast)
@@ -96,13 +116,24 @@ fn watch(listener: &UserNotificationListener, target: HWND) {
     let t0 = std::time::Instant::now();
     let mut seen: HashSet<u32> = ids(listener).into_iter().map(|(id, _)| id).collect();
     let first_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let woken = subscribe();
-    match woken {
-        true => log::line(&format!("listener: waiting on WNF, {} toasts already in the center, one diff {first_ms:.2} ms", seen.len())),
-        false => log::line(&format!("listener: no WNF subscription, polling every {POLL_MS} ms, {} toasts in the center", seen.len())),
+    let _ = LISTENER.set(std::thread::current());
+    let mut helper = start_helper(target);
+    let mut woken = helper.is_some() || subscribe();
+    match (helper.is_some(), woken) {
+        (true, _) => log::line(&format!("listener: waiting on {}, {} toasts already in the center, one diff {first_ms:.2} ms", helper::EXE, seen.len())),
+        (false, true) => log::line(&format!("listener: waiting on WNF, {} toasts already in the center, one diff {first_ms:.2} ms", seen.len())),
+        (false, false) => log::line(&format!("listener: no WNF subscription, polling every {POLL_MS} ms, {} toasts in the center", seen.len())),
     }
     loop {
-        if woken {
+        if let Some(h) = helper {
+            // A safety net only: the helper wakes this thread on every change.
+            std::thread::park_timeout(std::time::Duration::from_secs(HELPER_CHECK_S));
+            if !helper::alive(h) {
+                log::line(&format!("listener: {} exited, polling every {POLL_MS} ms", helper::EXE));
+                helper = None;
+                woken = false;
+            }
+        } else if woken {
             std::thread::park();
         } else {
             std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
@@ -141,6 +172,26 @@ fn watch(listener: &UserNotificationListener, target: HWND) {
 }
 
 const POLL_MS: u64 = 1000;
+const HELPER_CHECK_S: u64 = 60;
+
+/// Starts `explorust-notify.exe` and waits up to 5 s for its answer; its handle when it subscribed.
+fn start_helper(target: HWND) -> Option<windows::Win32::Foundation::HANDLE> {
+    let h = helper::start(target)?;
+    let t0 = std::time::Instant::now();
+    while HELPER.load(std::sync::atomic::Ordering::Acquire) == 0 && t0.elapsed().as_secs() < 5 && helper::alive(h) {
+        std::thread::park_timeout(std::time::Duration::from_millis(200));
+    }
+    if HELPER.load(std::sync::atomic::Ordering::Acquire) == 1 {
+        log::line(&format!("listener: {} subscribed after {:.1} ms", helper::EXE, t0.elapsed().as_secs_f64() * 1000.0));
+        return Some(h);
+    }
+    log::line(&format!("listener: {} gave no subscription (state {})", helper::EXE, HELPER.load(std::sync::atomic::Ordering::Acquire)));
+    if helper::alive(h) {
+        // SAFETY: ends our own child, which answered nothing useful.
+        unsafe { let _ = windows::Win32::System::Threading::TerminateProcess(h, 1); }
+    }
+    None
+}
 
 /// The WNF state names to wait on, from `EXPLORUST_NOTIFY_WNF` (hex, comma separated). None by
 /// default: in g1 (26300, no toast UI running) `notify-dev --wnf-scan` saw no well-known name
@@ -163,7 +214,6 @@ unsafe extern "system" fn wnf_changed(name: u64, stamp: u32, _: *const c_void, _
 
 /// Subscribes this thread to the toast WNF names; false when none took.
 fn subscribe() -> bool {
-    let _ = LISTENER.set(std::thread::current());
     let mut any = false;
     for name in wnf_names() {
         match wnf::subscribe(name, wnf_changed, std::ptr::null_mut()) {
