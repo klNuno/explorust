@@ -21,10 +21,10 @@ mode=$(cat "$(echo "$mode" | grep '^log:' | awk '{print $2}')" | grep -o 'MODE=[
 echo "g1 mode: ${mode:-unknown}"
 ua=0
 [ "$mode" = installed ] && ua=1
-os job run --wait -- env EXPLORUST_UIACCESS=$ua cargo build --release --target x86_64-pc-windows-gnu -p shell -p keys -p guard -p devkeys -p files -p inject -p notify
+os job run --wait -- env EXPLORUST_UIACCESS=$ua cargo build --release --target x86_64-pc-windows-gnu -p shell -p keys -p guard -p devkeys -p files -p inject -p notify -p viewer -p taskman
 t=target/x86_64-pc-windows-gnu/release
 mkdir -p dist
-cp "$t/explorust.exe" "$t/explorust-guard.exe" "$t/keys.exe" "$t/explorust-keys.exe" "$t/explorust-open.exe" "$t/explorust_inject.dll" "$t/explorust-notify.exe" tools/g1-state.ps1 dist/
+cp "$t/explorust.exe" "$t/explorust-guard.exe" "$t/keys.exe" "$t/explorust-keys.exe" "$t/explorust-open.exe" "$t/explorust_inject.dll" "$t/explorust-notify.exe" "$t/explorust-viewer.exe" "$t/explorust-taskman.exe" tools/g1-state.ps1 dist/
 python3 -I crates/notify/package/make-msix.py dist/explorust-notify.msix
 [ $ua = 1 ] && python3 -I tools/authenticode-sign.py sign dist/explorust-keys.exe
 cp dist/explorust.exe dist/explorust.next.exe
@@ -38,6 +38,10 @@ timeout 120 os win push g1 dist/g1-state.ps1 'C:\explorust' >/dev/null
 timeout 90 os win run g1 --ps -- 'Set-Location C:\explorust; Remove-Item explorust-notify.old*.exe -EA SilentlyContinue; if (Test-Path explorust-notify.exe) { Rename-Item explorust-notify.exe ("explorust-notify.old" + (Get-Random) + ".exe") }; "helper set aside"' >/dev/null
 timeout 120 os win push g1 dist/explorust-notify.exe 'C:\explorust' >/dev/null
 timeout 120 os win push g1 dist/explorust-notify.msix 'C:\explorust' >/dev/null
+# The default handlers (image viewer, task manager): a running one locks its exe, so it is renamed aside first.
+timeout 90 os win run g1 --ps -- 'Set-Location C:\explorust; foreach ($n in "explorust-viewer", "explorust-taskman") { Remove-Item "$n.old*.exe" -EA SilentlyContinue; if (Test-Path "$n.exe") { Rename-Item "$n.exe" ("$n.old" + (Get-Random) + ".exe") } }; "handlers set aside"' >/dev/null
+timeout 120 os win push g1 dist/explorust-viewer.exe 'C:\explorust' >/dev/null
+timeout 120 os win push g1 dist/explorust-taskman.exe 'C:\explorust' >/dev/null
 if [ "${1:-}" = "--guard" ]; then
   cp "$t/explorust-guard.exe" dist/explorust-guard.next.exe
   timeout 120 os win push g1 dist/explorust-guard.next.exe 'C:\explorust' >/dev/null
@@ -49,6 +53,16 @@ if [ $ua = 1 ]; then
   # Swap as SYSTEM: <name>.exe -> <name>.old (a running image can be renamed), then copy the new one.
   timeout 90 os win run g1 --ps -- "\$d='$pf'; function swap(\$src, \$name) { if (-not (Test-Path \$src)) { return }; Remove-Item \"\$d\\\$name.old\" -EA SilentlyContinue; if (Test-Path \"\$d\\\$name.exe\") { Rename-Item \"\$d\\\$name.exe\" \"\$name.old\" }; Copy-Item \$src \"\$d\\\$name.exe\"; Remove-Item \$src; \"\$name swapped\" }; Copy-Item C:\\explorust\\explorust-open.exe C:\\explorust\\explorust-open.stage.exe; Copy-Item C:\\explorust\\explorust-keys.exe C:\\explorust\\explorust-keys.stage.exe; swap C:\\explorust\\explorust.next.exe explorust; swap C:\\explorust\\explorust-open.stage.exe explorust-open; swap C:\\explorust\\explorust-keys.stage.exe explorust-keys; swap C:\\explorust\\explorust-guard.next.exe explorust-guard; Get-ChildItem \"\$d\\explorust-notify.old*.exe\" -EA SilentlyContinue | Remove-Item -EA SilentlyContinue; if (Test-Path \"\$d\\explorust-notify.exe\") { Rename-Item \"\$d\\explorust-notify.exe\" (\"explorust-notify.old\" + (Get-Random) + \".exe\") }; Copy-Item C:\\explorust\\explorust-notify.exe \"\$d\\explorust-notify.exe\"; Copy-Item C:\\explorust\\explorust-notify.msix \"\$d\\explorust-notify.msix\" -Force; 'explorust-notify swapped'; \$dll=\"\$d\\explorust_inject.dll\"; if (Test-Path C:\\explorust\\explorust_inject.dll) { Remove-Item \"\$dll.old\" -EA SilentlyContinue; if (Test-Path \$dll) { Rename-Item \$dll explorust_inject.dll.old }; Copy-Item C:\\explorust\\explorust_inject.dll \$dll; 'explorust_inject swapped' }" >/dev/null
 fi
+if [ $ua = 1 ]; then
+  # The handlers next to explorust.exe in Program Files, as SYSTEM, the running ones renamed aside.
+  timeout 90 os win run g1 --ps -- "\$d='$pf'; foreach (\$n in 'explorust-viewer', 'explorust-taskman') { Get-ChildItem \"\$d\\\$n.old*.exe\" -EA SilentlyContinue | Remove-Item -EA SilentlyContinue; if (Test-Path \"\$d\\\$n.exe\") { Rename-Item \"\$d\\\$n.exe\" (\$n + '.old' + (Get-Random) + '.exe') }; Copy-Item \"C:\\explorust\\\$n.exe\" \"\$d\\\$n.exe\"; \"\$n swapped\" }" >/dev/null
+  hd=$pf
+else
+  hd='C:\explorust'
+fi
+# The viewer registers itself for the logged-on user (--ps runs as SYSTEM): ProgID, OpenWithProgids,
+# RegisteredApplications under HKCU; no default changes.
+timeout 90 os win run g1 --desktop -- "$hd\explorust-viewer.exe" --register >/dev/null 2>&1 || true
 # Any explorust.exe can ask the running one to reload.
 timeout 90 os win run g1 --desktop -- 'C:\explorust\explorust.exe' --reload >/dev/null 2>&1 || true
 sleep 4
