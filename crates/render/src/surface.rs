@@ -75,6 +75,25 @@ impl Surface {
         }
     }
 
+    /// Resizes the swap chain's buffers and retargets the device context to the new back buffer.
+    pub fn resize(&self, width: u32, height: u32) -> Result<()> {
+        unsafe {
+            self.ctx.SetTarget(None);
+            self.swap.ResizeBuffers(0, width.max(1), height.max(1), DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))?;
+            let buffer: IDXGISurface = self.swap.GetBuffer(0)?;
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                ..Default::default()
+            };
+            let target = self.ctx.CreateBitmapFromDxgiSurface(&buffer, Some(&props))?;
+            self.ctx.SetTarget(&target);
+            Ok(())
+        }
+    }
+
     pub fn begin(&self) {
         unsafe {
             self.ctx.BeginDraw();

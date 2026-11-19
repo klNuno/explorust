@@ -18,6 +18,7 @@ path = "src/bin/desktop-lively.rs"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 bus = { path = "../bus" }
+menu = { path = "../menu" }
 windows-core.workspace = true
 windows = { workspace = true, features = [
   "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Graphics_Imaging",

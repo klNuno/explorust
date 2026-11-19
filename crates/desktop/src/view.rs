@@ -38,6 +38,8 @@ pub fn create(progman: HWND, client: Rect) -> windows_core::Result<Desk> {
         let sb: IShellBrowser = browser.to_interface();
         let hwnd = view.CreateViewWindow(None, &fs, &sb, &rc)?;
         let _ = view.UIActivate(SVUIA_ACTIVATE_NOFOCUS);
+        // Right-click, the menu key and Shift+F10 show the Windows 11 menu (crates/menu).
+        menu::hook(&view);
         log::line(&format!("view {:?} flags {flags:#x}", hwnd.0));
         if let Ok(fv) = view.cast::<IFolderView2>() {
             let mut mode = FOLDERVIEWMODE(0);

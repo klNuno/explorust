@@ -20,6 +20,7 @@ path = "src/bin/explorust-open.rs"
 bus = { path = "../bus" }
 shelldata = { path = "../shelldata" }
 render = { path = "../render" }
+menu = { path = "../menu" }
 windows-core.workspace = true
 windows-numerics = "0.3.1"
 windows = { workspace = true, features = [

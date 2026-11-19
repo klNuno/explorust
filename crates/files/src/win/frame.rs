@@ -879,6 +879,10 @@ impl Frame {
             shell::dark_children(root);
         }
         t.view_window = t.shell_view().and_then(|v| unsafe { windows::Win32::System::Ole::IOleWindow::GetWindow(&v).ok() });
+        // Right-click, the menu key and Shift+F10 show the Windows 11 menu (crates/menu).
+        if let Some(v) = t.shell_view() {
+            menu::hook(&v);
+        }
     }
 }
 
