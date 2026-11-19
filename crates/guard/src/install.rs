@@ -19,9 +19,17 @@ use windows::core::{HSTRING, PCWSTR};
 /// The public half of the signing certificate (`tools/authenticode-sign.py keygen`).
 const CERT: &[u8] = include_bytes!("../res/explorust-codesign.cer");
 const STORES: [&str; 2] = ["Root", "TrustedPublisher"];
-/// What runs from the install folder: the guard, the shell, the folder handler and the UWP probe
-/// some host builds start beside explorust.exe.
-const FILES: [&str; 4] = ["explorust-guard.exe", "explorust.exe", "explorust-open.exe", "nickel-windows-app-probe.exe"];
+/// What runs from the install folder: the guard, the shell, the folder handler, the UWP probe
+/// some host builds start beside explorust.exe, and the toast listener's helper with its sparse
+/// package (`package.rs`).
+const FILES: [&str; 6] = [
+    "explorust-guard.exe",
+    "explorust.exe",
+    "explorust-open.exe",
+    "nickel-windows-app-probe.exe",
+    "explorust-notify.exe",
+    crate::package::MSIX,
+];
 
 pub fn elevated() -> bool {
     // SAFETY: a plain token query.

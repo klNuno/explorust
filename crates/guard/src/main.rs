@@ -16,6 +16,7 @@
 mod folders;
 mod hotkey;
 mod install;
+mod package;
 mod log;
 mod policy;
 mod proc;
@@ -109,8 +110,15 @@ fn install() -> u32 {
         }
     } else {
         say("install: not elevated, so no Program Files copy: a uiAccess build will not start from here");
-        me
+        me.clone()
     };
+    // The toast listener's identity; explorust runs without it (it polls), so a failure only warns.
+    let from = me.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let dir = guard.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    match package::add(&from, &dir) {
+        Ok(p) => say(&format!("install: notification helper package {p}, external location {}", dir.display())),
+        Err(e) => say(&format!("install: notification helper package not installed ({e}); toasts are polled")),
+    }
     match reg::set_shell(&format!("\"{}\"", guard.display())) {
         Ok(()) => {
             say(&format!("installed: next logon starts {}", guard.display()));
@@ -140,6 +148,10 @@ fn restore() -> u32 {
     };
     folders::handler(false);
     let _ = proc::Event::set_existing(supervise::FALLBACK_EVENT);
+    match package::remove() {
+        Ok(r) => say(&format!("restore: notification helper package {r}")),
+        Err(e) => say(&format!("restore: notification helper package: {e}")),
+    }
     if !install::elevated() {
         if install::dir().exists() || install::trusted() {
             say("restore: run it elevated to remove the Program Files copy and the certificate");
