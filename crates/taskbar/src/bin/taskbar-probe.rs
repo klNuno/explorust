@@ -7,7 +7,9 @@
 //! `win:<key>` (Win+key, a digit or letter) `shot:<name>` (the screen to `<name>.bmp` beside the exe)
 //! `rclick:x,y` `esc` `trays` (every `Shell_TrayWnd` with its process id) `flash:<title part>`
 //! (FlashWindowEx with FLASHW_TRAY | FLASHW_TIMERNOFG) `winx` `trayfocus` `taskfocus` (bus commands)
-//! `key:left|right|enter|apps|esc`.
+//! `key:left|right|enter|apps|esc` `progress:<title part>,<percent>` `pstate:<title part>,<TBPFLAG>`
+//! `overlay:<title part>` (a stock warning badge) `overlayoff:<title part>` (ITaskbarList3 calls made
+//! here on that window) `res:<w>x<h>` (display resolution; `res:0` puts the registry mode back).
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -131,6 +133,28 @@ mod probe {
                 let was = unsafe { FlashWindowEx(&fi) }.as_bool();
                 format!("FlashWindowEx {} ({:#x}): was active {was}", title(h), h.0 as usize)
             }
+            "progress" | "pstate" | "overlay" | "overlayoff" => {
+                let (part, n) = val.split_once(',').unwrap_or((val, "0"));
+                let Some(h) = find(part) else { return "not found".into() };
+                let n: u64 = n.trim().parse().unwrap_or(0);
+                taskbar_list(cmd, h, n)
+            }
+            "res" => {
+                use windows::Win32::Graphics::Gdi::{CDS_TYPE, ChangeDisplaySettingsW, DEVMODEW, DM_PELSHEIGHT, DM_PELSWIDTH};
+                let r = if val == "0" {
+                    // SAFETY: restores the registry display mode.
+                    unsafe { ChangeDisplaySettingsW(None, CDS_TYPE(0)) }
+                } else {
+                    let Some((w, hh)) = val.split_once('x') else { return "bad WxH".into() };
+                    let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+                    dm.dmPelsWidth = w.parse().unwrap_or(1280);
+                    dm.dmPelsHeight = hh.parse().unwrap_or(800);
+                    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+                    // SAFETY: a dynamic mode change (not saved to the registry).
+                    unsafe { ChangeDisplaySettingsW(Some(&dm), CDS_TYPE(0)) }
+                };
+                format!("ChangeDisplaySettings: {}", r.0)
+            }
             "winx" => format!("posted={}", bus::post(bus::Command::WinX, 0)),
             "trayfocus" => format!("posted={}", bus::post(bus::Command::TrayFocus, 0)),
             "taskfocus" => format!("posted={}", bus::post(bus::Command::TaskbarFocus, 0)),
@@ -170,6 +194,31 @@ mod probe {
             "shot" => shot(val),
             "shutdown" => format!("posted={}", bus::post_to(bus::Owner::Taskbar, bus::Command::Shutdown, 0)),
             _ => "unknown step".into(),
+        }
+    }
+
+    /// One ITaskbarList3 call on `h`, made the way any app makes it (CLSID_TaskbarList in this process).
+    fn taskbar_list(cmd: &str, h: HWND, n: u64) -> String {
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
+        use windows::Win32::UI::Shell::{ITaskbarList3, TBPFLAG, TaskbarList};
+        // SAFETY: COM on this thread, then calls on the taskbar list object.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let t: ITaskbarList3 = match CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER) {
+                Ok(t) => t,
+                Err(e) => return format!("CoCreateInstance: {e}"),
+            };
+            let init = t.HrInit();
+            let r = match cmd {
+                "progress" => t.SetProgressValue(h, n, 100),
+                "pstate" => t.SetProgressState(h, TBPFLAG(n as i32)),
+                "overlay" => {
+                    let icon = LoadIconW(None, IDI_WARNING).unwrap_or_default();
+                    t.SetOverlayIcon(h, icon, windows_core::w!("Warning"))
+                }
+                _ => t.SetOverlayIcon(h, HICON::default(), windows_core::PCWSTR::null()),
+            };
+            format!("{} ({:#x}): HrInit {:?}, call {:?}", title(h), h.0 as usize, init, r)
         }
     }
 

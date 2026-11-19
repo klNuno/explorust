@@ -13,6 +13,8 @@ pub mod geom;
 pub mod jump;
 pub mod model;
 pub mod right;
+pub mod settings;
+pub mod taskband;
 pub mod theme;
 pub mod thumbs;
 pub mod tray;

@@ -46,6 +46,10 @@ pub fn task_of(hwnd: HWND) -> Option<Task> {
         if !app && (ex & WS_EX_TOOLWINDOW.0 != 0 || ex & WS_EX_NOACTIVATE.0 != 0 || owned) {
             return None;
         }
+        // ITaskbarList::DeleteTab marks the window with this property.
+        if !windows::Win32::UI::WindowsAndMessaging::GetPropW(hwnd, windows_core::w!("ITaskList_Deleted")).is_invalid() {
+            return None;
+        }
     }
     if items::is_cloaked(hwnd) {
         return None;

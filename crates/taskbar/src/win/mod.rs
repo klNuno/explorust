@@ -10,6 +10,8 @@ mod popup;
 mod scene;
 mod side;
 mod status;
+mod settings;
+mod taskband;
 mod tasks;
 mod thumbs;
 mod trayhost;

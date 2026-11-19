@@ -25,6 +25,10 @@ pub struct Slot<'a> {
     pub hover: f32,
     pub press: f32,
     pub focused: bool,
+    /// ITaskbarList3 progress and the animation clock in seconds (indeterminate).
+    pub progress: Option<(crate::taskband::Progress, f32)>,
+    /// The window whose overlay badge shows on this button.
+    pub overlay: Option<isize>,
 }
 
 /// The right side as drawn.
@@ -48,6 +52,8 @@ pub struct Scene {
     start: ID2D1Bitmap1,
     icons: HashMap<String, Option<ID2D1Bitmap1>>,
     tray: HashMap<isize, Option<ID2D1Bitmap1>>,
+    /// Overlay badges by window.
+    overlays: HashMap<isize, ID2D1Bitmap1>,
     pub scale: f32,
     pub width: f32,
 }
@@ -61,7 +67,7 @@ impl Scene {
         let chevron_fmt = text.format("Segoe Fluent Icons", G::CHEVRON_PX, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?;
         let logo = start_image(theme.light, (G::START_SQ * scale).round() as u32);
         let start = surface.bitmap(logo.width, logo.height, &logo.to_premultiplied_bgra())?;
-        Ok(Scene { surface, text, clock_fmt, glyph_fmt, chevron_fmt, start, icons: HashMap::new(), tray: HashMap::new(), scale, width: w_px as f32 / scale })
+        Ok(Scene { surface, text, clock_fmt, glyph_fmt, chevron_fmt, start, icons: HashMap::new(), tray: HashMap::new(), overlays: HashMap::new(), scale, width: w_px as f32 / scale })
     }
 
     pub fn icon_px(&self) -> i32 {
@@ -75,6 +81,17 @@ impl Scene {
     pub fn set_icon(&mut self, key: &str, img: Option<shelldata::Image>) {
         let bmp = img.and_then(|i| self.surface.bitmap(i.width, i.height, &i.to_premultiplied_bgra()).ok());
         self.icons.insert(key.to_string(), bmp);
+    }
+
+    pub fn set_overlay(&mut self, hwnd: isize, img: Option<shelldata::Image>) {
+        match img.and_then(|i| self.surface.bitmap(i.width, i.height, &i.to_premultiplied_bgra()).ok()) {
+            Some(b) => {
+                self.overlays.insert(hwnd, b);
+            }
+            None => {
+                self.overlays.remove(&hwnd);
+            }
+        }
     }
 
     pub fn tray_px(&self) -> i32 {
@@ -157,15 +174,50 @@ impl Scene {
         Ok(())
     }
 
+    /// The button's progress bar where the indicator is: a track the button's width, the filled
+    /// part in the state's color, or a moving segment when indeterminate.
+    fn draw_progress(&self, theme: &Theme, cx: f32, p: crate::taskband::Progress, t: f32) -> Result<()> {
+        use crate::taskband::ProgressState as P;
+        let ctx = &self.surface.ctx;
+        let w = G::PROGRESS_W;
+        let x0 = cx - w / 2.0;
+        let y = G::INDICATOR_Y;
+        let h = G::INDICATOR_H;
+        let r = h / 2.0;
+        let c = match p.state {
+            P::Error => theme.progress_error,
+            P::Paused => theme.progress_paused,
+            _ => theme.progress,
+        };
+        // SAFETY: drawing calls between BeginDraw and EndDraw on this thread's context.
+        unsafe {
+            let track = D2D1_ROUNDED_RECT { rect: rect(x0, y, w, h), radiusX: r, radiusY: r };
+            ctx.FillRoundedRectangle(&track, &self.brush(theme.progress_track)?);
+            let (a, len) = if p.state == P::Indeterminate {
+                let seg = w * 0.4;
+                let k = (t % 1.5) / 1.5;
+                let a = -seg + (w + seg) * k;
+                (a.max(0.0), (a + seg).min(w) - a.max(0.0))
+            } else {
+                (0.0, (w * p.value).max(h))
+            };
+            if len > 0.0 {
+                let fill = D2D1_ROUNDED_RECT { rect: rect(x0 + a, y, len, h), radiusX: r, radiusY: r };
+                ctx.FillRoundedRectangle(&fill, &self.brush(c)?);
+            }
+        }
+        Ok(())
+    }
+
     fn brush(&self, c: Rgba) -> Result<ID2D1Brush> {
         let b: ID2D1SolidColorBrush = self.surface.brush(rgba(c.0, c.1, c.2, c.3))?;
         b.cast()
     }
 
-    pub fn draw(&self, theme: &Theme, slots: &[Slot], clock: &(String, String), right: &RightView) -> Result<()> {
+    pub fn draw(&self, theme: &Theme, slots: &[Slot], clock: &(String, String), right: &RightView, left: bool) -> Result<()> {
         let s = &self.surface;
         let ctx = &s.ctx;
-        let row = Row { width: self.width, buttons: slots.len() };
+        let row = Row { width: self.width, buttons: slots.len(), left };
         s.begin();
         // SAFETY: drawing calls between BeginDraw and EndDraw on this thread's context.
         unsafe {
@@ -224,7 +276,14 @@ impl Scene {
                 if let Some((bmp, r)) = icon {
                     ctx.DrawBitmap(bmp, Some(&r), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
                 }
-                if b.running {
+                if let Some(Some(bmp)) = b.overlay.map(|h| self.overlays.get(&h)) {
+                    let o = super::taskband::OVERLAY;
+                    let r = rect(cx + G::ICON / 2.0 - o + G::OVERLAY_OUT, G::ICON_TOP + G::ICON - o + G::OVERLAY_OUT, o, o);
+                    ctx.DrawBitmap(bmp, Some(&r), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None);
+                }
+                if let Some((p, t)) = b.progress {
+                    self.draw_progress(theme, cx, p, t)?;
+                } else if b.running {
                     let (w, c) = if b.flashing {
                         (G::ATTENTION_W, theme.attention_ind)
                     } else if b.active {

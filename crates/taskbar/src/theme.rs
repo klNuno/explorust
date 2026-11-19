@@ -27,6 +27,12 @@ pub struct Theme {
     pub running: Rgba,
     pub active_ind: Rgba,
     pub focus: Rgba,
+    /// Taskbar progress (ITaskbarList3): normal, paused and error fills, and the track under them.
+    /// Windows 11's SystemFillColorSuccess, Caution and Critical; not measured on a real bar.
+    pub progress: Rgba,
+    pub progress_paused: Rgba,
+    pub progress_error: Rgba,
+    pub progress_track: Rgba,
 }
 
 impl Theme {
@@ -47,6 +53,10 @@ impl Theme {
                 running: (132, 132, 132, 1.0),
                 active_ind: (accent.0, accent.1, accent.2, 1.0),
                 focus: (0, 0, 0, 0.9),
+                progress: (15, 123, 15, 1.0),
+                progress_paused: (157, 93, 0, 1.0),
+                progress_error: (196, 43, 28, 1.0),
+                progress_track: (0, 0, 0, 0.16),
             }
         } else {
             Theme {
@@ -64,6 +74,10 @@ impl Theme {
                 running: (155, 155, 156, 1.0),
                 active_ind: (181, 173, 235, 1.0),
                 focus: (255, 255, 255, 0.9),
+                progress: (108, 203, 95, 1.0),
+                progress_paused: (252, 225, 0, 1.0),
+                progress_error: (255, 153, 164, 1.0),
+                progress_track: (255, 255, 255, 0.16),
             }
         }
     }

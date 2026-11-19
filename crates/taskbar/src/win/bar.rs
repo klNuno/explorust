@@ -6,7 +6,9 @@
 use super::actions::{self, Launch};
 use super::scene::{RightView, Scene, Slot};
 use super::side::{self, Asks, Ctx, Side};
-use super::{jumplist, menu, popup, trayhost, winx};
+use super::{jumplist, menu, popup, settings, trayhost, winx};
+use super::taskband::{self as band, Taskband};
+use crate::settings::{self as S, Settings};
 use super::thumbs::ThumbFlyout;
 use crate::jump;
 use crate::right::Hit;
@@ -52,6 +54,10 @@ const TIMER_CLOCK: usize = 2;
 const TIMER_THUMB_OPEN: usize = 5;
 const TIMER_THUMB_CLOSE: usize = 6;
 const THUMB_CLOSE_MS: u32 = 300;
+/// Auto-hide: the slide frames, the delay before hiding, and the indeterminate progress frames.
+const TIMER_SLIDE: usize = 7;
+const TIMER_HIDE: usize = 8;
+const TIMER_PROGRESS: usize = 9;
 const HSHELL_RUDEAPPACTIVATED: usize = 0x8004;
 const HSHELL_FLASH: usize = 0x8006;
 const EVENT_MINIMIZESTART: u32 = 0x0016;
@@ -111,6 +117,14 @@ struct Bar {
     thumb_want: Option<usize>,
     /// Keyboard focus on the right side (Win+B): index in `tray_hits()`.
     tray_focus: Option<usize>,
+    taskband: Taskband,
+    settings: Settings,
+    /// Auto-hide slide: 0 hidden, 1 shown, where it goes, and when the last frame ran.
+    shown: f32,
+    want_shown: bool,
+    slide_at: Instant,
+    /// Start of the indeterminate progress animation.
+    progress_t0: Instant,
 }
 
 pub fn run() {
@@ -241,10 +255,15 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         BAR_HWND.with(|h| h.set(hwnd.0 as isize));
         let theme = current_theme();
         render::backdrop::apply(hwnd, render::backdrop::Backdrop::Acrylic { tint_abgr: theme.tint_abgr });
+        let settings = settings::read();
         let (h_px, scene) = place(hwnd, monitor, &theme)?;
+        if settings.autohide {
+            let _ = SetWindowPos(hwnd, None, monitor.left, S::slide_top(monitor.bottom, h_px, 0.0), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        let work = WorkArea::reserve(monitor, h_px);
+        let work = WorkArea::reserve(monitor, if settings.autohide { 0 } else { h_px });
         let shellhook = RegisterWindowMessageW(w!("SHELLHOOK"));
+        let taskband = Taskband::publish(hwnd, hwnd, shellhook);
         let hooked = RegisterShellHookWindow(hwnd).as_bool();
         let taskman = set_taskman(hwnd);
         let mut hooks = Vec::new();
@@ -318,12 +337,21 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             thumbs: None,
             thumb_want: None,
             tray_focus: None,
+            taskband,
+            shown: if settings.autohide { 0.0 } else { 1.0 },
+            want_shown: !settings.autohide,
+            slide_at: Instant::now(),
+            progress_t0: Instant::now(),
+            settings,
         };
         BAR.with(|b| *b.borrow_mut() = Some(bar));
         with_bar(|b| {
             b.rebuild();
             b.paint();
             b.log_groups();
+            for &h in b.model.wins.iter().map(|w| &w.hwnd) {
+                b.taskband.button_created(h);
+            }
         });
         SetTimer(Some(hwnd), TIMER_CLOCK, shelldata::clock::ms_to_next_minute() as u32, None);
         // Running apps add their icons again.
@@ -398,6 +426,9 @@ fn run_effect(e: Effect) {
                 // SAFETY: reads our own window's rect.
                 let _ = unsafe { GetWindowRect(b.hwnd, &mut bar) };
                 if b.work.is_some() {
+                    if b.settings.autohide {
+                        bar = RECT { top: b.monitor.bottom, bottom: b.monitor.bottom, ..bar };
+                    }
                     let r = b.side.work_area(b.monitor, bar);
                     super::workarea::apply_rect(RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom });
                 }
@@ -460,7 +491,7 @@ unsafe extern "system" fn on_winevent(_: HWINEVENTHOOK, event: u32, hwnd: HWND, 
 
 impl Bar {
     fn row(&self) -> Row {
-        Row { width: self.scene.as_ref().map_or(1280.0, |s| s.width), buttons: self.groups.len() + 1 }
+        Row { width: self.scene.as_ref().map_or(1280.0, |s| s.width), buttons: self.groups.len() + 1, left: self.settings.align_left }
     }
 
     fn scale(&self) -> f32 {
@@ -486,11 +517,13 @@ impl Bar {
                 let c = self.model.upsert(id, &t.key);
                 if new {
                     log::line(&format!("window {id:#x} {} added", t.key));
+                    self.taskband.button_created(id);
                 }
                 c
             }
             None => {
                 self.exes.remove(&id);
+                self.taskband.forget(id);
                 self.model.remove(id)
             }
         };
@@ -589,9 +622,14 @@ impl Bar {
         self.layout_right();
         let Some(scene) = self.scene.as_ref() else { return };
         let mut slots = Vec::with_capacity(self.groups.len() + 1);
-        slots.push(Slot { key: None, running: false, active: false, flashing: false, hover: self.hover_v[0], press: self.press_v[0], focused: self.focus == Some(0) });
+        slots.push(Slot { key: None, running: false, active: false, flashing: false, hover: self.hover_v[0], press: self.press_v[0], focused: self.focus == Some(0), progress: None, overlay: None });
+        let phase = self.progress_t0.elapsed().as_secs_f32();
         for (i, g) in self.groups.iter().enumerate() {
+            let progress = g.wins.iter().find_map(|w| self.taskband.progress.get(w).filter(|p| p.shown()).copied());
+            let overlay = g.wins.iter().rev().find(|w| self.taskband.overlays.contains_key(w)).copied();
             slots.push(Slot {
+                progress: progress.map(|p| (p, phase)),
+                overlay,
                 key: Some(&g.key),
                 running: !g.wins.is_empty(),
                 active: self.model.is_active(g),
@@ -605,9 +643,107 @@ impl Bar {
         let glyphs = self.side.glyphs();
         let focus = self.tray_focus.and_then(|i| self.tray_hits().get(i).copied());
         let right = RightView { layout: &self.side.layout, icons: &hicons, glyphs: &glyphs, hover: self.side.hover, pressed: self.side.pressed, focus };
-        if let Err(e) = scene.draw(&self.theme, &slots, &self.clock, &right) {
+        let indeterminate = slots.iter().any(|s| s.progress.is_some_and(|(p, _)| p.state == crate::taskband::ProgressState::Indeterminate));
+        if let Err(e) = scene.draw(&self.theme, &slots, &self.clock, &right, self.settings.align_left) {
             log::line(&format!("draw failed: {e}"));
         }
+        // SAFETY: timers on our own window.
+        unsafe {
+            if indeterminate {
+                SetTimer(Some(self.hwnd), TIMER_PROGRESS, 33, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_PROGRESS);
+            }
+        }
+    }
+
+    /// A taskband message (`crate::taskband`); None when `msg` is not one.
+    fn on_taskband(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let px = (band::OVERLAY * self.scale()).round() as i32;
+        match self.taskband.on_message(msg, wp, lp, px)? {
+            band::Change::None => {}
+            band::Change::Redraw => self.dirty(),
+            band::Change::Overlay(h, img) => {
+                if let Some(s) = self.scene.as_mut() {
+                    s.set_overlay(h, img);
+                }
+                self.dirty();
+            }
+            band::Change::Active(h) => self.set_active(HWND(h as _)),
+        }
+        Some(LRESULT(0))
+    }
+
+    /// Auto-hide: starts sliding the bar in or out.
+    fn slide_to(&mut self, show: bool) {
+        if !self.settings.autohide || self.want_shown == show {
+            return;
+        }
+        self.want_shown = show;
+        self.slide_at = Instant::now();
+        log::line(&format!("autohide: {}", if show { "show" } else { "hide" }));
+        // SAFETY: timers on our own window.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_HIDE);
+            SetTimer(Some(self.hwnd), TIMER_SLIDE, 8, None);
+        }
+    }
+
+    /// One slide frame; false once it arrived.
+    fn slide_step(&mut self) -> bool {
+        let dt = self.slide_at.elapsed().as_secs_f32() * 1000.0;
+        self.slide_at = Instant::now();
+        let (target, ms) = if self.want_shown { (1.0, S::SHOW_MS) } else { (0.0, S::HIDE_MS) };
+        // Linear progress through the slide, eased on placement.
+        let step = dt / ms;
+        self.shown = if target > self.shown { (self.shown + step).min(1.0) } else { (self.shown - step).max(0.0) };
+        self.place_slide();
+        if self.shown == target {
+            log::line(&format!("autohide: {} at {:?}", if self.want_shown { "shown" } else { "hidden" }, self.window_rect()));
+        }
+        self.shown != target
+    }
+
+    fn place_slide(&self) {
+        let k = if self.want_shown { S::ease_out(self.shown) } else { 1.0 - S::ease_out(1.0 - self.shown) };
+        let top = if self.settings.autohide { S::slide_top(self.monitor.bottom, self.h_px, k) } else { self.monitor.bottom - self.h_px };
+        // SAFETY: moves our own window.
+        let _ = unsafe { SetWindowPos(self.hwnd, None, self.monitor.left, top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
+    }
+
+    /// Auto-hide: the pointer left; hide unless a flyout or the keyboard keeps the bar.
+    fn maybe_hide(&mut self) {
+        if !self.settings.autohide {
+            return;
+        }
+        let mut pt = POINT::default();
+        // SAFETY: reads the cursor position.
+        let _ = unsafe { GetCursorPos(&mut pt) };
+        let wr = self.window_rect();
+        let inside = pt.x >= wr.left && pt.x < wr.right && pt.y >= wr.top && pt.y < wr.bottom;
+        // SAFETY: reads the foreground window.
+        let fg = unsafe { GetForegroundWindow() };
+        if inside || self.thumbs.is_some() || fg == self.hwnd {
+            // SAFETY: a timer on our own window.
+            unsafe { SetTimer(Some(self.hwnd), TIMER_HIDE, S::HIDE_DELAY_MS, None) };
+            return;
+        }
+        self.slide_to(false);
+    }
+
+    /// Settings changed in the registry: true when the layout must be redone.
+    fn reload_settings(&mut self) -> bool {
+        let s = settings::read();
+        if s == self.settings {
+            return false;
+        }
+        let autohide_changed = s.autohide != self.settings.autohide;
+        self.settings = s;
+        if autohide_changed {
+            self.want_shown = !s.autohide;
+            self.shown = if s.autohide { 0.0 } else { 1.0 };
+        }
+        true
     }
 
     fn animate(&mut self) {
@@ -678,6 +814,17 @@ impl Bar {
             Ok((h, s)) => {
                 self.h_px = h;
                 self.scene = Some(s);
+                self.place_slide();
+                if let Some(scene) = self.scene.as_mut() {
+                    // Badges were drawn at the old scale: redraw them at the new one.
+                    for (h, img) in &self.taskband.images {
+                        scene.set_overlay(*h, Some(img.clone()));
+                    }
+                }
+                let m = self.monitor;
+                // SAFETY: reads our own window's DPI.
+                let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+                log::line(&format!("reposition: monitor {},{} {}x{} dpi {dpi} bar {h} px at {:?}", m.left, m.top, m.right - m.left, m.bottom - m.top, self.window_rect()));
                 self.effects.push(Effect::WorkArea);
                 self.rebuild();
                 self.paint();
@@ -697,6 +844,9 @@ impl Bar {
                 let a = self.side.prune();
                 self.asks(a);
                 self.exes.remove(&(lp.0));
+                if self.taskband.forget(lp.0) {
+                    self.dirty();
+                }
                 if self.model.remove(lp.0) {
                     self.dirty();
                 }
@@ -966,20 +1116,33 @@ impl Bar {
                 }
             }
             bus::Command::WinX => self.effects.push(Effect::WinX),
-            bus::Command::TrayFocus => {
+            bus::Command::TrayFocus | bus::Command::TaskbarFocus => {
+                self.slide_to(true);
+                if cmd == bus::Command::TrayFocus {
+                    self.on_command_focus(true);
+                } else {
+                    self.on_command_focus(false);
+                }
+            }
+            bus::Command::Shutdown => self.effects.push(Effect::Quit),
+            _ => {}
+        }
+    }
+
+    fn on_command_focus(&mut self, tray: bool) {
+        match tray {
+            true => {
                 self.focus = None;
                 self.tray_focus = Some(0);
                 self.effects.push(Effect::FocusBar);
                 self.paint();
             }
-            bus::Command::TaskbarFocus => {
+            false => {
                 self.tray_focus = None;
                 self.focus = Some(if self.groups.is_empty() { 0 } else { 1 });
                 self.effects.push(Effect::FocusBar);
                 self.paint();
             }
-            bus::Command::Shutdown => self.effects.push(Effect::Quit),
-            _ => {}
         }
     }
 
@@ -1067,6 +1230,11 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
     if shellhook.is_some_and(|m| m == msg) {
         return with_bar(|b| b.on_shellhook(wp.0, lp));
     }
+    if (crate::taskband::MSG_ACTIVE_ALT..=crate::taskband::MSG_TAB_PROPERTIES).contains(&msg) {
+        if let Some(r) = with_bar(|b| b.on_taskband(msg, wp, lp)).flatten() {
+            return Some(r);
+        }
+    }
     match msg {
         WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
         WM_COPYDATA => with_bar(|b| {
@@ -1143,6 +1311,11 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
             // SAFETY: tracks the pointer leaving our own window.
             let _ = unsafe { TrackMouseEvent(&mut tme) };
+            if b.settings.autohide {
+                // SAFETY: a timer on our own window.
+                let _ = unsafe { KillTimer(Some(hwnd), TIMER_HIDE) };
+                b.slide_to(true);
+            }
             let rh = b.right_hit(lp);
             let (slot, _) = b.slot_at(lp);
             let task_slot = if rh.is_some() { None } else { slot };
@@ -1156,6 +1329,10 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             LRESULT(0)
         }),
         WM_MOUSELEAVE => with_bar(|b| {
+            if b.settings.autohide {
+                // SAFETY: a timer on our own window.
+                unsafe { SetTimer(Some(hwnd), TIMER_HIDE, S::HIDE_DELAY_MS, None) };
+            }
             b.set_hover(None);
             b.thumb_hover(None);
             if b.side.on_leave() {
@@ -1225,6 +1402,22 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
                     }
                     b.paint();
                 }
+                TIMER_SLIDE => {
+                    if !b.slide_step() {
+                        // SAFETY: our own timer.
+                        let _ = unsafe { KillTimer(Some(hwnd), TIMER_SLIDE) };
+                        if b.want_shown {
+                            // SAFETY: a timer on our own window.
+                            unsafe { SetTimer(Some(hwnd), TIMER_HIDE, S::HIDE_DELAY_MS, None) };
+                        }
+                    }
+                }
+                TIMER_HIDE => {
+                    // SAFETY: our own timer.
+                    let _ = unsafe { KillTimer(Some(hwnd), TIMER_HIDE) };
+                    b.maybe_hide();
+                }
+                TIMER_PROGRESS => b.paint(),
                 TIMER_THUMB_OPEN => {
                     // SAFETY: our own timer.
                     let _ = unsafe { KillTimer(Some(hwnd), TIMER_THUMB_OPEN) };
@@ -1276,11 +1469,14 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
                     b.effects.push(Effect::Reposition);
                 } else if wp.0 as u32 == SPI_SETWORKAREA.0 {
                     b.effects.push(Effect::WorkArea);
+                } else if b.reload_settings() {
+                    b.effects.push(Effect::Reposition);
                 }
             });
             Some(LRESULT(0))
         }
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            log::line(&format!("{} {:#x} {:#x}", if msg == WM_DPICHANGED { "WM_DPICHANGED" } else { "WM_DISPLAYCHANGE" }, wp.0, lp.0));
             with_bar(|b| b.effects.push(Effect::Reposition));
             Some(LRESULT(0))
         }

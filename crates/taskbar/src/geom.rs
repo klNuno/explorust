@@ -13,6 +13,10 @@ pub const RUNNING_W: f32 = 6.0;
 pub const ACTIVE_W: f32 = 16.0;
 /// Indicator of a button in the attention state (measured on the owner's bar).
 pub const ATTENTION_W: f32 = 20.0;
+/// Taskbar progress bar width (ITaskbarList3), drawn where the indicator is; not measured.
+pub const PROGRESS_W: f32 = 28.0;
+/// How far an overlay badge sticks out past the icon's bottom-right corner; not measured.
+pub const OVERLAY_OUT: f32 = 4.0;
 /// Start logo: four squares and a 1 px gap.
 pub const START_SQ: f32 = 11.0;
 pub const START_TOP: f32 = 13.0;
@@ -43,10 +47,18 @@ pub fn bar_height_px(dpi: u32) -> i32 {
 pub struct Row {
     pub width: f32,
     pub buttons: usize,
+    /// Buttons from the left edge (TaskbarAl = 0) instead of centered.
+    pub left: bool,
 }
+
+/// Left of the first slot when the buttons are left-aligned (not measured on a real bar).
+pub const LEFT_MARGIN: f32 = 2.0;
 
 impl Row {
     pub fn x0(&self) -> f32 {
+        if self.left {
+            return LEFT_MARGIN;
+        }
         (self.width / 2.0 - self.buttons as f32 * SLOT / 2.0).round()
     }
 
@@ -89,7 +101,7 @@ mod tests {
 
     #[test]
     fn row_is_centered_and_hit_tested() {
-        let r = Row { width: 1280.0, buttons: 4 };
+        let r = Row { width: 1280.0, buttons: 4, left: false };
         assert_eq!(r.x0(), 552.0);
         assert_eq!(r.cx(0), 574.0);
         assert_eq!(r.at(551.0), None);
@@ -98,6 +110,13 @@ mod tests {
         assert_eq!(r.at(552.0 + 44.0 * 4.0), None);
         assert_eq!(r.slot_rect(1), (596.0, 0.0, 640.0, 48.0));
         assert!(r.in_clock(1279.0) && !r.in_clock(1100.0));
+    }
+
+    #[test]
+    fn row_left_aligned() {
+        let r = Row { width: 1280.0, buttons: 4, left: true };
+        assert_eq!(r.x0(), LEFT_MARGIN);
+        assert_eq!(r.at(LEFT_MARGIN + 1.0), Some(0));
     }
 
     #[test]
