@@ -12,6 +12,46 @@ thread_local! {
 }
 
 /// Runs `f` on the service, connecting (or reconnecting once after an error) as needed.
+/// Changing desktops is off unless `EXPLORUST_VD_WRITE` is set: in g1, SwitchDesktop made
+/// explorust.exe (the process hosting the immersive shell) fail fast in combase.dll (8000ffff)
+/// 3 s later, twice, and the guard fell back to explorer. Reading the desktops is safe.
+pub fn writable() -> bool {
+    std::env::var_os("EXPLORUST_VD_WRITE").is_some()
+}
+
+fn refuse(what: &str) -> bool {
+    if writable() {
+        return false;
+    }
+    log::line(&format!("{what}: off, Windows' desktop switch crashes the shell's immersive shell (set EXPLORUST_VD_WRITE to try)"));
+    true
+}
+
+fn off() -> windows_core::Error {
+    windows_core::Error::new(windows_core::HRESULT(0x80004001u32 as i32), "desktop changes are off")
+}
+
+/// Moves `hwnd` to desktop `k` and tells whether the window reports that desktop afterwards.
+pub fn move_window(hwnd: windows::Win32::Foundation::HWND, k: usize) -> Result<Option<bool>> {
+    if !writable() {
+        return Err(off());
+    }
+    with_vd(|vd| {
+        let desks = vd.desktops()?;
+        let d = desks.get(k).ok_or(windows_core::Error::from_hresult(windows_core::HRESULT(0x80070057u32 as i32)))?;
+        vd.move_window(hwnd, d)?;
+        Ok(vd.window_desktop(hwnd).map(|g| g == d.id))
+    })
+}
+
+/// Creates a desktop without switching (Task View's New desktop).
+pub fn create() -> Result<String> {
+    if !writable() {
+        return Err(off());
+    }
+    with_vd(|vd| vd.create().map(|d| d.name))
+}
+
 pub fn with_vd<R>(f: impl Fn(&Vd) -> Result<R>) -> Result<R> {
     let cached = VD.with(|c| c.borrow_mut().take());
     let vd = match cached {
@@ -60,6 +100,9 @@ fn names(desks: &[Desk], cur: usize) -> String {
 
 /// Ctrl+Win+D: a new desktop at the end, switched to, as Windows does.
 pub fn new_desktop() {
+    if refuse("desktop new") {
+        return;
+    }
     let t = Instant::now();
     let r = with_vd(|vd| {
         let d = vd.create()?;
@@ -75,6 +118,9 @@ pub fn new_desktop() {
 
 /// Ctrl+Win+Left (`dir` -1) or Right (1).
 pub fn switch(dir: isize) {
+    if refuse("desktop switch") {
+        return;
+    }
     let t = Instant::now();
     let r = with_vd(|vd| {
         let (desks, cur) = state(vd)?;
@@ -92,6 +138,9 @@ pub fn switch(dir: isize) {
 
 /// Switches to desktop `i` of the strip.
 pub fn switch_to(i: usize) -> Result<&'static str> {
+    if !writable() {
+        return Err(off());
+    }
     with_vd(|vd| {
         let desks = vd.desktops()?;
         let d = desks.get(i).ok_or(windows_core::Error::from_hresult(windows_core::HRESULT(0x80070057u32 as i32)))?;
@@ -101,6 +150,9 @@ pub fn switch_to(i: usize) -> Result<&'static str> {
 
 /// Ctrl+Win+F4: closes the current desktop, its windows go to the neighbour Windows picks.
 pub fn close_current() {
+    if refuse("desktop close") {
+        return;
+    }
     let t = Instant::now();
     let r = with_vd(|vd| {
         let (desks, cur) = state(vd)?;
@@ -118,6 +170,9 @@ pub fn close_current() {
 
 /// Closes desktop `i` (the Task View close button).
 pub fn close(i: usize) -> Result<()> {
+    if !writable() {
+        return Err(off());
+    }
     with_vd(|vd| {
         let desks = vd.desktops()?;
         let cur = vd.current_index(&desks).unwrap_or(0);

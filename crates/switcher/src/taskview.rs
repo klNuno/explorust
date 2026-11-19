@@ -272,7 +272,7 @@ impl Tv {
                 Hover::Desk(i)
             };
         }
-        if self.strip.new_desk.contains(x, y) && self.service {
+        if self.strip.new_desk.contains(x, y) && self.service && desktops::writable() {
             return Hover::NewDesk;
         }
         Hover::None
@@ -397,7 +397,7 @@ fn on_move(hwnd: HWND, lp: LPARAM) {
         let (x, y) = dips(lp, t.scale);
         if let Some(d) = t.drag.as_mut() {
             let p = pt(lp);
-            if !d.active && ((p.x - d.from.x).abs() > DRAG_START || (p.y - d.from.y).abs() > DRAG_START) && t.service {
+            if !d.active && ((p.x - d.from.x).abs() > DRAG_START || (p.y - d.from.y).abs() > DRAG_START) && t.service && desktops::writable() {
                 d.active = true;
                 // SAFETY: capture on our own window while the drag runs.
                 unsafe { SetCapture(hwnd) };
@@ -499,7 +499,7 @@ fn run(act: Act) {
             }
         }
         Act::New => {
-            let r = desktops::with_vd(|vd| vd.create().map(|d| d.name));
+            let r = desktops::create();
             log::line(&format!("task view: new desktop {:?} in {:.1} ms", r.as_ref().map_err(|e| e.to_string()), ms(t0)));
             rebuild_now();
         }
@@ -509,12 +509,7 @@ fn run(act: Act) {
             rebuild_now();
         }
         Act::Move(h, title, k) => {
-            let r = desktops::with_vd(|vd| {
-                let desks = vd.desktops()?;
-                let d = desks.get(k).ok_or(windows_core::Error::from_hresult(windows_core::HRESULT(0x80070057u32 as i32)))?;
-                vd.move_window(h, d)?;
-                Ok(vd.window_desktop(h).map(|g| g == d.id))
-            });
+            let r = desktops::move_window(h, k);
             log::line(&format!(
                 "task view: moved {title:?} to desktop {}: {:?} (window now on it: {:?}) in {:.1} ms",
                 k + 1,
