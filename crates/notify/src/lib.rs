@@ -20,6 +20,12 @@ mod log;
 #[cfg(target_os = "windows")]
 mod win;
 
+/// Dev probe: writes the WNF state names whose stamp moves (see `win/wnf.rs`).
+#[cfg(target_os = "windows")]
+pub fn dev_wnf_scan(out: &std::path::Path, quiet: u64, after: u64) {
+    win::wnf::scan(out, quiet, after);
+}
+
 /// Runs the component until shutdown.
 pub fn run() {
     #[cfg(target_os = "windows")]

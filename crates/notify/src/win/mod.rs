@@ -5,6 +5,7 @@ mod card;
 mod listen;
 mod system;
 mod twinui;
+pub mod wnf;
 
 use crate::log;
 use crate::model::{self, Banner, Hit, Toast};

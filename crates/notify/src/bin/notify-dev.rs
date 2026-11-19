@@ -7,6 +7,12 @@
 #[cfg(target_os = "windows")]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--wnf-scan") {
+        let out = args.get(i + 1).map(String::as_str).unwrap_or(r"C:\explorust\wnf-scan.txt");
+        let n = |k: usize, d: u64| args.get(i + k).and_then(|a| a.parse().ok()).unwrap_or(d);
+        notify::dev_wnf_scan(std::path::Path::new(out), n(2, 6), n(3, 10));
+        return;
+    }
     if let Some(i) = args.iter().position(|a| a == "--post") {
         let cmd = match args.get(i + 1).map(String::as_str) {
             Some("clipboard") => bus::Command::ClipboardHistory,

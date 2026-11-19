@@ -2,7 +2,9 @@
 //! thread of its own (MTA), and posts each one to the UI thread's command window.
 
 use crate::log;
+use super::wnf;
 use crate::model::Toast;
+use std::ffi::c_void;
 use std::collections::HashSet;
 use windows::Foundation::TypedEventHandler;
 use windows::UI::Notifications::Management::{UserNotificationListener, UserNotificationListenerAccessStatus};
@@ -81,9 +83,9 @@ fn listen(target: HWND) {
 }
 
 /// The fallback when the platform refuses the change event (any process without package
-/// identity): diffs the toasts of the center by id once a second. The notification database
-/// gives no file change signal to wait on (its files keep their write time while the platform
-/// holds them open), so this is the one idle cost of the part; package identity removes it.
+/// identity): diffs the toasts of the center by id each time a WNF state name given in
+/// `EXPLORUST_NOTIFY_WNF` changes (`wnf.rs`), else once a second. No name that changes on a
+/// published toast is known yet, so the default is the 1 s diff (about 7 ms CPU each).
 fn watch(listener: &UserNotificationListener, target: HWND) {
     let ids = |l: &UserNotificationListener| -> Vec<(u32, UserNotification)> {
         l.GetNotificationsAsync(NotificationKinds::Toast)
@@ -93,33 +95,84 @@ fn watch(listener: &UserNotificationListener, target: HWND) {
     };
     let t0 = std::time::Instant::now();
     let mut seen: HashSet<u32> = ids(listener).into_iter().map(|(id, _)| id).collect();
-    log::line(&format!(
-        "listener: polling every {POLL_MS} ms, {} toasts already in the center, one poll {:.2} ms",
-        seen.len(),
-        t0.elapsed().as_secs_f64() * 1000.0
-    ));
+    let first_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let woken = subscribe();
+    match woken {
+        true => log::line(&format!("listener: waiting on WNF, {} toasts already in the center, one diff {first_ms:.2} ms", seen.len())),
+        false => log::line(&format!("listener: no WNF subscription, polling every {POLL_MS} ms, {} toasts in the center", seen.len())),
+    }
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-        let now = ids(listener);
-        let now_ids: HashSet<u32> = now.iter().map(|(id, _)| *id).collect();
-        for (id, n) in &now {
-            if seen.contains(id) {
-                continue;
-            }
-            match read(n) {
-                Ok(t) => post_added(target, t),
-                Err(e) => log::line(&format!("listener: notification {id} unreadable: {e}")),
-            }
+        if woken {
+            std::thread::park();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         }
-        for id in seen.difference(&now_ids) {
-            // SAFETY: posting to our UI window; a stale handle only fails the call.
-            let _ = unsafe { PostMessageW(Some(target), MSG_REMOVED, WPARAM(*id as usize), LPARAM(0)) };
+        // The platform may signal before the toast is readable: one late retry.
+        for attempt in 0..2 {
+            let t = std::time::Instant::now();
+            let now = ids(listener);
+            let now_ids: HashSet<u32> = now.iter().map(|(id, _)| *id).collect();
+            let mut changed = false;
+            for (id, n) in &now {
+                if seen.contains(id) {
+                    continue;
+                }
+                changed = true;
+                match read(n) {
+                    Ok(t) => post_added(target, t),
+                    Err(e) => log::line(&format!("listener: notification {id} unreadable: {e}")),
+                }
+            }
+            for id in seen.difference(&now_ids) {
+                changed = true;
+                // SAFETY: posting to our UI window; a stale handle only fails the call.
+                let _ = unsafe { PostMessageW(Some(target), MSG_REMOVED, WPARAM(*id as usize), LPARAM(0)) };
+            }
+            if woken {
+                log::line(&format!("listener: diff {attempt} in {:.1} ms, changed {changed}", t.elapsed().as_secs_f64() * 1000.0));
+            }
+            seen = now_ids;
+            if changed || !woken {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(400));
         }
-        seen = now_ids;
     }
 }
 
 const POLL_MS: u64 = 1000;
+
+/// The WNF state names to wait on, from `EXPLORUST_NOTIFY_WNF` (hex, comma separated). None by
+/// default: in g1 (26300, no toast UI running) `notify-dev --wnf-scan` saw no well-known name
+/// change when a toast was published, `WNF_SHEL_TOAST_PUBLISHED` included (step notify-3).
+fn wnf_names() -> Vec<u64> {
+    std::env::var_os("EXPLORUST_NOTIFY_WNF")
+        .map(|v| v.to_string_lossy().split(',').filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).collect())
+        .unwrap_or_default()
+}
+
+static LISTENER: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
+
+unsafe extern "system" fn wnf_changed(name: u64, stamp: u32, _: *const c_void, _: *mut c_void, _: *const c_void, size: u32) -> i32 {
+    log::line(&format!("listener: WNF {name:016x} stamp {stamp} ({size} bytes)"));
+    if let Some(t) = LISTENER.get() {
+        t.unpark();
+    }
+    0
+}
+
+/// Subscribes this thread to the toast WNF names; false when none took.
+fn subscribe() -> bool {
+    let _ = LISTENER.set(std::thread::current());
+    let mut any = false;
+    for name in wnf_names() {
+        match wnf::subscribe(name, wnf_changed, std::ptr::null_mut()) {
+            Ok(()) => any = true,
+            Err(st) => log::line(&format!("listener: WNF {name:016x} not subscribed: 0x{st:08x}")),
+        }
+    }
+    any
+}
 
 fn post_added(target: HWND, toast: Toast) {
     let raw = Box::into_raw(Box::new(toast));
