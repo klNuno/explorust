@@ -21,6 +21,8 @@ pub struct Card {
     pub height_dip: f32,
     pub hover: bool,
     pub hover_close: bool,
+    /// On screen (a card waits hidden while Windows' own popup may show instead).
+    pub shown: bool,
     dark: bool,
     surface: Surface,
     text: Text,
@@ -71,7 +73,7 @@ impl Card {
         let icon = shelldata::items::apps_folder_item(&toast.aumid)
             .and_then(|item| shelldata::icons::icon_for_item(&item, icon_px))
             .and_then(|img| surface.bitmap(img.width, img.height, &img.to_premultiplied_bgra()).ok());
-        let card = Card { hwnd, toast, scale, height_dip, hover: false, hover_close: false, dark, surface, text: Text::new()?, icon };
+        let card = Card { hwnd, toast, scale, height_dip, hover: false, hover_close: false, shown: false, dark, surface, text: Text::new()?, icon };
         card.paint();
         Ok(card)
     }

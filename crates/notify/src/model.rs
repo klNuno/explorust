@@ -163,9 +163,67 @@ pub fn hit(x: f32, y: f32) -> Hit {
 /// How many cards can stand on screen at once (Windows shows at most three).
 pub const MAX_ON_SCREEN: usize = 3;
 
+/// Who draws toast popups in this session. Windows' own (ShellExperienceHost) are the 1:1 target:
+/// when they show, explorust's cards step aside; when they do not, the cards stand in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Popups {
+    /// No toast checked yet.
+    Unknown,
+    /// Windows' popup showed for the last toast.
+    Windows,
+    /// Windows' popup did not show for the last toast.
+    Ours,
+}
+
+impl Popups {
+    /// Whether a new toast's card shows at once (else it waits for the check, hidden).
+    pub fn card_first(self) -> bool {
+        self != Popups::Windows
+    }
+
+    /// After the check of one toast: whether Windows' popup was on screen.
+    pub fn after_check(self, windows_seen: bool) -> Popups {
+        if windows_seen { Popups::Windows } else { Popups::Ours }
+    }
+}
+
+/// Milliseconds after a toast arrives before looking for Windows' popup (it slides in within
+/// about 300 ms of the platform's change event).
+pub const POPUP_CHECK_MS: u32 = 700;
+
+/// Whether a visible ShellExperienceHost window is Windows' toast popup rather than the
+/// notification center or the calendar: a toast is about 364 DIPs wide and at most about 450 tall,
+/// sitting at the bottom right of the work area; the center and the calendar are taller.
+pub fn is_toast_popup(rect: (i32, i32, i32, i32), work: (i32, i32, i32, i32), scale: f32) -> bool {
+    let (l, t, r, b) = rect;
+    let (w, h) = ((r - l) as f32 / scale, (b - t) as f32 / scale);
+    let near_right = (work.2 - r) as f32 / scale <= 64.0;
+    let near_bottom = (work.3 - b) as f32 / scale <= 64.0;
+    (250.0..=480.0).contains(&w) && (40.0..=450.0).contains(&h) && near_right && near_bottom
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popups() {
+        assert!(Popups::Unknown.card_first());
+        assert!(Popups::Ours.card_first());
+        assert!(!Popups::Windows.card_first());
+        assert_eq!(Popups::Unknown.after_check(true), Popups::Windows);
+        assert_eq!(Popups::Windows.after_check(false), Popups::Ours);
+    }
+
+    #[test]
+    fn toast_popup_shape() {
+        let work = (0, 0, 1280, 752);
+        assert!(is_toast_popup((900, 600, 1264, 738), work, 1.0));
+        // The notification center: as tall as the work area.
+        assert!(!is_toast_popup((900, 12, 1264, 738), work, 1.0));
+        // Top left: not a toast.
+        assert!(!is_toast_popup((0, 0, 364, 120), work, 1.0));
+    }
 
     fn toast(texts: &[&str]) -> Toast {
         Toast { id: 1, aumid: "a".into(), app: "App".into(), texts: texts.iter().map(|s| s.to_string()).collect() }

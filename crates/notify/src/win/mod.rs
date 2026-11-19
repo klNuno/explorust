@@ -4,12 +4,13 @@
 mod card;
 pub mod helper;
 mod listen;
+mod popup;
 mod system;
 mod twinui;
 pub mod wnf;
 
 use crate::log;
-use crate::model::{self, Banner, Hit, Toast};
+use crate::model::{self, Banner, Hit, Popups, Toast};
 use card::Card;
 use std::cell::RefCell;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -21,12 +22,15 @@ use windows_core::{HSTRING, PCWSTR, w};
 
 const CARD_CLASS: PCWSTR = w!("explorust.notify.toast");
 const TIMER_HIDE: usize = 1;
+/// Looks for Windows' own popup of the card's toast (`model::POPUP_CHECK_MS`).
+const TIMER_CHECK: usize = 2;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 struct State {
     cmd: HWND,
     /// Newest first.
     cards: Vec<Card>,
+    popups: Popups,
 }
 
 thread_local! {
@@ -42,7 +46,7 @@ pub fn run() {
     match create() {
         Err(e) => log::line(&format!("notify: windows not created: {e}")),
         Ok(cmd) => {
-            ST.with(|c| *c.borrow_mut() = Some(State { cmd, cards: Vec::new() }));
+            ST.with(|c| *c.borrow_mut() = Some(State { cmd, cards: Vec::new(), popups: Popups::Unknown }));
             listen::spawn(cmd);
             let mut msg = MSG::default();
             // SAFETY: a plain message loop on this thread.
@@ -171,14 +175,37 @@ fn panel(cmd: bus::Command, arg: isize) {
             Err(e) => log::line(&format!("notify: {cmd:?} failed in {ms:.1} ms: {e}")),
         }
         if cmd == bus::Command::NotificationCenter {
-            std::thread::sleep(std::time::Duration::from_millis(1500));
-            log::line(&format!("notify: notification center visible 1.5 s later: {:?}", twinui::notification_center_visible()));
+            watch_center(t0);
         }
         if com {
             // SAFETY: balances the CoInitializeEx above.
             unsafe { CoUninitialize() };
         }
     });
+}
+
+/// Logs `IsVisible` of the notification center every 100 ms for 2 s (each change, with the
+/// foreground window's class and ShellExperienceHost's visible windows), to see whether and when
+/// the center closes again.
+fn watch_center(t0: std::time::Instant) {
+    let mut last = None;
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let v = twinui::notification_center_visible().map_err(|e| e.code().0 as u32);
+        if last != Some(v) {
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let (_, host) = popup::windows_toast_visible();
+            log::line(&format!("notify: center visible {v:x?} at {ms:.0} ms, foreground {}, ShellExperienceHost windows: {host}", foreground_class()));
+            last = Some(v);
+        }
+    }
+}
+
+fn foreground_class() -> String {
+    let mut buf = [0u16; 128];
+    // SAFETY: reads the class name of the foreground window into a local buffer.
+    let n = unsafe { GetClassNameW(GetForegroundWindow(), &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
 fn added(toast: Toast) {
@@ -205,14 +232,30 @@ fn added(toast: Toast) {
             return log::line(&format!("toast card not drawn: {e}"));
         }
     };
-    let extra = ST.with(|c| {
+    let (extra, popups) = ST.with(|c| {
         let mut b = c.borrow_mut();
-        let s = b.as_mut()?;
+        let Some(s) = b.as_mut() else { return (None, Popups::Unknown) };
         s.cards.insert(0, card);
-        (s.cards.len() > model::MAX_ON_SCREEN).then(|| s.cards[s.cards.len() - 1].hwnd)
+        ((s.cards.len() > model::MAX_ON_SCREEN).then(|| s.cards[s.cards.len() - 1].hwnd), s.popups)
     });
     if let Some(old) = extra {
         close(old, "pushed out by a newer toast");
+    }
+    // SAFETY: arms the check timer of our window.
+    unsafe { SetTimer(Some(hwnd), TIMER_CHECK, model::POPUP_CHECK_MS, None) };
+    if popups.card_first() {
+        show(hwnd);
+        log::line(&format!("toast shown in {:.1} ms (popups {popups:?})", t0.elapsed().as_secs_f64() * 1000.0));
+    } else {
+        log::line("toast card held: Windows showed its own popup last time");
+    }
+}
+
+/// Puts a card on screen without activating it, arms its hide timer and plays the sound.
+fn show(hwnd: HWND) {
+    let first = with_card(hwnd, |k| !std::mem::replace(&mut k.shown, true));
+    if first != Some(true) {
+        return;
     }
     layout();
     // SAFETY: shows our window without activating it, arms its hide timer.
@@ -221,7 +264,28 @@ fn added(toast: Toast) {
         SetTimer(Some(hwnd), TIMER_HIDE, duration_ms(), None);
     }
     system::play_sound();
-    log::line(&format!("toast shown in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
+}
+
+/// The check timer: Windows' own popup on screen means the card steps aside (closed, and the next
+/// cards wait hidden); none means the card shows (late if it was held).
+fn check_popup(hwnd: HWND) {
+    let t0 = std::time::Instant::now();
+    let (seen, list) = popup::windows_toast_visible();
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let next = ST.with(|c| {
+        let mut b = c.borrow_mut();
+        let s = b.as_mut()?;
+        let (old, next) = (s.popups, s.popups.after_check(seen));
+        s.popups = next;
+        Some((old, next))
+    });
+    let Some((old, next)) = next else { return };
+    log::line(&format!("popup check in {ms:.1} ms: Windows' toast {seen}, popups {old:?} -> {next:?}; host windows: {list}"));
+    if seen {
+        close(hwnd, "Windows shows its own popup");
+    } else {
+        show(hwnd);
+    }
 }
 
 /// Windows' "Dismiss notifications after this amount of time" (Accessibility), 5 s by default;
@@ -245,7 +309,8 @@ fn layout() {
         let b = c.borrow();
         let Some(s) = b.as_ref() else { return };
         let scale = s.cards.first().map(|k| k.scale).unwrap_or(1.0);
-        let heights: Vec<f32> = s.cards.iter().map(|k| k.height_dip).collect();
+        let cards: Vec<&Card> = s.cards.iter().filter(|k| k.shown).collect();
+        let heights: Vec<f32> = cards.iter().map(|k| k.height_dip).collect();
         let mut rects = model::stack((work.left, work.top, work.right, work.bottom), &heights, scale);
         // Dev only: the left side, to compare with Windows' own toast while explorer runs.
         if std::env::var_os("EXPLORUST_NOTIFY_LEFT").is_some() {
@@ -253,7 +318,7 @@ fn layout() {
                 r.x = work.left as f32 + work.right as f32 - r.x - r.w;
             }
         }
-        for (k, r) in s.cards.iter().zip(rects) {
+        for (k, r) in cards.iter().zip(rects) {
             // SAFETY: moves our own window.
             unsafe {
                 let _ = SetWindowPos(k.hwnd, Some(HWND_TOPMOST), r.x as i32, r.y as i32, r.w as i32, r.h as i32, SWP_NOACTIVATE);
@@ -336,6 +401,12 @@ unsafe extern "system" fn card_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     close(hwnd, "clicked");
                 }
             }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TIMER_CHECK => {
+            // SAFETY: our timer.
+            unsafe { let _ = KillTimer(Some(hwnd), TIMER_CHECK); }
+            check_popup(hwnd);
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == TIMER_HIDE => {
