@@ -258,7 +258,8 @@ impl Sampler {
                 Meta { path, desc }
             });
             let lower = meta.path.to_ascii_lowercase();
-            let system = r.pid == 4 || r.session == 0 && (lower.is_empty() || lower.starts_with(r"c:\windows\")) || lower.starts_with(r"c:\windows\system32\") && r.session == 0;
+            // Windows processes: the kernel, protected ones (no path) and images under C:\Windows.
+            let system = r.pid == 4 || lower.is_empty() || lower.starts_with(r"c:\windows\");
             procs.push(Proc {
                 pid: r.pid,
                 ppid: r.ppid,

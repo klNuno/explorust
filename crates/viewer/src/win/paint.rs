@@ -92,10 +92,14 @@ impl App {
                     M31: cx - w / 2.0 * m11 - h / 2.0 * m21,
                     M32: cy - w / 2.0 * m12 - h / 2.0 * m22,
                 };
+                // The image stays under the command bar, as in Photos.
+                let a = self.area();
+                ctx.PushAxisAlignedClip(&rect(a.0, a.1, a.0 + a.2, a.1 + a.3), D2D1_ANTIALIAS_MODE_ALIASED);
                 ctx.SetTransform(&m);
                 let mode = if scale < 1.0 { D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC } else if scale >= 3.0 { D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR } else { D2D1_INTERPOLATION_MODE_LINEAR };
                 ctx.DrawBitmap(bmp, Some(&rect(0.0, 0.0, w, h)), 1.0, mode, None, None);
                 ctx.SetTransform(&Matrix3x2::identity());
+                ctx.PopAxisAlignedClip();
             }
             let k = self.k;
             let (Ok(text), Ok(dim), Ok(hover), Ok(press), Ok(plate)) =
