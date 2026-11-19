@@ -294,6 +294,8 @@ name = "desktop"
 version = "0.1.0"
 dependencies = [
  "bus",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
@@ -542,6 +544,11 @@ name = "files"
 version = "0.1.0"
 dependencies = [
  "bus",
+ "render",
+ "shelldata",
+ "windows",
+ "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]
@@ -1079,6 +1086,11 @@ name = "notify"
 version = "0.1.0"
 dependencies = [
  "bus",
+ "render",
+ "shelldata",
+ "windows",
+ "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]
@@ -1881,6 +1893,11 @@ name = "start"
 version = "0.1.0"
 dependencies = [
  "bus",
+ "render",
+ "shelldata",
+ "windows",
+ "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]
@@ -1900,6 +1917,11 @@ name = "switcher"
 version = "0.1.0"
 dependencies = [
  "bus",
+ "render",
+ "shelldata",
+ "windows",
+ "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]
@@ -1929,6 +1951,11 @@ name = "taskbar"
 version = "0.1.0"
 dependencies = [
  "bus",
+ "render",
+ "shelldata",
+ "windows",
+ "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]
