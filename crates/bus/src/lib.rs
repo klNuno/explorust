@@ -62,6 +62,9 @@ pub enum Command {
     /// Win+R, Win+I and the other one-line shell actions (lParam = `ShellAction as isize`). They run
     /// in explorust itself, so what they start gets its plain token, never the hook exe's UI access.
     ShellAction = 24,
+    /// Bring a window to the foreground (lParam = its HWND). Answered by explorust-keys.exe, whose UI
+    /// access lets it activate any window, a UWP frame included, over an elevated foreground window.
+    Activate = 25,
 }
 
 impl Command {
@@ -92,6 +95,7 @@ impl Command {
             22 => SwitcherMove,
             23 => SwitcherClose,
             24 => ShellAction,
+            25 => Activate,
             _ => return None,
         })
     }
@@ -108,6 +112,7 @@ impl Command {
             FilesOpen => Owner::Files,
             ShowDesktop => Owner::Desktop,
             ShellAction => Owner::Shell,
+            Activate => Owner::Keys,
             // Sent to each owner with `post_to`.
             Shutdown => Owner::Taskbar,
         }
@@ -124,6 +129,9 @@ pub enum Owner {
     Files,
     /// explorust's own command window, which runs the shell actions.
     Shell,
+    /// The keyboard hook's command window (explorust-keys.exe, or explorust when the hook runs
+    /// in-process), which activates windows for the parts.
+    Keys,
 }
 
 impl Owner {
@@ -140,6 +148,7 @@ impl Owner {
             Owner::Notify => "notify",
             Owner::Files => "files",
             Owner::Shell => "shell",
+            Owner::Keys => "keys",
         }
     }
 }
@@ -254,12 +263,14 @@ mod tests {
 
     #[test]
     fn every_command_round_trips() {
-        for v in 1..=24 {
+        for v in 1..=25 {
             let c = Command::from_u32(v).unwrap();
             assert_eq!(c as u32, v);
         }
         assert!(Command::from_u32(0).is_none());
-        assert!(Command::from_u32(25).is_none());
+        assert!(Command::from_u32(26).is_none());
+        assert_eq!(Command::Activate.owner(), Owner::Keys);
+        assert_eq!(class_of(Owner::Keys), "explorust.keys");
     }
 
     #[test]

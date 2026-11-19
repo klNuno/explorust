@@ -397,7 +397,14 @@ fn run_effect(e: Effect) {
     match e {
         Effect::Activate(h) => {
             let ok = actions::activate(h);
-            log::line(&format!("activate {:?}: {}", h.0, if ok { "foreground" } else { "not foreground" }));
+            // Over an elevated window the medium explorust may be refused (a UWP frame above all):
+            // explorust-keys.exe, with UI access, activates it then.
+            let keys = !ok && bus::post(bus::Command::Activate, h.0 as isize);
+            log::line(&format!(
+                "activate {:?}: {}",
+                h.0,
+                if ok { "foreground" } else if keys { "not foreground, asked explorust-keys" } else { "not foreground" }
+            ));
         }
         Effect::Minimize(h) => {
             log::line(&format!("minimize {:?}", h.0));

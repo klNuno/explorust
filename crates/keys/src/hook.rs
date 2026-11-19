@@ -41,16 +41,25 @@ const VK_MASK: u16 = 0xE8;
 /// dwExtraInfo of the keys the hook injects, so it lets them pass.
 const OWN_INPUT: usize = 0x6578_706C;
 
+pub(crate) fn log_line(msg: &str) {
+    log(msg);
+}
+
 fn log(msg: &str) {
     if let Some(f) = LOG.get() {
         f(msg);
     }
 }
 
-/// Installs the hook on a thread of its own, which then pumps messages for it. Returns once the
-/// hook is in place, or the reason it is not. `log` writes one line to the host's log.
+/// Installs the hook on a thread of its own, which then pumps messages for it, and the activation
+/// window (`crate::activate`) on another. Returns once both are in place, or the reason the hook is
+/// not (a missing activation window is only logged: the parts then activate by themselves).
+/// `log` writes one line to the host's log.
 pub fn spawn(log_line: fn(&str)) -> Result<(), String> {
     let _ = LOG.set(log_line);
+    if let Err(e) = crate::activate::spawn() {
+        log(&e);
+    }
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("hotkeys".into())

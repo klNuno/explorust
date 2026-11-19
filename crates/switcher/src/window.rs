@@ -430,7 +430,13 @@ fn on_next(back: bool) {
         // SAFETY: timers on our own command window.
         unsafe {
             SetTimer(Some(s.cmd), T_SHOW, model::SHOW_DELAY_MS, None);
-            SetTimer(Some(s.cmd), T_ALT, 50, None);
+            // Over an elevated window GetAsyncKeyState reads Alt as up while it is held, which
+            // committed on the first Tab: there only the hook's Alt up commits.
+            if activate::key_state_readable(s.orig) {
+                SetTimer(Some(s.cmd), T_ALT, 50, None);
+            } else {
+                log::line("foreground above our integrity level: no Alt polling");
+            }
         }
         log::line(&format!(
             "next{}: {} windows in {:.1} ms: {}",
@@ -552,7 +558,7 @@ fn commit(why: &str) {
         return;
     };
     let t = Instant::now();
-    let how = activate::activate(h);
+    let how = activate::request(h);
     log::line(&format!(
         "commit ({why}): {title:?} via {how} in {:.1} ms, {ms:.0} ms after the first Tab, {}",
         t.elapsed().as_secs_f32() * 1000.0,
@@ -574,7 +580,7 @@ fn cancel() {
     };
     // SAFETY: plain query.
     let fg = unsafe { GetForegroundWindow() };
-    let how = if fg == orig || orig.is_invalid() { "unchanged" } else { activate::activate(orig) };
+    let how = if fg == orig || orig.is_invalid() { "unchanged" } else { activate::request(orig) };
     log::line(&format!("cancel: original foreground {:?} {how}", wl::title(orig)));
     verify(orig, "cancel");
 }

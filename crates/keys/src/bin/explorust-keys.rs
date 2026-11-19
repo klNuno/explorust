@@ -1,7 +1,8 @@
 //! explorust-keys.exe: the installed shell's keyboard hook, in a process of its own so that only
 //! this exe carries UI access (`uiAccess="true"`, signed, in Program Files). explorust starts it
 //! with `--shell <pid>`; it ends when that explorust ends or sets `Local\explorust-keys-quit-<pid>`.
-//! It starts no process: shell actions are posted to explorust. Log: `%LOCALAPPDATA%\explorust\hotkeys.log`.
+//! It starts no process: shell actions are posted to explorust. It also answers `Command::Activate`
+//! (class `explorust.keys`), so the parts bring windows forward over elevated ones. Log: `%LOCALAPPDATA%\explorust\hotkeys.log`.
 //!
 //! Exit codes: 0 explorust ended or asked it to stop, 2 bad arguments, 3 another instance kept the
 //! session's mutex, 4 the hook was refused.
