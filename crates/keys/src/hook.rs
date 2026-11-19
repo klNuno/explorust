@@ -21,6 +21,8 @@ static WIN: AtomicBool = AtomicBool::new(false);
 static WIN_USED: AtomicBool = AtomicBool::new(false);
 static SHIFT: AtomicBool = AtomicBool::new(false);
 static CTRL: AtomicBool = AtomicBool::new(false);
+/// Alt as the hook saw it: LLKHF_ALTDOWN is not set on a key pressed with Ctrl and Alt both held.
+static ALT: AtomicBool = AtomicBool::new(false);
 /// The switcher is open: Alt up commits, Esc cancels.
 static SWITCHING: AtomicBool = AtomicBool::new(false);
 /// The key whose down was swallowed, so its up is swallowed too.
@@ -117,6 +119,7 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
     match vk {
         VK_SHIFT | VK_LSHIFT | VK_RSHIFT => SHIFT.store(down, Relaxed),
         VK_CTRL | VK_LCTRL | VK_RCTRL => CTRL.store(down, Relaxed),
+        VK_ALT | VK_LALT | VK_RALT => ALT.store(down, Relaxed),
         VK_LWIN | VK_RWIN => {
             if down {
                 if !WIN.swap(true, Relaxed) {
@@ -143,6 +146,9 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
             }
             return None;
         }
+        _ => {}
+    }
+    match vk {
         VK_ALT | VK_LALT | VK_RALT if !down && SWITCHING.swap(false, Relaxed) => {
             post(Command::SwitcherCommit, 0);
             return None;
@@ -152,7 +158,7 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
     if !down {
         return None;
     }
-    if is_escape(vk, CTRL.load(Relaxed), alt, SHIFT.load(Relaxed)) && escape() {
+    if is_escape(vk, CTRL.load(Relaxed), alt || ALT.load(Relaxed), SHIFT.load(Relaxed)) && escape() {
         return Some(swallow(vk));
     }
     if WIN.load(Relaxed) {
