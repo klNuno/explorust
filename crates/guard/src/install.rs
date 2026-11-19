@@ -22,8 +22,8 @@ const CERT: &[u8] = include_bytes!("../res/explorust-codesign.cer");
 const STORES: [&str; 2] = ["Root", "TrustedPublisher"];
 /// What runs from the install folder: the guard, the shell, the folder handler, the UWP probe
 /// some host builds start beside explorust.exe, the toast listener's helper with its sparse
-/// package (`package.rs`), and the UI-access keyboard hook.
-const FILES: [&str; 8] = [
+/// package (`package.rs`), the UI-access keyboard hook and the file index service.
+const FILES: [&str; 9] = [
     "explorust-guard.exe",
     "explorust.exe",
     "explorust-open.exe",
@@ -32,7 +32,10 @@ const FILES: [&str; 8] = [
     crate::package::MSIX,
     "explorust-keys.exe",
     "explorust_inject.dll",
+    INDEX,
 ];
+/// The MFT/USN index (`crates/index`), registered as the service `explorust-index`.
+const INDEX: &str = "explorust-index.exe";
 
 pub fn elevated() -> bool {
     // SAFETY: a plain token query.
@@ -215,5 +218,21 @@ pub fn trusted() -> bool {
         }
         let _ = CertCloseStore(Some(store), 0);
         yes
+    }
+}
+
+/// Registers (`--install`) or removes (`--uninstall`) the index service through the index exe of
+/// the install folder, which knows its own service; elevated only. Returns its output.
+pub fn index_service(install: bool) -> String {
+    let exe = dir().join(INDEX);
+    if !exe.exists() {
+        return format!("{} absent, no service", exe.display());
+    }
+    let arg = if install { "--install" } else { "--uninstall" };
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW: the index exe is a console program.
+    match std::process::Command::new(&exe).arg(arg).creation_flags(0x0800_0000).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(e) => format!("{} {arg}: {e}", exe.display()),
     }
 }

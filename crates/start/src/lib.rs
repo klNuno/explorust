@@ -20,6 +20,8 @@ mod index;
 #[cfg(target_os = "windows")]
 mod log;
 #[cfg(target_os = "windows")]
+mod mft;
+#[cfg(target_os = "windows")]
 mod menu;
 #[cfg(target_os = "windows")]
 mod power;

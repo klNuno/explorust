@@ -25,6 +25,8 @@ pub struct FileEntry {
     pub type_text: String,
     pub folder: bool,
     pub icon: Option<ID2D1Bitmap1>,
+    /// `search::file_rank` of the name, plus 4 for a noisy place (AppData, Windows): the merge order.
+    pub rank: u8,
 }
 
 /// The results of the current query.
@@ -135,6 +137,8 @@ impl Start {
             self.found.files_stale = false;
         }
         self.found.files.extend(files);
+        // The Windows index and explorust's own index answer the same query: one row per path.
+        search::merge_files(&mut self.found.files, |f| f.path.as_str(), |f| f.rank, |f, r| f.rank = r);
         self.found.files_done = done;
         self.rebuild_rows(keep);
         self.dirty = true;

@@ -352,9 +352,66 @@ pub fn index_sql(query: &str, max: u32) -> Option<String> {
     ))
 }
 
+/// How a file name matches the query, like Windows orders file results: 0 the name starts with
+/// it, 1 a word of the name does, 2 the name contains it, 3 the name does not (a match on the
+/// path or the content).
+pub fn file_rank(name: &str, query: &str) -> u8 {
+    let (n, q) = (fold(name), fold(query.trim()));
+    if q.is_empty() {
+        return 3;
+    }
+    if n.starts_with(&q) {
+        return 0;
+    }
+    let mut best = 3;
+    for (i, _) in n.match_indices(&q) {
+        let word = n[..i].chars().next_back().is_some_and(is_sep);
+        best = best.min(if word { 1 } else { 2 });
+    }
+    best
+}
+
+/// Merges file results of several sources in place: the first of each path (case ignored) stays,
+/// with the better rank of its copies, then a stable sort by rank keeps each source's own order
+/// (recent first) inside a rank.
+pub fn merge_files<T>(v: &mut Vec<T>, path: impl Fn(&T) -> &str, rank: impl Fn(&T) -> u8, set_rank: impl Fn(&mut T, u8)) {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut keep: Vec<T> = Vec::with_capacity(v.len());
+    for e in v.drain(..) {
+        let key = path(&e).to_lowercase();
+        if let Some(&i) = seen.get(&key) {
+            let r = rank(&keep[i]).min(rank(&e));
+            set_rank(&mut keep[i], r);
+            continue;
+        }
+        seen.insert(key, keep.len());
+        keep.push(e);
+    }
+    keep.sort_by_key(|e| rank(e));
+    *v = keep;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_ranks_and_merge() {
+        assert_eq!(file_rank("Rapport final.docx", "rap"), 0);
+        assert_eq!(file_rank("Rapport final.docx", "FINAL"), 1);
+        assert_eq!(file_rank("unfinalized.md", "final"), 2);
+        assert_eq!(file_rank("notes.txt", "budget"), 3);
+        let mut v = vec![
+            (r"C:\a\x final.txt".to_string(), 1u8),
+            (r"C:\a\final.txt".to_string(), 0),
+            (r"c:\A\X FINAL.TXT".to_string(), 1),
+            (r"C:\b\notes.txt".to_string(), 3),
+            (r"C:\b\final2.txt".to_string(), 0),
+        ];
+        merge_files(&mut v, |e| e.0.as_str(), |e| e.1, |e, r| e.1 = r);
+        let got: Vec<&str> = v.iter().map(|e| e.0.as_str()).collect();
+        assert_eq!(got, vec![r"C:\a\final.txt", r"C:\b\final2.txt", r"C:\a\x final.txt", r"C:\b\notes.txt"]);
+    }
 
     fn entries(names: &[&str]) -> Vec<Entry> {
         names.iter().map(|n| Entry::new(n, &[])).collect()

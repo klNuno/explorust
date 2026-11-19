@@ -4,6 +4,7 @@
 
 use super::{Target, hide, launch, popup, with};
 use crate::index::{Batch, Index};
+use crate::mft::Mft;
 use crate::scene::{Act, View};
 use crate::search::{self, Kind};
 use crate::sources::{self, Setting};
@@ -22,6 +23,7 @@ use windows_core::HSTRING;
 
 thread_local! {
     static INDEX: RefCell<Option<Index>> = const { RefCell::new(None) };
+    static MFT: RefCell<Option<Mft>> = const { RefCell::new(None) };
     /// When the key of the current query was handled, for the file batches' timing.
     static KEY_AT: RefCell<Option<Instant>> = const { RefCell::new(None) };
 }
@@ -31,6 +33,7 @@ const CALCULATOR: &str = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
 /// Starts the index worker and the Settings loader.
 pub fn start(hwnd: HWND, icon_px: i32) {
     INDEX.with(|i| *i.borrow_mut() = Some(Index::start(hwnd, icon_px)));
+    MFT.with(|i| *i.borrow_mut() = Some(Mft::start(hwnd, icon_px)));
     let target = hwnd.0 as isize;
     let _ = std::thread::Builder::new().name("start-settings".into()).spawn(move || {
         // SAFETY: COM for this worker (indirect strings from package resources); the box goes to the UI thread.
@@ -124,6 +127,11 @@ fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
     .flatten() else {
         return;
     };
+    MFT.with(|i| {
+        if let Some(i) = i.borrow().as_ref() {
+            i.query(generation, &q);
+        }
+    });
     INDEX.with(|i| {
         if let Some(i) = i.borrow().as_ref() {
             i.query(generation, &q);
@@ -161,6 +169,7 @@ pub fn files(b: Batch) {
                 path: h.path,
                 type_text: h.type_text,
                 folder: h.folder,
+                rank: h.rank,
             })
             .collect();
         let ok = s.add_files(b.generation, entries, b.done);
@@ -173,7 +182,8 @@ pub fn files(b: Batch) {
     if let Some(q) = shown {
         if n > 0 || b.done {
             log::line(&format!(
-                "search files \"{q}\": +{n}{} at {after:.1} ms after the key (index {:.1} ms), drawn in {:.1} ms",
+                "search files \"{q}\": +{n} from {}{} at {after:.1} ms after the key (source {:.1} ms), drawn in {:.1} ms",
+                b.source,
                 if b.done { ", done" } else { "" },
                 b.ms,
                 t.elapsed().as_secs_f32() * 1000.0

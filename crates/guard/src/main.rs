@@ -101,6 +101,7 @@ fn install() -> u32 {
         match copied {
             Ok((guard, trust)) => {
                 say(&format!("install: shell copied to {}, certificate trusted ({trust})", install::dir().display()));
+                say(&format!("install: {}", install::index_service(true)));
                 guard
             }
             Err(e) => {
@@ -160,6 +161,7 @@ fn restore() -> u32 {
     }
     // The running guard kills explorust on the fallback event; give it a moment to let go.
     std::thread::sleep(std::time::Duration::from_secs(2));
+    say(&format!("restore: {}", install::index_service(false)));
     say(&format!("restore: {}", install::remove_files()));
     match install::trust(false) {
         Ok(t) => say(&format!("restore: certificate {t}")),

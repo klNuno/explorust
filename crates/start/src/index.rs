@@ -32,9 +32,12 @@ pub struct FileHit {
     pub type_text: String,
     pub folder: bool,
     pub icon: Option<Image>,
+    pub rank: u8,
 }
 
 pub struct Batch {
+    /// "index" (Windows Search) or "mft" (explorust-index).
+    pub source: &'static str,
     pub generation: u64,
     pub hits: Vec<FileHit>,
     pub done: bool,
@@ -111,7 +114,7 @@ fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32) {
                 Ok(d) => db = Some(d),
                 Err(e) => {
                     log::line(&format!("index: not available: {e}"));
-                    post(hwnd, Batch { generation, hits: Vec::new(), done: true, ms: 0.0 });
+                    post(hwnd, Batch { source: "index", generation, hits: Vec::new(), done: true, ms: 0.0 });
                     continue;
                 }
             }
@@ -126,13 +129,13 @@ fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32) {
             }
             Err(e) => {
                 log::line(&format!("index: \"{q}\" failed: {e}"));
-                post(hwnd, Batch { generation, hits: Vec::new(), done: true, ms: t.elapsed().as_secs_f32() * 1000.0 });
+                post(hwnd, Batch { source: "index", generation, hits: Vec::new(), done: true, ms: t.elapsed().as_secs_f32() * 1000.0 });
             }
         }
     }
 }
 
-fn post(hwnd: HWND, b: Batch) {
+pub fn post(hwnd: HWND, b: Batch) {
     let p = Box::into_raw(Box::new(b));
     // SAFETY: hands the box to the UI thread, freed here when the post fails.
     unsafe {
@@ -217,7 +220,9 @@ fn run_query(d: &Db, q: &str, generation: u64, hwnd: HWND, icon_px: i32, rx: &Re
                 let icon = SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(&HSTRING::from(path.as_str()), None)
                     .ok()
                     .and_then(|f| apps::image(&f, icon_px));
-                hits.push(FileHit { name: col(&cells[1]), type_text: col(&cells[3]), path, folder, icon });
+                let name = col(&cells[1]);
+                let rank = search::file_rank(&name, q);
+                hits.push(FileHit { name, type_text: col(&cells[3]), path, folder, icon, rank });
             }
             let _ = rowset.ReleaseRows(got, handles.as_ptr(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut());
             total += hits.len();
@@ -225,7 +230,7 @@ fn run_query(d: &Db, q: &str, generation: u64, hwnd: HWND, icon_px: i32, rx: &Re
                 log::line(&format!("index: \"{q}\": first {} rows at {:.1} ms", hits.len(), t.elapsed().as_secs_f32() * 1000.0));
                 first = false;
             }
-            post(hwnd, Batch { generation, hits, done: false, ms: t.elapsed().as_secs_f32() * 1000.0 });
+            post(hwnd, Batch { source: "index", generation, hits, done: false, ms: t.elapsed().as_secs_f32() * 1000.0 });
             // A newer query is waiting: stop streaming this one.
             if let Ok(next) = rx.try_recv() {
                 newer = Some(next);
@@ -233,7 +238,7 @@ fn run_query(d: &Db, q: &str, generation: u64, hwnd: HWND, icon_px: i32, rx: &Re
             }
         }
         let _ = acc.ReleaseAccessor(hacc, None);
-        post(hwnd, Batch { generation, hits: Vec::new(), done: true, ms: t.elapsed().as_secs_f32() * 1000.0 });
+        post(hwnd, Batch { source: "index", generation, hits: Vec::new(), done: true, ms: t.elapsed().as_secs_f32() * 1000.0 });
         Ok((total, newer))
     }
 }
