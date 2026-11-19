@@ -1,6 +1,7 @@
 //! switcher-keys.exe: a guest test tool that holds keys across steps, which Alt+Tab needs (keys.exe
 //! presses and releases a chord at once). Steps: `+alt` key down, `-alt` key up, `tab` a tap,
-//! `wait:<ms>`, `move:<x>,<y>` the cursor, `click:<x>,<y>` a left click there, `fg` the foreground.
+//! `wait:<ms>`, `move:<x>,<y>` the cursor, `click:<x>,<y>` a left click there, `min:<title>` minimizes
+//! the window with that exact title (`_` for a space), `fg` the foreground.
 //! Keys: alt shift tab esc. Each step and the foreground window's title go to `switcher-keys.log`
 //! beside the exe.
 
@@ -29,7 +30,8 @@ mod win {
         INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN,
         MOUSEEVENTF_LEFTUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW, SetCursorPos};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetForegroundWindow, GetWindowTextW, SW_MINIMIZE, SetCursorPos, ShowWindow};
+    use windows_core::HSTRING;
 
     fn vk(name: &str) -> Option<u16> {
         Some(match name {
@@ -74,6 +76,14 @@ mod win {
             std::thread::sleep(std::time::Duration::from_millis(50));
             let m = |f| INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dwFlags: f, ..Default::default() } } };
             return send(&[m(MOUSEEVENTF_LEFTDOWN), m(MOUSEEVENTF_LEFTUP)]);
+        }
+        if let Some(t) = arg.strip_prefix("min:") {
+            let title = HSTRING::from(t.replace('_', " "));
+            // SAFETY: a window lookup by title, then the minimize command on it.
+            return match unsafe { FindWindowW(None, &title) } {
+                Ok(h) => format!("minimized {:?}: {}", h.0, unsafe { ShowWindow(h, SW_MINIMIZE) }.as_bool()),
+                Err(e) => format!("no window {t}: {e}"),
+            };
         }
         if arg == "fg" {
             return "ok".into();
