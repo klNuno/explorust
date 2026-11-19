@@ -73,6 +73,7 @@ pub(crate) fn windows_build() -> String {
 }
 
 /// `hlog!("phase=... {x}")`: one formatted line in the host log.
+#[allow(unused_macros)] // only the Windows modules log
 macro_rules! hlog {
     ($($arg:tt)*) => {
         $crate::log::line(&format!($($arg)*))

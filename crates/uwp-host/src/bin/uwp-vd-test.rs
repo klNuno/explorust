@@ -5,8 +5,9 @@
 //!   uwp-vd-test.exe [hold_s] [after_s]
 //!
 //! It creates a second desktop when there is only one, switches to the next desktop
-//! (`SwitchDesktop`, slot 9), waits `hold_s` (default 5), switches back, removes the desktop it
-//! created, then watches the shell's pid for `after_s` (default 60). Lines go to stdout and to
+//! (`SwitchDesktop`, slot 9), waits `hold_s` (default 5), switches back, waits again, switches to
+//! the next desktop once more and removes it while it is current (Windows falls back to the
+//! first one), then watches the shell's pid for `after_s` (default 60). Lines go to stdout and to
 //! `%LOCALAPPDATA%\explorust\uwp-vd-test.log`. Exit code 0 when the shell survived.
 //!
 //! Slots of `IVirtualDesktopManagerInternal` (twinui.pcshell.dll 26300.9974, vftable
@@ -192,14 +193,26 @@ mod win {
                 t.elapsed().as_secs_f64() * 1000.0,
                 current(&mgr)?
             ));
-            if let Some(d) = created {
-                // SAFETY: slot 13, RemoveDesktop(IVirtualDesktop*, IVirtualDesktop* fallback).
-                let hr = unsafe {
-                    let f: Two = slot(&mgr, 13);
-                    f(mgr.as_raw(), d.as_raw(), back.as_raw())
-                };
-                say(&format!("removed the created desktop: {hr:?}"));
+            if !alive_after(shell_pid, hold) {
+                say("shell died after the switch back");
+                return Ok(());
             }
+            // Removal of the current desktop: Windows switches to the fallback itself.
+            switch(&mgr, next)?;
+            say(&format!("SwitchDesktop to {:?} again, current now {:?}", id(next), current(&mgr)?));
+            let t = Instant::now();
+            // SAFETY: slot 13, RemoveDesktop(IVirtualDesktop*, IVirtualDesktop* fallback).
+            let hr = unsafe {
+                let f: Two = slot(&mgr, 13);
+                f(mgr.as_raw(), next.as_raw(), back.as_raw())
+            };
+            say(&format!(
+                "RemoveDesktop of the current desktop: {hr:?} in {:.1} ms, current now {:?}, {} desktops",
+                t.elapsed().as_secs_f64() * 1000.0,
+                current(&mgr)?,
+                desktops(&mgr)?.len()
+            ));
+            drop(created);
             Ok(())
         })();
         if let Err(e) = result {

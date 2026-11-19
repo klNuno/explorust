@@ -23,6 +23,7 @@ mod symbols;
 mod view_event_trace;
 #[cfg(target_os = "windows")]
 mod wrapper_inspect;
+mod xaml_islands;
 
 #[cfg(target_os = "windows")]
 pub use host::{run_embedded_host, run_host, run_managed_host};

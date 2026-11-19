@@ -358,6 +358,7 @@ fn run_host_with_parent(
         crate::log::windows_build(),
         std::process::id()
     );
+    crate::xaml_islands::log_state();
     if configure_process_dpi && let Err(error) = configure_dpi_awareness() {
         hlog!("phase=host-dpi error={error}");
         readiness.failed("host-dpi", error);
