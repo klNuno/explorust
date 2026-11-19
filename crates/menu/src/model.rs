@@ -90,6 +90,26 @@ pub fn top_glyph(verb: &str) -> char {
     }
 }
 
+/// The tooltip of a top-row button in the UI language (a LANGID's primary language, 0x0C French).
+pub fn top_tip(verb: &str, langid: u16) -> &'static str {
+    let fr = langid & 0x3FF == 0x0C;
+    match (verb, fr) {
+        ("cut", false) => "Cut",
+        ("cut", true) => "Couper",
+        ("copy", false) => "Copy",
+        ("copy", true) => "Copier",
+        ("rename", false) => "Rename",
+        ("rename", true) => "Renommer",
+        ("Windows.ModernShare", false) => "Share",
+        ("Windows.ModernShare", true) => "Partager",
+        ("delete", false) => "Delete",
+        ("delete", true) => "Supprimer",
+        ("paste", false) => "Paste",
+        ("paste", true) => "Coller",
+        _ => "",
+    }
+}
+
 /// The glyph Windows 11 shows beside a verb, `None` when the item keeps its own bitmap or none.
 pub fn glyph(verb: &str) -> Option<char> {
     let v = verb.to_ascii_lowercase();
@@ -187,6 +207,61 @@ pub fn arrange(entries: &[Entry], top_row: bool, more_label: &str) -> (Vec<(Stri
         ..Default::default()
     });
     (top, list)
+}
+
+/// Verbs Windows itself puts in the menu: shown at once from a menu of another kind, before the
+/// handlers of this one have filled it.
+pub fn inbox(verb: &str) -> bool {
+    !verb.is_empty() && (glyph(verb).is_some() || verb.starts_with("Windows."))
+}
+
+/// The static part of an arranged menu: the top row, the rows of in-box verbs and `Show more
+/// options`. Ids are those of the menu it came from.
+pub fn static_part(list: &[Entry]) -> Vec<Entry> {
+    let keep: Vec<Entry> = list
+        .iter()
+        .filter(|e| match e.kind {
+            Kind::Separator | Kind::More => true,
+            Kind::Command => inbox(&e.verb),
+            Kind::Submenu => false,
+        })
+        .cloned()
+        .collect();
+    let mut out = tidy(keep.into_iter().filter(|e| e.kind != Kind::More).collect());
+    if let Some(m) = list.iter().find(|e| e.kind == Kind::More) {
+        if !out.is_empty() {
+            out.push(Entry { kind: Kind::Separator, ..Default::default() });
+        }
+        out.push(m.clone());
+    }
+    out
+}
+
+/// The menus shown last, one per kind (`items:<ext>`, `items:folder`, `bg:<view>`): what the
+/// next menu of a kind shows before its handlers answer.
+#[derive(Default)]
+pub struct Recent {
+    menus: Vec<(String, Vec<(String, u32)>, Vec<Entry>)>,
+}
+
+impl Recent {
+    pub fn store(&mut self, key: &str, top: &[(String, u32)], list: &[Entry]) {
+        self.menus.retain(|(k, _, _)| k != key);
+        let list = list.iter().map(|e| Entry { bitmap: None, ..e.clone() }).collect();
+        self.menus.insert(0, (key.to_string(), top.to_vec(), list));
+        self.menus.truncate(16);
+    }
+
+    /// The previous menu of `key`; else the static part of the latest menu of the same family
+    /// (the part of the key before `:`). `true` when it is the same kind.
+    pub fn get(&self, key: &str) -> Option<(Vec<(String, u32)>, Vec<Entry>, bool)> {
+        if let Some((_, t, l)) = self.menus.iter().find(|(k, _, _)| k == key) {
+            return Some((t.clone(), l.clone(), true));
+        }
+        let family = key.split(':').next().unwrap_or("");
+        let (_, t, l) = self.menus.iter().find(|(k, _, _)| k.split(':').next() == Some(family))?;
+        Some((t.clone(), static_part(l), false))
+    }
 }
 
 /// Drops leading, trailing and doubled separators.
@@ -449,5 +524,26 @@ mod tests {
         assert_eq!(place(1200, 700, 300, 400, area), (900, 300));
         assert_eq!(place_sub((100, 100, 400, 132), 250, 300, area, 4), (396, 100));
         assert_eq!(place_sub((1000, 600, 1270, 632), 250, 300, area, 4), (754, 460));
+    }
+
+    #[test]
+    fn recent_menus() {
+        let (top, list) = arrange(
+            &[cmd(1, "&Open", "open"), cmd(2, "Edit in Notepad", ""), sep(), cmd(3, "&Copy", "copy"), cmd(4, "P&roperties", "properties")],
+            true,
+            "Show more options",
+        );
+        let mut r = Recent::default();
+        assert!(r.get("items:.txt").is_none());
+        r.store("items:.txt", &top, &list);
+        let (t, l, same) = r.get("items:.txt").unwrap();
+        assert!(same);
+        assert_eq!((t, l.len()), (top.clone(), list.len()));
+        let (t, l, same) = r.get("items:.png").unwrap();
+        assert!(!same);
+        assert_eq!(t, top);
+        let labels: Vec<&str> = l.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, ["Open", "", "Properties", "", "Show more options"]);
+        assert!(r.get("bg:files").is_none());
     }
 }

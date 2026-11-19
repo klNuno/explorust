@@ -2,8 +2,8 @@
 //! submenus never activate), a modal loop like `TrackPopupMenu`'s, mouse and keyboard input.
 
 use super::paint::{self, Fonts, View};
-use super::{log, read};
-use crate::model::{self, Entry, Hit, Kind, Layout};
+use super::{log, read, tip::Tip, worker};
+use crate::model::{self, Entry, Hit, Kind, Layout, Recent};
 use render::Surface;
 use std::cell::RefCell;
 use std::time::Instant;
@@ -23,15 +23,26 @@ use windows_core::w;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const CLASS: windows_core::PCWSTR = w!("explorust.menu");
 const TIMER_SUB: usize = 1;
+const TIMER_TIP: usize = 2;
+const TIP_MS: u32 = 500;
 const HOVER_MS: u32 = 300;
 /// Acrylic tint of the dark flyout (ABGR).
 const TINT: u32 = 0xE62C_2C2C;
 
-/// What the user chose.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// What the user chose: a command id with its verb, or the classic menu.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Pick {
-    Command(u32),
+    Command(u32, String),
     More,
+}
+
+/// Where the menu's rows come from.
+#[derive(Clone)]
+pub enum Src {
+    /// A menu this thread fills (the view's background menu).
+    Local(IContextMenu),
+    /// The worker's menu of this generation.
+    Worker(u64),
 }
 
 struct Win {
@@ -57,11 +68,27 @@ struct Ui {
     pool: Vec<Win>,
     levels: Vec<Level>,
     scale: f32,
-    cm: Option<IContextMenu>,
+    src: Option<Src>,
+    /// The handlers' rows are in (the menu shows what the worker read, not the static part).
+    ready: bool,
+    /// A row picked before the handlers' rows arrived: its verb and label.
+    pending: Option<(String, String)>,
+    /// A submenu asked from the worker: (depth, row).
+    sub_wait: Option<(usize, usize)>,
+    /// What kind of menu shows (`model::Recent` key), whether it is a selection's, its label.
+    key: String,
+    items: bool,
+    more: &'static str,
+    /// Prewarm fills in flight: generation and the key they fill.
+    prewarm: Vec<(u64, String)>,
+    recent: Recent,
+    at: POINT,
+    t0: Instant,
     pick: Option<Pick>,
     done: bool,
     pressed: bool,
     tracking: Vec<bool>,
+    tip: Option<Tip>,
 }
 
 thread_local! {
@@ -114,12 +141,24 @@ pub fn prewarm() {
         }
         let ui = Fonts::new().and_then(|fonts| {
             let root = new_window(true)?;
+            let tip = Tip::new(root.hwnd);
             Ok(Ui {
+                tip,
                 fonts,
                 pool: vec![root],
                 levels: Vec::new(),
                 scale: 1.0,
-                cm: None,
+                src: None,
+                ready: true,
+                pending: None,
+                sub_wait: None,
+                key: String::new(),
+                items: false,
+                more: "",
+                prewarm: Vec::new(),
+                recent: Recent::default(),
+                at: POINT::default(),
+                t0: Instant::now(),
                 pick: None,
                 done: false,
                 pressed: false,
@@ -213,6 +252,11 @@ impl Ui {
 
     /// Closes the levels deeper than `depth`.
     fn close_from(&mut self, depth: usize) {
+        if depth == 0 {
+            if let Some(t) = self.tip.as_mut() {
+                t.hide();
+            }
+        }
         while self.levels.len() > depth {
             let l = self.levels.pop().unwrap();
             // SAFETY: hides our own popup.
@@ -245,17 +289,36 @@ impl Ui {
             return;
         }
         self.close_from(depth + 1);
-        let Some(cm) = self.cm.clone() else { return };
+        if !self.ready {
+            return;
+        }
+        let Some(src) = self.src.clone() else { return };
         let e = &self.levels[depth].entries[row];
         if e.kind != Kind::Submenu || !e.enabled {
             return;
         }
-        let sub = HMENU(e.submenu as *mut _);
-        let t = Instant::now();
-        read::init_popup(&cm, sub, row as u32);
-        let entries = model::tidy(read::entries(&cm, sub, super::FIRST));
-        log::line(&format!("submenu '{}': {} entries in {:.1} ms", e.label, entries.len(), t.elapsed().as_secs_f64() * 1000.0));
-        let entries: Vec<Entry> = entries.into_iter().filter(|e| e.kind == Kind::Separator || !e.label.is_empty()).collect();
+        let entries = match src {
+            Src::Local(cm) => {
+                let sub = HMENU(e.submenu as *mut _);
+                let t = Instant::now();
+                read::init_popup(&cm, sub, row as u32);
+                let entries = read::entries(&cm, sub, super::FIRST);
+                log::line(&format!("submenu '{}': {} entries in {:.1} ms", e.label, entries.len(), t.elapsed().as_secs_f64() * 1000.0));
+                entries
+            }
+            Src::Worker(gn) => {
+                self.sub_wait = Some((depth, row));
+                let reply = self.pool[0].hwnd.0 as isize;
+                worker::send(worker::Job::Sub { gn, menu: e.submenu, index: row as u32, depth, row, reply });
+                return;
+            }
+        };
+        self.show_sub(depth, row, entries, select_first);
+    }
+
+    /// Shows the entries of the submenu of `row` at `depth`.
+    fn show_sub(&mut self, depth: usize, row: usize, entries: Vec<Entry>, select_first: bool) {
+        let entries: Vec<Entry> = model::tidy(entries).into_iter().filter(|e| e.kind == Kind::Separator || !e.label.is_empty()).collect();
         if entries.is_empty() {
             return;
         }
@@ -275,8 +338,12 @@ impl Ui {
     fn activate(&mut self, depth: usize, hit: Hit, keyboard: bool) {
         match hit {
             Hit::Top(i) => {
-                if let Some(&(_, id)) = self.levels[depth].top.get(i) {
-                    self.finish(Some(Pick::Command(id)));
+                if let Some((verb, id)) = self.levels[depth].top.get(i).cloned() {
+                    if !self.ready {
+                        self.pending = Some((verb, String::new()));
+                        return;
+                    }
+                    self.finish(Some(Pick::Command(id, verb)));
                 }
             }
             Hit::Row(i) => {
@@ -285,13 +352,130 @@ impl Ui {
                     return;
                 }
                 match e.kind {
+                    Kind::Command if !self.ready => {
+                        self.pending = Some((e.verb.clone(), e.label.clone()));
+                    }
                     Kind::Command => {
-                        let id = e.id;
-                        self.finish(Some(Pick::Command(id)));
+                        let (id, verb) = (e.id, e.verb.clone());
+                        self.finish(Some(Pick::Command(id, verb)));
                     }
                     Kind::More => self.finish(Some(Pick::More)),
                     Kind::Submenu => self.open_sub(depth, i, keyboard),
                     Kind::Separator => {}
+                }
+            }
+        }
+    }
+
+    /// The handlers' rows arrived: the root level shows them in place of the static part, the
+    /// window and its swap chain take the new size, and a row picked meanwhile runs.
+    fn merge(&mut self, entries: &[Entry]) {
+        let (top, list) = model::arrange(entries, self.items, self.more);
+        self.recent.store(&self.key, &top, &list);
+        self.ready = true;
+        if self.done || self.levels.is_empty() {
+            return;
+        }
+        let t = Instant::now();
+        let n = list.len();
+        self.close_from(1);
+        let hover = self.levels[0].hover;
+        let hover_verb = match hover {
+            Some(Hit::Row(r)) => self.levels[0].entries.get(r).map(|e| (e.verb.clone(), e.label.clone())),
+            _ => None,
+        };
+        let widths = self.fonts.measure(&list);
+        let layout = model::layout(top.len(), &list, &widths);
+        let (w, h) = (self.px(layout.width), self.px(layout.height));
+        let area = work_area(self.at.x, self.at.y);
+        let (x, y) = model::place(self.at.x, self.at.y, w, h, area);
+        let win = &mut self.pool[0];
+        if win.size != (w as u32, h as u32) {
+            if let Err(e) = win.surface.resize(w as u32, h as u32) {
+                log::line(&format!("merge resize: {e}"));
+            }
+            win.size = (w as u32, h as u32);
+        }
+        let bitmaps = list.iter().map(|e| e.bitmap.as_ref().and_then(|(bw, bh, px)| win.surface.bitmap(*bw, *bh, px).ok())).collect();
+        let hover = match (hover, hover_verb) {
+            (Some(Hit::Top(i)), _) if i < top.len() => Some(Hit::Top(i)),
+            (_, Some((v, l))) => list.iter().position(|e| e.kind != Kind::Separator && e.verb == v && e.label == l).map(Hit::Row),
+            _ => None,
+        };
+        let hwnd = win.hwnd;
+        self.levels[0] = Level { win: 0, entries: list, top, layout, hover, open: None, bitmaps, origin: (x, y) };
+        // SAFETY: moves and sizes our own popup; the swap chain already has the new size.
+        unsafe {
+            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        self.draw(0);
+        log::line(&format!(
+            "handlers' rows merged {:.1} ms after the right-click ({n} rows, merge {:.1} ms)",
+            self.t0.elapsed().as_secs_f64() * 1000.0,
+            t.elapsed().as_secs_f64() * 1000.0
+        ));
+        if let Some((verb, label)) = self.pending.take() {
+            let l = &self.levels[0];
+            let top = l.top.iter().position(|(v, _)| !verb.is_empty() && *v == verb).map(Hit::Top);
+            let row = l
+                .entries
+                .iter()
+                .position(|e| e.kind == Kind::Command && e.enabled && ((!verb.is_empty() && e.verb == verb) || (!label.is_empty() && e.label == label)))
+                .map(Hit::Row);
+            match top.or(row) {
+                Some(hit) => self.activate(0, hit, false),
+                None => {
+                    log::line(&format!("picked '{label}' [{verb}] before the fill; the filled menu has no such row"));
+                    self.finish(None);
+                }
+            }
+        } else if let Some(Hit::Row(r)) = self.levels[0].hover {
+            if self.levels[0].entries[r].kind == Kind::Submenu {
+                // SAFETY: the hover timer on our root window.
+                unsafe {
+                    SetTimer(Some(hwnd), TIMER_SUB, HOVER_MS, None);
+                }
+            }
+        }
+    }
+
+    fn on_reply(&mut self, r: worker::Reply) {
+        let cur = match &self.src {
+            Some(Src::Worker(g)) => Some(*g),
+            _ => None,
+        };
+        match r {
+            worker::Reply::Filled { gn, entries, fill_ms, ok } => {
+                if let Some(i) = self.prewarm.iter().position(|(g, _)| *g == gn) {
+                    let (_, key) = self.prewarm.remove(i);
+                    if ok {
+                        let (top, list) = model::arrange(&entries, key.starts_with("items"), super::more_label());
+                        self.recent.store(&key, &top, &list);
+                        log::line(&format!("prewarm {key}: {} rows in {fill_ms:.1} ms", list.len()));
+                    }
+                    return;
+                }
+                if cur != Some(gn) {
+                    return;
+                }
+                if !ok {
+                    log::line("worker fill failed: the menu keeps its static part");
+                    self.ready = true;
+                    self.pending = None;
+                    return;
+                }
+                log::line(&format!("worker filled {gn} in {fill_ms:.1} ms ({} entries)", entries.len()));
+                self.merge(&entries);
+            }
+            worker::Reply::Sub { gn, depth, row, entries } => {
+                if cur != Some(gn) || self.done || self.sub_wait != Some((depth, row)) {
+                    return;
+                }
+                self.sub_wait = None;
+                log::line(&format!("submenu row {row}: {} entries from the worker", entries.len()));
+                let still = self.levels.get(depth).is_some_and(|l| l.hover == Some(Hit::Row(row)) || l.open == Some(row));
+                if still && self.levels.len() == depth + 1 {
+                    self.show_sub(depth, row, entries, true);
                 }
             }
         }
@@ -388,6 +572,16 @@ impl Ui {
         if h != l.hover {
             self.levels[depth].hover = h;
             self.draw(depth);
+            if let Some(t) = self.tip.as_mut() {
+                t.hide();
+            }
+            if matches!(h, Some(Hit::Top(_))) {
+                let root = self.pool[0].hwnd;
+                // SAFETY: a one-shot timer on our root window.
+                unsafe {
+                    SetTimer(Some(root), TIMER_TIP, TIP_MS, None);
+                }
+            }
             // Hovering decides about submenus after a delay, as Windows does.
             let root = self.pool[0].hwnd;
             // SAFETY: a one-shot timer on our root window, killed when it fires.
@@ -396,6 +590,23 @@ impl Ui {
             }
         }
         // A level deeper than one being hovered keeps its parent row lit.
+    }
+
+    /// The tooltip timer: name the hovered top-row button under it.
+    fn tip_timer(&mut self) {
+        let Some(l) = self.levels.first() else { return };
+        let Some(Hit::Top(i)) = l.hover else { return };
+        let Some((verb, _)) = l.top.get(i) else { return };
+        // SAFETY: plain query of the UI language.
+        let text = model::top_tip(verb, unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() });
+        if text.is_empty() {
+            return;
+        }
+        let (bx, by, bw, bh) = l.layout.top[i];
+        let (x, y) = (l.origin.0 + self.px(bx + bw / 2.0), l.origin.1 + self.px(by + bh) + self.px(6.0));
+        if let Some(t) = self.tip.as_mut() {
+            t.show(text, x, y);
+        }
     }
 
     /// The hover timer: open the hovered submenu, or close the ones the pointer left.
@@ -416,6 +627,19 @@ fn dips(lp: LPARAM, scale: f32) -> (f32, f32) {
 }
 
 unsafe extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == worker::reply_msg() {
+        // SAFETY: posted by the worker as a Box<Reply>.
+        let mut r = Some(*unsafe { Box::from_raw(lp.0 as *mut worker::Reply) });
+        with(|ui| {
+            if let Some(r) = r.take() {
+                ui.on_reply(r);
+            }
+        });
+        if let Some(r) = r {
+            LATE.with(|l| l.borrow_mut().push(r));
+        }
+        return LRESULT(0);
+    }
     let handled = match msg {
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_MOUSEMOVE => with(|ui| {
@@ -433,6 +657,9 @@ unsafe extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
         WM_MOUSELEAVE => with(|ui| {
             if let Some(d) = ui.level_of(h) {
                 ui.tracking[d] = false;
+                if let Some(t) = ui.tip.as_mut() {
+                    t.hide();
+                }
                 if ui.levels[d].hover.is_some() {
                     ui.levels[d].hover = None;
                     ui.draw(d);
@@ -475,6 +702,13 @@ unsafe extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             }
             with(|ui| ui.hover_timer())
         }
+        WM_TIMER if wp.0 == TIMER_TIP => {
+            // SAFETY: our own timer.
+            unsafe {
+                let _ = KillTimer(Some(h), TIMER_TIP);
+            }
+            with(|ui| ui.tip_timer())
+        }
         WM_ACTIVATE if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE => with(|ui| {
             let to = HWND(lp.0 as _);
             if !ui.done && !ui.levels.is_empty() && ui.level_of(to).is_none() {
@@ -507,29 +741,107 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     unsafe { CallNextHookEx(None, code, wp, lp) }
 }
 
-/// Shows the Windows 11 menu and runs its modal loop; returns what was picked.
-pub fn run(cm: &IContextMenu, entries: Vec<Entry>, top: Vec<(String, u32)>, owner: HWND, at: POINT, t0: Instant) -> Option<Pick> {
+/// One menu to show: where its rows come from and where it opens.
+pub struct Request<'a> {
+    pub src: Src,
+    /// The `model::Recent` key of its kind.
+    pub key: String,
+    pub items: bool,
+    pub more: &'static str,
+    pub owner: HWND,
+    pub at: POINT,
+    pub t0: Instant,
+    /// Fills a local menu after the first frame and returns its entries.
+    pub fill: Option<&'a mut dyn FnMut() -> Vec<Entry>>,
+}
+
+thread_local! {
+    /// Worker replies that came while the UI state was borrowed (a handler pumping messages).
+    static LATE: RefCell<Vec<worker::Reply>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A prewarm fill of generation `gn` is on its way for menus of kind `key`.
+pub fn expect_prewarm(gn: u64, key: &str) {
     prewarm();
+    with(|ui| ui.prewarm.push((gn, key.to_string())));
+}
+
+/// The window worker replies go to.
+pub fn reply_window() -> Option<HWND> {
+    prewarm();
+    with(|ui| ui.pool[0].hwnd)
+}
+
+fn drain_late() {
+    let late: Vec<worker::Reply> = LATE.with(|l| l.borrow_mut().drain(..).collect());
+    for r in late {
+        with(|ui| ui.on_reply(r));
+    }
+}
+
+/// Shows the Windows 11 menu and runs its modal loop; returns what was picked. The first frame
+/// shows the previous menu of the same kind (or the static part of another); the handlers' rows
+/// replace it when they arrive.
+pub fn run(req: Request) -> Option<Pick> {
+    prewarm();
+    drain_late();
+    let Request { src, key, items, more, owner, at, t0, mut fill } = req;
+    let cached = with(|ui| ui.recent.get(&key)).flatten();
+    // Nothing to show at once for a local menu: fill it first.
+    let mut filled = None;
+    if cached.is_none() {
+        if let Some(f) = fill.take() {
+            filled = Some(f());
+        }
+    }
     let started = with(|ui| {
         // SAFETY: DPI of the owner's monitor.
         ui.scale = unsafe { GetDpiForWindow(owner) } as f32 / 96.0;
         if ui.scale <= 0.0 {
             ui.scale = 1.0;
         }
-        ui.cm = Some(cm.clone());
+        ui.src = Some(src);
+        ui.key = key.clone();
+        ui.items = items;
+        ui.more = more;
+        ui.at = at;
+        ui.t0 = t0;
+        ui.pending = None;
+        ui.sub_wait = None;
         ui.pick = None;
         ui.done = false;
         ui.pressed = false;
-        let n = entries.len();
-        let r = ui.open(entries, top, RECT { left: at.x, top: at.y, right: at.x, bottom: at.y }, false);
+        let (top, list, what) = match (&filled, cached) {
+            (Some(entries), _) => {
+                let (t, l) = model::arrange(entries, items, more);
+                ui.recent.store(&key, &t, &l);
+                ui.ready = true;
+                (t, l, "filled")
+            }
+            (None, Some((t, l, same))) => {
+                ui.ready = false;
+                (t, l, if same { "previous menu of this kind" } else { "static part of another kind" })
+            }
+            (None, None) => {
+                ui.ready = false;
+                (Vec::new(), model::static_part(&model::arrange(&[], items, more).1), "nothing cached")
+            }
+        };
+        let n = list.len();
+        let r = ui.open(list, top, RECT { left: at.x, top: at.y, right: at.x, bottom: at.y }, false);
         if let Err(e) = &r {
             log::line(&format!("open: {e}"));
         }
-        log::line(&format!("first frame presented {:.1} ms after the right-click ({n} rows)", t0.elapsed().as_secs_f64() * 1000.0));
+        let _ = ui.pool[0].surface.slide_in(-ui.scale * 12.0, 0.2, 0.083);
+        log::line(&format!("first frame presented {:.1} ms after the right-click ({n} rows, {what}, {key})", t0.elapsed().as_secs_f64() * 1000.0));
         r.is_ok()
     });
     if started != Some(true) {
         return None;
+    }
+    if let Some(f) = fill.take() {
+        let entries = f();
+        with(|ui| ui.merge(&entries));
     }
     // SAFETY: a thread mouse hook for the modal loop, removed below.
     unsafe {
@@ -538,6 +850,10 @@ pub fn run(cm: &IContextMenu, entries: Vec<Entry>, top: Vec<(String, u32)>, owne
     }
     let mut msg = MSG::default();
     loop {
+        if with(|ui| ui.done) != Some(false) {
+            break;
+        }
+        drain_late();
         if with(|ui| ui.done) != Some(false) {
             break;
         }
@@ -569,8 +885,10 @@ pub fn run(cm: &IContextMenu, entries: Vec<Entry>, top: Vec<(String, u32)>, owne
     }
     with(|ui| {
         ui.close_from(0);
-        ui.cm = None;
-        ui.pick
+        if matches!(ui.src, Some(Src::Local(_))) {
+            ui.src = None;
+        }
+        ui.pick.take()
     })
     .flatten()
 }

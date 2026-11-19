@@ -114,9 +114,14 @@ pub fn track(cm: &IContextMenu, menu: HMENU, x: i32, y: i32) -> u32 {
 
 /// Runs command `id` (ids start at `first`) with the point and the modifier keys, as Explorer does.
 pub fn invoke(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POINT) {
-    let offset = (id - first) as usize;
     // SAFETY: modifier state of this thread's input.
     let (shift, ctrl) = unsafe { (GetKeyState(VK_SHIFT.0 as i32) < 0, GetKeyState(VK_CONTROL.0 as i32) < 0) };
+    invoke_with(cm, owner, id, first, at, shift, ctrl);
+}
+
+/// `invoke` with the modifier keys given (the worker thread has no keyboard state of its own).
+pub fn invoke_with(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POINT, shift: bool, ctrl: bool) {
+    let offset = (id - first) as usize;
     let mut mask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
     if shift {
         mask |= CMIC_MASK_SHIFT_DOWN;

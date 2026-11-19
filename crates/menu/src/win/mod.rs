@@ -5,14 +5,20 @@ mod log;
 mod paint;
 mod popup;
 mod read;
+mod tip;
+mod worker;
 
 use crate::model;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::Common::{ITEMIDLIST, STRRET};
+use windows::Win32::UI::Shell::{IPersistFolder2, IShellFolder, SHGDNF, SHGDN_FORPARSING, SHGDN_INFOLDER, SVGIO_ALLVIEW, StrRetToBufW};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::Ole::IObjectWithSite;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT};
 use windows::Win32::UI::Shell::{
     DefSubclassProc, IContextMenu, IFolderView2, IShellView, RemoveWindowSubclass, SVGIO_BACKGROUND,
     SVGIO_SELECTION, SetWindowSubclass,
@@ -40,15 +46,20 @@ pub fn show(owner: HWND, cm: &IContextMenu, x: i32, y: i32, items: bool, classic
 }
 
 fn show_at(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool, t0: Instant) {
+    let key = if items { "items:local".to_string() } else { background_key(owner) };
+    show_local(owner, cm, at, items, classic, t0, key);
+}
+
+/// The menu of `cm`, filled on this thread (after the first frame when a menu of its kind was
+/// shown before).
+fn show_local(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool, t0: Instant, key: String) {
     // SAFETY: a menu this thread creates, fills through the handler and destroys.
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else { return };
     let mut flags = if items { CMF_CANRENAME } else { 0 };
     if classic {
         flags |= CMF_EXTENDEDVERBS;
-    }
-    let hr = unsafe { cm.QueryContextMenu(menu, 0, FIRST, LAST, flags) };
-    let tq = t0.elapsed().as_secs_f64() * 1000.0;
-    if classic {
+        let hr = unsafe { cm.QueryContextMenu(menu, 0, FIRST, LAST, flags) };
+        let tq = t0.elapsed().as_secs_f64() * 1000.0;
         log::line(&format!("classic menu ({}), handlers filled it in {tq:.1} ms ({hr:?})", if items { "items" } else { "background" }));
         let id = classic::track(cm, menu, at.x, at.y);
         give_back(owner);
@@ -58,8 +69,42 @@ fn show_at(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool
         let _ = unsafe { DestroyMenu(menu) };
         return;
     }
-    let entries = read::entries(cm, menu, FIRST);
-    let tr = t0.elapsed().as_secs_f64() * 1000.0;
+    let mut fill = || {
+        let t = Instant::now();
+        // SAFETY: the handlers fill our menu on this thread.
+        let hr = unsafe { cm.QueryContextMenu(menu, 0, FIRST, LAST, flags) };
+        let tq = t.elapsed().as_secs_f64() * 1000.0;
+        let entries = read::entries(cm, menu, FIRST);
+        log_entries(items, tq, hr, &entries, t.elapsed().as_secs_f64() * 1000.0);
+        entries
+    };
+    let req = popup::Request {
+        src: popup::Src::Local(cm.clone()),
+        key,
+        items,
+        more: more_label(),
+        owner,
+        at,
+        t0,
+        fill: Some(&mut fill),
+    };
+    let pick = popup::run(req);
+    give_back(owner);
+    match pick {
+        Some(popup::Pick::Command(id, _)) => classic::invoke(cm, owner, id, FIRST, at),
+        Some(popup::Pick::More) => {
+            let id = classic::track(cm, menu, at.x, at.y);
+            give_back(owner);
+            if id >= FIRST {
+                classic::invoke(cm, owner, id, FIRST, at);
+            }
+        }
+        None => log::line("dismissed"),
+    }
+    let _ = unsafe { DestroyMenu(menu) };
+}
+
+fn log_entries(items: bool, tq: f64, hr: windows_core::HRESULT, entries: &[model::Entry], tr: f64) {
     let owner_drawn = entries.iter().filter(|e| e.owner_draw).count();
     let verbs: Vec<String> = entries
         .iter()
@@ -75,23 +120,180 @@ fn show_at(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool
         entries.len(),
         verbs.join(", ")
     ));
+}
+
+pub(crate) fn more_label() -> &'static str {
     // SAFETY: plain query of the UI language.
-    let lang = unsafe { GetUserDefaultUILanguage() };
-    let (top, list) = model::arrange(&entries, items, model::more_label(lang));
-    let pick = popup::run(cm, list, top, owner, at, t0);
-    give_back(owner);
-    match pick {
-        Some(popup::Pick::Command(id)) => classic::invoke(cm, owner, id, FIRST, at),
-        Some(popup::Pick::More) => {
-            let id = classic::track(cm, menu, at.x, at.y);
-            give_back(owner);
-            if id >= FIRST {
-                classic::invoke(cm, owner, id, FIRST, at);
+    model::more_label(unsafe { GetUserDefaultUILanguage() })
+}
+
+fn background_key(defview: HWND) -> String {
+    // The desktop's view sits under Progman or a WorkerW.
+    let mut buf = [0u16; 64];
+    // SAFETY: class name of our view's top-level window.
+    let n = unsafe { GetClassNameW(GetAncestor(defview, GA_ROOT), &mut buf) } as usize;
+    let class = String::from_utf16_lossy(&buf[..n]);
+    if class == "Progman" || class == "WorkerW" { "bg:desktop".into() } else { "bg:files".into() }
+}
+
+const SFGAO_FOLDER: u32 = 0x2000_0000;
+
+static GEN: AtomicU64 = AtomicU64::new(1);
+
+/// The view folder's absolute ID list.
+fn folder_of(fv: &IFolderView2) -> Option<worker::Pidl> {
+    // SAFETY: COM calls on the view's thread; the ID list is copied and freed.
+    unsafe {
+        let pf: IPersistFolder2 = fv.GetFolder().ok()?;
+        let abs = pf.GetCurFolder().ok()?;
+        let folder = worker::pidl_bytes(abs);
+        CoTaskMemFree(Some(abs as _));
+        Some(folder)
+    }
+}
+
+/// The selection as the worker needs it: the view folder's ID list, the selected children's ID
+/// lists and the `model::Recent` key of the selection's kind.
+fn selection(fv: &IFolderView2, only_first: bool) -> Option<(worker::Pidl, Vec<worker::Pidl>, String)> {
+    // SAFETY: COM calls on the view's thread; ID lists the view allocates are copied and freed.
+    unsafe {
+        let folder = folder_of(fv)?;
+        let mut children = Vec::new();
+        if only_first {
+            if fv.ItemCount(SVGIO_ALLVIEW).unwrap_or(0) > 0 {
+                if let Ok(p) = fv.Item(0) {
+                    children.push(worker::pidl_bytes(p));
+                    CoTaskMemFree(Some(p as _));
+                }
             }
+        } else {
+            let mut i = -1;
+            loop {
+                let next = fv.GetSelectedItem(i + 1);
+                match next {
+                    Ok(n) if n > i => {
+                        i = n;
+                        if let Ok(p) = fv.Item(n) {
+                            children.push(worker::pidl_bytes(p));
+                            CoTaskMemFree(Some(p as _));
+                        }
+                    }
+                    _ => break,
+                }
+                if children.len() >= 512 {
+                    break;
+                }
+            }
+        }
+        if children.is_empty() {
+            return None;
+        }
+        let multi = if children.len() > 1 { "+" } else { "" };
+        let sf: IShellFolder = fv.GetFolder().ok()?;
+        let child = children[0].as_ptr() as *const ITEMIDLIST;
+        let mut attrs = SFGAO_FOLDER;
+        let _ = sf.GetAttributesOf(&[child], &mut attrs);
+        let kind = if attrs & SFGAO_FOLDER != 0 {
+            "folder".to_string()
+        } else {
+            let mut name = STRRET::default();
+            let ext = if sf.GetDisplayNameOf(child, SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0), &mut name).is_ok() {
+                let mut out = [0u16; 260];
+                let _ = StrRetToBufW(&mut name, Some(child), &mut out);
+                let n = out.iter().position(|&c| c == 0).unwrap_or(0);
+                let name = String::from_utf16_lossy(&out[..n]);
+                name.rsplit_once('.').map(|(_, e)| format!(".{}", e.to_lowercase())).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            ext
+        };
+        Some((folder, children, format!("items:{kind}{multi}")))
+    }
+}
+
+thread_local! {
+    /// Families this thread prewarmed (one fill each per thread).
+    static WARMED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+}
+
+/// After a view's first frame: the root window, the worker, and one fill per family (a file of the
+/// view, the folder's background) so the first menu of a kind has a static part to show.
+fn prewarm_view(defview: HWND, view: &IShellView) {
+    popup::prewarm();
+    worker::start();
+    let Some(reply) = popup::reply_window() else { return };
+    let Ok(fv) = view.cast::<IFolderView2>() else { return };
+    let first = WARMED.with(|w| {
+        let mut w = w.borrow_mut();
+        let todo: Vec<&'static str> = ["items", "bg"].into_iter().filter(|f| !w.contains(f)).collect();
+        w.extend(todo.iter().copied());
+        todo
+    });
+    for family in first {
+        let job = if family == "items" {
+            selection(&fv, true).map(|(folder, children, key)| (folder, children, key, CMF_CANRENAME))
+        } else {
+            folder_of(&fv).map(|folder| (folder, Vec::new(), "bg:prewarm".to_string(), 0))
+        };
+        if let Some((folder, children, key, flags)) = job {
+            let gn = GEN.fetch_add(1, Ordering::Relaxed);
+            popup::expect_prewarm(gn, &key);
+            worker::send(worker::Job::Fill { gn, folder, children, flags, reply: reply.0 as isize, owner: defview.0 as isize, site: None });
+        } else {
+            WARMED.with(|w| w.borrow_mut().retain(|f| *f != family));
+        }
+    }
+}
+
+/// The selection's menu built and filled on the worker; the first frame shows the static part.
+/// False when the selection cannot be given to the worker.
+fn show_worker(defview: HWND, view: &IShellView, fv: &IFolderView2, at: POINT, t0: Instant) -> bool {
+    let Some((folder, children, key)) = selection(fv, false) else { return false };
+    let Some(reply) = popup::reply_window() else { return false };
+    let gn = GEN.fetch_add(1, Ordering::Relaxed);
+    let first_child = children[0].clone();
+    let site = worker::marshal_site(view);
+    let sent = worker::send(worker::Job::Fill {
+        gn,
+        folder,
+        children,
+        flags: CMF_CANRENAME,
+        reply: reply.0 as isize,
+        owner: defview.0 as isize,
+        site,
+    });
+    if !sent {
+        return false;
+    }
+    let req = popup::Request { src: popup::Src::Worker(gn), key, items: true, more: more_label(), owner: defview, at, t0, fill: None };
+    let pick = popup::run(req);
+    give_back(defview);
+    // SAFETY: modifier state of this thread's input.
+    let (shift, ctrl) = unsafe { (GetKeyState(VK_SHIFT.0 as i32) < 0, GetKeyState(VK_CONTROL.0 as i32) < 0) };
+    match pick {
+        Some(popup::Pick::Command(_, verb)) if verb.eq_ignore_ascii_case("rename") => {
+            // In-place rename is the view's: select the item for editing, as the view's own menu does.
+            const SVSI_EDIT: u32 = 3;
+            const SVSI_DESELECTOTHERS: u32 = 4;
+            const SVSI_ENSUREVISIBLE: u32 = 8;
+            const SVSI_FOCUSED: u32 = 0x10;
+            // SAFETY: the view's own call with an ID list that outlives it.
+            let r = unsafe {
+                view.SelectItem(first_child.as_ptr() as *const ITEMIDLIST, SVSI_EDIT | SVSI_DESELECTOTHERS | SVSI_ENSUREVISIBLE | SVSI_FOCUSED)
+            };
+            log::line(&format!("rename through the view: {:?}", r.err().map(|e| e.code())));
+        }
+        Some(popup::Pick::Command(id, verb)) => {
+            log::line(&format!("pick id {id} [{verb}]: the worker runs it"));
+            worker::send(worker::Job::Invoke { gn, id, owner: defview.0 as isize, at: (at.x, at.y), shift, ctrl });
+        }
+        Some(popup::Pick::More) => {
+            worker::send(worker::Job::Classic { gn, owner: defview.0 as isize, at: (at.x, at.y) });
         }
         None => log::line("dismissed"),
     }
-    let _ = unsafe { DestroyMenu(menu) };
+    true
 }
 
 /// Gives the foreground and the focus back to the view the menu came from.
@@ -196,10 +398,13 @@ fn hook_children(defview: HWND) {
 unsafe extern "system" fn subclass(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, data: usize) -> LRESULT {
     let defview = HWND(data as _);
     if msg == prewarm_msg() && h == defview {
-        popup::prewarm();
+        if let Some(view) = VIEWS.with(|v| v.borrow().iter().find(|(w, _)| *w == defview).map(|(_, s)| s.clone())) {
+            prewarm_view(defview, &view);
+        }
         return LRESULT(0);
     }
     match msg {
+        WM_CONTEXTMENU if !from_view(HWND(wp.0 as _)) => {}
         WM_CONTEXTMENU => {
             let t0 = Instant::now();
             let view = VIEWS.with(|v| v.borrow().iter().find(|(w, _)| *w == defview).map(|(_, s)| s.clone()));
@@ -246,7 +451,16 @@ fn on_context(defview: HWND, view: &IShellView, lp: LPARAM, t0: Instant) -> bool
                 (x, y) = (r.left + 16, r.top + 16);
             }
         }
-        let items = view.cast::<IFolderView2>().ok().and_then(|f| f.ItemCount(SVGIO_SELECTION).ok()).unwrap_or(0) > 0;
+        let fv = view.cast::<IFolderView2>().ok();
+        let items = fv.as_ref().and_then(|f| f.ItemCount(SVGIO_SELECTION).ok()).unwrap_or(0) > 0;
+        if items && !shift {
+            if let Some(fv) = &fv {
+                if show_worker(defview, view, fv, POINT { x, y }, t0) {
+                    return true;
+                }
+                log::line("selection not given to the worker: the view's menu fills here");
+            }
+        }
         let cm: windows_core::Result<IContextMenu> = view.GetItemObject(if items { SVGIO_SELECTION } else { SVGIO_BACKGROUND });
         let Ok(cm) = cm else {
             log::line(&format!("no context menu from the view: {:?}", cm.err()));
@@ -265,3 +479,13 @@ fn on_context(defview: HWND, view: &IShellView, lp: LPARAM, t0: Instant) -> bool
 }
 
 pub use popup::prewarm;
+
+/// True when a WM_CONTEXTMENU came from the view itself (its list or item area), not from a
+/// child with its own menu such as the details view's column header.
+fn from_view(src: HWND) -> bool {
+    let mut buf = [0u16; 64];
+    // SAFETY: class name into a local buffer.
+    let n = unsafe { GetClassNameW(src, &mut buf) } as usize;
+    let class = String::from_utf16_lossy(&buf[..n]);
+    !matches!(class.as_str(), "SysHeader32" | "CtrlNotifySink" | "ScrollBar")
+}

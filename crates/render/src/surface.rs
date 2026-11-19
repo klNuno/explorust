@@ -126,6 +126,27 @@ impl Surface {
         }
     }
 
+    /// Open animation of the content: slides in from `from_y` pixels with a cubic ease-out over
+    /// `slide_s` seconds and fades in over `fade_s`, run by DirectComposition (no timers).
+    pub fn slide_in(&self, from_y: f32, slide_s: f32, fade_s: f32) -> Result<()> {
+        unsafe {
+            let t = slide_s.max(0.001);
+            // y(t) = from_y * (1 - t/T)^3 expanded into cubic coefficients.
+            let slide = self._dcomp.CreateAnimation()?;
+            slide.AddCubic(0.0, from_y, -3.0 * from_y / t, 3.0 * from_y / (t * t), -from_y / (t * t * t))?;
+            slide.End(t as f64, 0.0)?;
+            self._visual.SetOffsetY(&slide)?;
+            let f = fade_s.max(0.001);
+            let fade = self._dcomp.CreateAnimation()?;
+            fade.AddCubic(0.0, 0.0, 1.0 / f, 0.0, 0.0)?;
+            fade.End(f as f64, 1.0)?;
+            let group = self._dcomp.CreateEffectGroup()?;
+            group.SetOpacity(&fade)?;
+            self._visual.SetEffect(&group)?;
+            self._dcomp.Commit()
+        }
+    }
+
     pub fn brush(&self, c: D2D1_COLOR_F) -> Result<ID2D1SolidColorBrush> {
         unsafe { self.ctx.CreateSolidColorBrush(&c, None) }
     }
