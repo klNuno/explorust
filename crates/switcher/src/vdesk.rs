@@ -152,18 +152,25 @@ impl Vd {
         }
     }
 
-    /// Switches with Windows' slide animation, or without it when that call fails.
+    /// Switches to `d` and checks that it became current: the animated call first, then the
+    /// plain one. In g1 (no explorer) the animated call returned S_OK and left the current
+    /// desktop as it was, so the result is checked rather than trusted.
     pub fn switch(&self, d: &Desk) -> Result<&'static str> {
         // SAFETY: slots 22 SwitchDesktopWithAnimation and 9 SwitchDesktop, both (IVirtualDesktop*).
         unsafe {
             let anim: One = slot(&self.mgr, 22);
-            if anim(self.mgr.as_raw(), d.obj.as_raw()).is_ok() {
+            let a = anim(self.mgr.as_raw(), d.obj.as_raw());
+            if a.is_ok() && self.current_id().ok() == Some(d.id) {
                 return Ok("SwitchDesktopWithAnimation");
             }
             let plain: One = slot(&self.mgr, 9);
             plain(self.mgr.as_raw(), d.obj.as_raw()).ok()?;
         }
-        Ok("SwitchDesktop")
+        if self.current_id().ok() == Some(d.id) {
+            Ok("SwitchDesktop")
+        } else {
+            Ok("SwitchDesktop (returned S_OK, current unchanged)")
+        }
     }
 
     /// Removes `d`; its windows go to `fallback`.

@@ -315,6 +315,12 @@ pub fn toggle() {
         unsafe {
             let _ = ShowWindow(t.hwnd, SW_SHOW);
         }
+        let tiles: Vec<String> =
+            t.layout.tiles.iter().map(|r| format!("{},{} {}x{}", r.rect.x, r.rect.y, r.rect.w, r.rect.h)).collect();
+        let desks: Vec<String> =
+            t.strip.desks.iter().map(|d| format!("{},{} {}x{}", d.rect.x, d.rect.y, d.rect.w, d.rect.h)).collect();
+        let n = &t.strip.new_desk;
+        log::line(&format!("task view: tiles {}; desks {}; new {},{} {}x{}", tiles.join("; "), desks.join("; "), n.x, n.y, n.w, n.h));
         log::line(&format!(
             "task view: {} windows ({}), desktops {:?} current {}, service {}, shown in {:.1} ms",
             t.entries.len(),

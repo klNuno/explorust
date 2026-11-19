@@ -125,6 +125,7 @@ pub fn toggle() {
         log::line(&format!("snap: {:?} cannot be resized, no layouts", wl::title(target)));
         return;
     }
+    let mut pos = (0, 0);
     let shown = with(|s| {
         s.target = target;
         // SAFETY: monitor and frame queries, then placing our own window.
@@ -146,6 +147,7 @@ pub fn toggle() {
             let x = (anchor_x - fw / 2).clamp(s.work.left + 8, s.work.right - fw - 8);
             let y = (frame.top + (32.0 * sc) as i32 + 4).clamp(s.work.top + 8, s.work.bottom - fh - 8);
             let _ = SetWindowPos(s.hwnd, Some(HWND_TOPMOST), x, y, fw, fh, SWP_NOACTIVATE);
+            pos = (x, y);
             if s.painter.is_none() {
                 let side = (SURFACE * sc).round() as u32;
                 match Painter::new(s.hwnd, side, side) {
@@ -163,11 +165,13 @@ pub fn toggle() {
         }
         s.acting = true;
         log::line(&format!(
-            "snap: {} layouts for {:?}, flyout {}x{} DIPs, shown in {:.1} ms",
+            "snap: {} layouts for {:?}, flyout {}x{} DIPs at {},{}, shown in {:.1} ms",
             s.layouts.len(),
             wl::title(target),
             s.flyout.w,
             s.flyout.h,
+            pos.0,
+            pos.1,
             t0.elapsed().as_secs_f32() * 1000.0
         ));
         s.hwnd
