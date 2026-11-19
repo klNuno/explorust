@@ -12,6 +12,10 @@ fn main() {
         // Test aid: send FilesOpen to the running part, as the shell's Win+E hook does, and exit.
         std::process::exit(if bus::post(bus::Command::FilesOpen, 0) { 0 } else { 1 });
     }
+    if std::env::args().any(|a| a == "--quit") {
+        // Test aid: close the running part's windows (they leave the shell's window list) and end it.
+        std::process::exit(if bus::post_to(bus::Owner::Files, bus::Command::Shutdown, 0) { 0 } else { 1 });
+    }
     files::dark_mode_for_process();
     if std::env::args().any(|a| a == "--open") {
         // Test aid: open a window once the part listens, as Win+E would.

@@ -16,6 +16,7 @@
 //! runs its message loop and returns on `bus::Command::Shutdown` or `WM_QUIT`.
 
 pub mod edit;
+pub mod handler;
 pub mod handover;
 pub mod history;
 pub mod layout;

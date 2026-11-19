@@ -57,6 +57,37 @@ impl Pidl {
         unsafe { SHGetIDListFromObject(item).ok().and_then(Pidl::take) }
     }
 
+    /// The parent folder's ID list, `None` for the desktop root.
+    pub fn parent(&self) -> Option<Pidl> {
+        let mut b = self.0.clone();
+        // SAFETY: `b` is a copy of a valid ID list; ILRemoveLastID only shortens it in place.
+        unsafe {
+            if !ILRemoveLastID(Some(b.as_mut_ptr() as *mut ITEMIDLIST)).as_bool() {
+                return None;
+            }
+            Pidl::copy(b.as_ptr() as *const ITEMIDLIST)
+        }
+    }
+
+    /// The last item ID (relative to the parent), pointing into `self`.
+    pub fn last(&self) -> *const ITEMIDLIST {
+        unsafe { ILFindLastID(self.as_ptr()) }
+    }
+
+    /// Whether the item is a folder (ZIP folders included).
+    pub fn is_folder(&self) -> bool {
+        use windows::Win32::System::SystemServices::SFGAO_FOLDER;
+        self.item()
+            .and_then(|i| unsafe { i.GetAttributes(SFGAO_FOLDER) })
+            .map(|a| a.0 & SFGAO_FOLDER.0 != 0)
+            .unwrap_or(false)
+    }
+
+    /// Its parsing name, for logs.
+    pub fn display(&self) -> String {
+        self.item().map(|i| name(&i, SIGDN_DESKTOPABSOLUTEPARSING)).unwrap_or_default()
+    }
+
     /// Parses a path, a `shell:` name or a `search-ms:` URI.
     pub fn parse(name: &str) -> Option<Pidl> {
         let w = shelldata::wide(name);

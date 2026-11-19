@@ -7,6 +7,7 @@ mod gfx;
 mod log;
 mod menus;
 mod shell;
+mod shellwindows;
 mod tab;
 
 use crate::handover;
@@ -72,10 +73,33 @@ fn prepare_spare() {
     }
 }
 
-/// Opens a window on `path` (Home when `None`). `t0` is when the request arrived.
-fn open(cmd: HWND, path: Option<&str>, t0: Instant, queued_ms: u32) {
+/// A new window on `place` (a tab torn off), at `at` in screen pixels.
+pub(crate) fn open_window(place: &Pidl, at: Option<(i32, i32)>) {
+    let t0 = Instant::now();
+    let (x, y) = at.unwrap_or_else(next_position);
+    match frame::create(place, x, y) {
+        Ok(h) => {
+            frame::set_opened(h, t0);
+            frame::show(h);
+            frame::announce(h, place);
+        }
+        Err(e) => log::line(&format!("new window failed: {e}")),
+    }
+}
+
+/// Opens a window on `path` (Home when `None`). A file, or any item when `select` is set, opens
+/// its folder with the item selected. `t0` is when the request arrived.
+fn open(cmd: HWND, path: Option<&str>, select: bool, t0: Instant, queued_ms: u32) {
+    let mut chosen = None;
     let place = match path {
         Some(p) => match Pidl::parse(p) {
+            Some(pidl) if select || !pidl.is_folder() => match pidl.parent() {
+                Some(parent) => {
+                    chosen = Some(pidl);
+                    Some(parent)
+                }
+                None => Some(pidl),
+            },
             Some(pidl) => Some(pidl),
             None => {
                 log::line(&format!("open {p:?}: not found"));
@@ -84,6 +108,7 @@ fn open(cmd: HWND, path: Option<&str>, t0: Instant, queued_ms: u32) {
         },
         None => None,
     };
+    let announced = place.clone().or_else(shell::home);
     let spare = SPARE.with(|s| s.take());
     let mut later = None;
     let (hwnd, from) = match spare {
@@ -108,6 +133,9 @@ fn open(cmd: HWND, path: Option<&str>, t0: Instant, queued_ms: u32) {
         }
     };
     frame::set_opened(hwnd, t0);
+    if let Some(item) = chosen {
+        frame::select_after(hwnd, item);
+    }
     let before = t0.elapsed().as_secs_f64() * 1000.0;
     let (show_ms, draw_ms, activate_ms) = frame::show(hwnd);
     let presented = before + show_ms + draw_ms;
@@ -121,6 +149,9 @@ fn open(cmd: HWND, path: Option<&str>, t0: Instant, queued_ms: u32) {
     ));
     if let Some(p) = later {
         frame::browse(hwnd, &p);
+    }
+    if let Some(p) = &announced {
+        frame::announce(hwnd, p);
     }
     unsafe {
         SetTimer(Some(cmd), TIMER_SPARE, SPARE_DELAY_MS, None);
@@ -138,7 +169,7 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         if arg != 0 {
                             log::line(&format!("FilesOpen lParam {arg}: no path protocol yet, opening Home"));
                         }
-                        open(hwnd, None, t0, queued);
+                        open(hwnd, None, false, t0, queued);
                     }
                     Some((bus::Command::Shutdown, _)) => {
                         log::line("shutdown");
@@ -155,14 +186,15 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_COPYDATA => {
                 let t0 = Instant::now();
                 let cds = &*(lp.0 as *const COPYDATASTRUCT);
-                if cds.dwData != handover::MAGIC || cds.lpData.is_null() {
+                let select = cds.dwData == handover::MAGIC_SELECT;
+                if (cds.dwData != handover::MAGIC && !select) || cds.lpData.is_null() {
                     return LRESULT(0);
                 }
                 let bytes = std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize);
                 let Some(path) = handover::decode(bytes) else { return LRESULT(0) };
                 // Reply first: the sender waits in SendMessage.
                 let _ = ReplyMessage(LRESULT(1));
-                open(hwnd, Some(&path), t0, 0);
+                open(hwnd, Some(&path), select, t0, 0);
                 LRESULT(1)
             }
             WM_TIMER if wp.0 == TIMER_SPARE => {
@@ -236,7 +268,7 @@ pub fn run() {
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if frame::accelerator(&msg) {
+            if frame::middle_click(&msg) || frame::accelerator(&msg) {
                 continue;
             }
             let _ = TranslateMessage(&msg);

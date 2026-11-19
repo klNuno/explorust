@@ -10,7 +10,7 @@ use crate::win::chrome::{self, TabView};
 use crate::win::gfx::{Canvas, Shared};
 use crate::win::shell::{self, Pidl};
 use crate::win::tab::{self, Tab};
-use crate::win::{log, menus};
+use crate::win::{log, menus, shellwindows};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -24,12 +24,22 @@ use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::Shell::{SIGDN_DESKTOPABSOLUTEEDITING, SVUIA_ACTIVATE_FOCUS};
+use windows::Win32::System::Com::IServiceProvider;
+use windows::Win32::System::SystemServices::SFGAO_FOLDER;
+use windows::Win32::UI::Shell::{
+    IShellView, SIGDN_DESKTOPABSOLUTEEDITING, SVSI_DESELECTOTHERS, SVSI_ENSUREVISIBLE, SVSI_FOCUSED, SVSI_SELECT,
+    SVUIA_ACTIVATE_FOCUS,
+};
+use windows_core::Interface;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_core::{PCWSTR, w};
 
 const CLASS: PCWSTR = w!("explorust.FilesWindow");
 pub const MSG_RELAYOUT: u32 = 0x8000 + 0x123;
+/// A caller of the window list asks to browse (lParam a boxed `Pidl` the frame frees).
+const MSG_BROWSE: u32 = 0x8000 + 0x124;
+/// A middle click on the items view selected what it hit: open it in a tab.
+const MSG_MIDDLE: u32 = 0x8000 + 0x125;
 
 pub struct Frame {
     pub hwnd: HWND,
@@ -53,6 +63,12 @@ pub struct Frame {
     laid_out: (i32, i32, u32),
     /// When the window was asked for, until its view is ready (logged then).
     pub opened: Option<Instant>,
+    /// Cookie of the window in the shell's window list.
+    sw_cookie: Option<i32>,
+    /// An item (absolute ID list) to select once its folder shows.
+    select: Option<Pidl>,
+    /// A tab dragged off the strip, torn into a new window on release.
+    tear: Option<usize>,
 }
 
 thread_local! {
@@ -156,6 +172,9 @@ pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
             view_hidden: false,
             laid_out: (0, 0, 0),
             opened: None,
+            sw_cookie: None,
+            select: None,
+            tear: None,
         };
         let rc = Rc::new(RefCell::new(frame));
         FRAMES.with(|f| f.borrow_mut().push((hwnd, rc.clone())));
@@ -208,6 +227,71 @@ pub fn browse(hwnd: HWND, place: &Pidl) {
             let _ = t.browse(place);
         }
     });
+}
+
+/// Puts `hwnd` in the shell's window list, showing `place`.
+pub fn announce(hwnd: HWND, place: &Pidl) {
+    // Outside the frame's borrow: the cross-process call can let callers in.
+    let cookie = shellwindows::register(hwnd, place);
+    with(hwnd, |f| f.sw_cookie = cookie);
+}
+
+/// Selects `item` (absolute) once the active tab shows its folder.
+pub fn select_after(hwnd: HWND, item: Pidl) {
+    with(hwnd, |f| f.select = Some(item));
+}
+
+/// The file system path (if any) and the display name of the folder `hwnd` shows.
+pub fn location(hwnd: HWND) -> Option<(Option<String>, String)> {
+    with(hwnd, |f| f.tab().map(|t| (t.item.as_ref().and_then(shell::fs_path), t.title.clone()))).flatten()
+}
+
+/// The active tab's view.
+pub fn active_view(hwnd: HWND) -> Option<IShellView> {
+    with(hwnd, |f| f.tab().and_then(|t| t.shell_view())).flatten()
+}
+
+/// The active tab's browser as a service provider.
+pub fn browser_services(hwnd: HWND) -> Option<IServiceProvider> {
+    with(hwnd, |f| f.tab().and_then(|t| t.eb.cast().ok())).flatten()
+}
+
+/// Navigates the active tab to `place` from the message loop (a COM caller is on the stack).
+pub fn browse_later(hwnd: HWND, place: Pidl) {
+    let raw = Box::into_raw(Box::new(place));
+    unsafe {
+        if PostMessageW(Some(hwnd), MSG_BROWSE, WPARAM(0), LPARAM(raw as isize)).is_err() {
+            drop(Box::from_raw(raw));
+        }
+    }
+}
+
+/// A middle click on a folder in an items view opens it in a new tab, as Explorer does. The view
+/// has no hit test, so the click is replayed as a left click (which selects what it hits) and the
+/// frame reads the selection after it.
+pub fn middle_click(msg: &MSG) -> bool {
+    if msg.message != WM_MBUTTONUP && msg.message != WM_MBUTTONDOWN {
+        return false;
+    }
+    unsafe {
+        if class_of(msg.hwnd) != "DirectUIHWND" {
+            return false;
+        }
+        let parent = GetParent(msg.hwnd).unwrap_or_default();
+        if class_of(parent) != "SHELLDLL_DefView" {
+            return false;
+        }
+        let root = GetAncestor(msg.hwnd, GA_ROOT);
+        if find(root).is_none() {
+            return false;
+        }
+        if msg.message == WM_MBUTTONUP {
+            let _ = PostMessageW(Some(msg.hwnd), WM_LBUTTONDOWN, WPARAM(1), msg.lParam);
+            let _ = PostMessageW(Some(msg.hwnd), WM_LBUTTONUP, WPARAM(0), msg.lParam);
+            let _ = PostMessageW(Some(root), MSG_MIDDLE, WPARAM(0), LPARAM(0));
+        }
+    }
+    true
 }
 
 pub fn set_opened(hwnd: HWND, t: Instant) {
@@ -286,6 +370,44 @@ impl Frame {
         Ok(())
     }
 
+    /// A tab after the active one that loads behind it (middle click).
+    fn add_background_tab(&mut self, place: &Pidl) -> windows_core::Result<()> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let t = Tab::new(self.hwnd, id, self.view_rect(), self.details.clone())?;
+        t.show(false);
+        t.browse(place)?;
+        self.tabs.insert(self.active + 1, t);
+        Ok(())
+    }
+
+    /// Middle click replayed: the folder the click selected opens in a background tab.
+    fn middle_open(&mut self) {
+        let Some(item) = self.tab().and_then(|t| t.folder_view()).and_then(|v| unsafe {
+            let items = v.GetSelection(false).ok()?;
+            if items.GetCount().ok()? != 1 {
+                return None;
+            }
+            items.GetItemAt(0).ok()
+        }) else {
+            return;
+        };
+        let folder = unsafe { item.GetAttributes(SFGAO_FOLDER) }.map(|a| a.0 & SFGAO_FOLDER.0 != 0).unwrap_or(false);
+        let Some(p) = Pidl::of(&item).filter(|_| folder) else { return };
+        match self.add_background_tab(&p) {
+            Ok(()) => log::line(&format!("middle click: {:?} opened in tab {}", shell::name(&item, windows::Win32::UI::Shell::SIGDN_NORMALDISPLAY), self.active + 2)),
+            Err(e) => log::line(&format!("middle click tab failed: {e}")),
+        }
+        self.draw();
+    }
+
+    /// The window list follows the active tab.
+    fn tell_list(&self) {
+        if let (Some(c), Some(p)) = (self.sw_cookie, self.tab().and_then(|t| t.history.current())) {
+            shellwindows::navigate(c, p);
+        }
+    }
+
     fn switch(&mut self, i: usize) {
         if i >= self.tabs.len() || i == self.active {
             return;
@@ -301,6 +423,7 @@ impl Frame {
         self.address = None;
         self.search = LineEdit::default();
         self.title();
+        self.tell_list();
     }
 
     fn close_tab(&mut self, i: usize) {
@@ -714,8 +837,40 @@ impl Frame {
         if active_id == Some(id) {
             self.title();
             self.search = LineEdit::default();
+            self.tell_list();
+            self.select_pending();
         }
         self.draw();
+    }
+
+    /// Selects the item a caller asked for when the active tab shows its folder.
+    fn select_pending(&mut self) {
+        let Some(item) = self.select.take() else { return };
+        let Some(t) = self.tab() else { return };
+        let same = match (item.parent(), t.history.current()) {
+            (Some(a), Some(b)) => unsafe { windows::Win32::UI::Shell::ILIsEqual(a.as_ptr(), b.as_ptr()) }.as_bool(),
+            _ => false,
+        };
+        if !same {
+            self.select = Some(item);
+            return;
+        }
+        let Some(v) = t.shell_view() else { return };
+        let flags = (SVSI_SELECT.0 | SVSI_DESELECTOTHERS.0 | SVSI_ENSUREVISIBLE.0 | SVSI_FOCUSED.0) as u32;
+        let r = unsafe { v.SelectItem(item.last(), flags) };
+        log::line(&format!("select {:?}: {r:?}", item.display()));
+    }
+
+    /// Ends a tab drag that left the strip: the tab closes here and its folder is returned for a
+    /// window of its own.
+    fn tear_off(&mut self) -> Option<Pidl> {
+        let i = self.tear.take()?;
+        self.pressed = Hit::None;
+        let place = self.tabs.get(i).and_then(|t| t.history.current().cloned())?;
+        self.close_tab(i);
+        self.draw();
+        log::line(&format!("tab {i} torn off into a new window"));
+        Some(place)
     }
 
     fn view_created(&mut self, id: usize) {
@@ -831,6 +986,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         track(hwnd, false);
                         f.tracking = true;
                     }
+                    if let Hit::Tab(i) = f.pressed {
+                        let k = f.scale();
+                        let off = y < (-24.0 * k) as i32 || y > ((L::TABSTRIP_H + 24.0) * k) as i32;
+                        if off && f.tabs.len() > 1 && f.tear.is_none() {
+                            f.tear = Some(i);
+                            let _ = SetCursor(LoadCursorW(None, IDC_SIZEALL).ok());
+                        }
+                    }
                     let h = f.hit(x, y);
                     f.set_hover(h)
                 });
@@ -865,6 +1028,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_LBUTTONUP => {
                 let (x, y) = point(lp);
                 let _ = ReleaseCapture();
+                if let Some(Some(place)) = with(hwnd, |f| f.tear_off()) {
+                    let mut at = POINT::default();
+                    let _ = GetCursorPos(&mut at);
+                    let k = scale(hwnd);
+                    crate::win::open_window(&place, Some((at.x - (120.0 * k) as i32, at.y - (20.0 * k) as i32)));
+                    return LRESULT(0);
+                }
                 with(hwnd, |f| {
                     let was = std::mem::replace(&mut f.pressed, Hit::None);
                     let h = f.hit(x, y);
@@ -924,10 +1094,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_ACTIVATE => {
-                with(hwnd, |f| {
+                let cookie = with(hwnd, |f| {
                     f.window_active = (wp.0 & 0xffff) != 0;
                     f.draw();
+                    f.sw_cookie
                 });
+                if let Some(Some(c)) = cookie {
+                    shellwindows::activated(c, (wp.0 & 0xffff) != 0);
+                }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_SIZE => {
@@ -990,7 +1164,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_DESTROY => {
+                if let Some(Some(c)) = with(hwnd, |f| f.sw_cookie.take()) {
+                    shellwindows::revoke(c);
+                }
                 FRAMES.with(|f| f.borrow_mut().retain(|(h, _)| *h != hwnd));
+                LRESULT(0)
+            }
+            MSG_BROWSE => {
+                let p = *Box::from_raw(lp.0 as *mut Pidl);
+                browse(hwnd, &p);
+                LRESULT(0)
+            }
+            MSG_MIDDLE => {
+                with(hwnd, |f| f.middle_open());
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),

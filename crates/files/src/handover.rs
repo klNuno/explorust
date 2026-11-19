@@ -3,6 +3,8 @@
 
 /// `dwData` of the handover: "EXPF".
 pub const MAGIC: usize = 0x4558_5046;
+/// `dwData` when the path names an item to select in its folder (`/select,`): "EXPS".
+pub const MAGIC_SELECT: usize = 0x4558_5053;
 
 /// The UTF-16 payload for `path`, NUL-terminated.
 pub fn encode(path: &str) -> Vec<u16> {

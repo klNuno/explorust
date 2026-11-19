@@ -21,9 +21,30 @@ pub fn search(query: &str, location: Option<&str>, title: &str) -> String {
     s
 }
 
+/// The `file:///` URL of a file system path, as Explorer reports in `LocationURL`.
+pub fn file_url(path: &str) -> String {
+    let mut out = String::from("file:///");
+    for c in path.chars() {
+        match c {
+            '\\' => out.push('/'),
+            ' ' => out.push_str("%20"),
+            '#' => out.push_str("%23"),
+            '%' => out.push_str("%25"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_urls() {
+        assert_eq!(file_url("C:\\Windows"), "file:///C:/Windows");
+        assert_eq!(file_url("C:\\a b\\#1"), "file:///C:/a%20b/%231");
+    }
 
     #[test]
     fn encodes_query_and_location() {
