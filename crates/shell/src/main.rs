@@ -32,6 +32,8 @@ mod keyhost;
 #[cfg(target_os = "windows")]
 mod log;
 #[cfg(target_os = "windows")]
+mod minimized;
+#[cfg(target_os = "windows")]
 mod run;
 #[cfg(target_os = "windows")]
 mod selftest;
