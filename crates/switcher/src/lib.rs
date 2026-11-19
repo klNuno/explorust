@@ -13,13 +13,19 @@
 
 pub mod layout;
 pub mod model;
+pub mod snap_layout;
+pub mod tv_layout;
 
 #[cfg(target_os = "windows")]
 mod activate;
 #[cfg(target_os = "windows")]
+mod desktops;
+#[cfg(target_os = "windows")]
 mod log;
 #[cfg(target_os = "windows")]
 mod scene;
+#[cfg(target_os = "windows")]
+mod vdesk;
 #[cfg(target_os = "windows")]
 mod window;
 #[cfg(target_os = "windows")]

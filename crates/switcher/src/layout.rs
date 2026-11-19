@@ -104,9 +104,14 @@ fn box_w(aspect: f32, h: f32) -> f32 {
 
 /// Lays out one tile per source aspect for a `screen_w` x `screen_h` monitor (DIPs).
 pub fn layout(aspects: &[f32], screen_w: f32, screen_h: f32) -> Layout {
+    layout_with(aspects, screen_w, screen_h, THUMB_H)
+}
+
+/// `layout` with thumbnails `thumb_h` high at full size (Task View's are larger).
+pub fn layout_with(aspects: &[f32], screen_w: f32, screen_h: f32, thumb_h: f32) -> Layout {
     let max_inner = (screen_w * 0.9 - 2.0 * PAD).max(1.0);
     let max_h = screen_h * 0.8;
-    let mut th = THUMB_H;
+    let mut th = thumb_h;
     loop {
         let rows = pack(aspects, th, max_inner);
         let tile_h = TITLE_H + th + INSET;

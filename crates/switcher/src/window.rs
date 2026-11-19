@@ -529,10 +529,17 @@ fn cancel() {
 unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         bus::MSG_COMMAND => {
-            match bus::decode(wp, lp) {
+            let cmd = bus::decode(wp, lp);
+            if let Some((c, a)) = cmd.filter(|(c, _)| !matches!(c, bus::Command::SwitcherNext)) {
+                log::line(&format!("command {c:?} ({a})"));
+            }
+            match cmd {
                 Some((bus::Command::SwitcherNext, arg)) => on_next(arg == 1),
                 Some((bus::Command::SwitcherCommit, _)) => commit("alt up"),
                 Some((bus::Command::SwitcherCancel, _)) => cancel(),
+                Some((bus::Command::DesktopNew, _)) => crate::desktops::new_desktop(),
+                Some((bus::Command::DesktopSwitch, arg)) => crate::desktops::switch(arg),
+                Some((bus::Command::DesktopClose, _)) => crate::desktops::close_current(),
                 Some((bus::Command::Shutdown, _)) => {
                     with(|s| s.close());
                     log::line("switcher: shutdown");

@@ -33,6 +33,22 @@ pub fn after_remove(sel: usize, removed: usize, n: usize) -> usize {
     s.min(n - 1)
 }
 
+/// The desktop Ctrl+Win+Left (`dir` < 0) or Right goes to from `cur` of `n`; Windows does not wrap.
+pub fn adjacent(cur: usize, n: usize, dir: isize) -> Option<usize> {
+    let t = cur as isize + dir.signum();
+    (dir != 0 && t >= 0 && (t as usize) < n).then_some(t as usize)
+}
+
+/// Where Ctrl+Win+F4 on desktop `cur` of `n` sends its windows and the user: the desktop to the
+/// left, or the right one when it is the first; None for the last desktop left.
+pub fn close_fallback(cur: usize, n: usize) -> Option<usize> {
+    match (cur, n) {
+        (_, 0 | 1) => None,
+        (0, _) => Some(1),
+        _ => Some(cur - 1),
+    }
+}
+
 /// Ease-out cubic for `t` in 0..1, clamped.
 pub fn ease_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -65,6 +81,17 @@ mod tests {
         assert_eq!(after_remove(2, 2, 2), 1);
         assert_eq!(after_remove(1, 2, 2), 1);
         assert_eq!(after_remove(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn desktops_do_not_wrap() {
+        assert_eq!(adjacent(0, 3, -1), None);
+        assert_eq!(adjacent(0, 3, 1), Some(1));
+        assert_eq!(adjacent(2, 3, 1), None);
+        assert_eq!(adjacent(1, 3, 0), None);
+        assert_eq!(close_fallback(0, 1), None);
+        assert_eq!(close_fallback(0, 3), Some(1));
+        assert_eq!(close_fallback(2, 3), Some(1));
     }
 
     #[test]
