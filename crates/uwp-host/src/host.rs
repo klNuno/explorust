@@ -791,7 +791,8 @@ fn run_host_with_parent(
 
 /// explorust: whether the controller skips twinui's TouchKeyboardExperienceManager component
 /// (emoji panel, clipboard view, voice typing). `EXPLORUST_UWP_TOUCH_KEYBOARD=0` skips it,
-/// `1` creates it; the default is set from the g1 tests (uwp-2).
+/// `1` creates it. Created by default since uwp-3: on 26300.9974 with explorust as the shell it
+/// starts TextInputHost and nothing broke (the panels themselves did not show yet).
 #[cfg(target_os = "windows")]
 fn skip_touch_keyboard() -> bool {
     match std::env::var("EXPLORUST_UWP_TOUCH_KEYBOARD").as_deref() {
@@ -802,7 +803,7 @@ fn skip_touch_keyboard() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-const SKIP_TOUCH_KEYBOARD_DEFAULT: bool = true;
+const SKIP_TOUCH_KEYBOARD_DEFAULT: bool = false;
 
 #[cfg(target_os = "windows")]
 fn publish_immersive_shell_broker() -> windows::core::Result<windows::core::IUnknown> {
