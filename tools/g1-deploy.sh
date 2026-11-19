@@ -18,16 +18,17 @@ mode=$(cat "$(echo "$mode" | grep '^log:' | awk '{print $2}')" | grep -o 'MODE=[
 echo "g1 mode: ${mode:-unknown}"
 ua=0
 [ "$mode" = installed ] && ua=1
-os job run --wait -- env EXPLORUST_UIACCESS=$ua cargo build --release --target x86_64-pc-windows-gnu -p shell -p keys -p guard -p devkeys -p files
+os job run --wait -- env EXPLORUST_UIACCESS=$ua cargo build --release --target x86_64-pc-windows-gnu -p shell -p keys -p guard -p devkeys -p files -p inject
 t=target/x86_64-pc-windows-gnu/release
 mkdir -p dist
-cp "$t/explorust.exe" "$t/explorust-guard.exe" "$t/keys.exe" "$t/explorust-keys.exe" "$t/explorust-open.exe" tools/g1-state.ps1 dist/
+cp "$t/explorust.exe" "$t/explorust-guard.exe" "$t/keys.exe" "$t/explorust-keys.exe" "$t/explorust-open.exe" "$t/explorust_inject.dll" tools/g1-state.ps1 dist/
 [ $ua = 1 ] && python3 -I tools/authenticode-sign.py sign dist/explorust-keys.exe
 cp dist/explorust.exe dist/explorust.next.exe
 timeout 120 os win push g1 dist/explorust-open.exe 'C:\explorust' >/dev/null
 timeout 120 os win push g1 dist/explorust.next.exe 'C:\explorust' >/dev/null
 timeout 120 os win push g1 dist/keys.exe 'C:\explorust' >/dev/null
 timeout 120 os win push g1 dist/explorust-keys.exe 'C:\explorust' >/dev/null
+timeout 120 os win push g1 dist/explorust_inject.dll 'C:\explorust' >/dev/null
 timeout 120 os win push g1 dist/g1-state.ps1 'C:\explorust' >/dev/null
 if [ "${1:-}" = "--guard" ]; then
   cp "$t/explorust-guard.exe" dist/explorust-guard.next.exe
@@ -38,7 +39,7 @@ if [ "${1:-}" = "--guard" ]; then
 fi
 if [ $ua = 1 ]; then
   # Swap as SYSTEM: <name>.exe -> <name>.old (a running image can be renamed), then copy the new one.
-  timeout 90 os win run g1 --ps -- "\$d='$pf'; function swap(\$src, \$name) { if (-not (Test-Path \$src)) { return }; Remove-Item \"\$d\\\$name.old\" -EA SilentlyContinue; if (Test-Path \"\$d\\\$name.exe\") { Rename-Item \"\$d\\\$name.exe\" \"\$name.old\" }; Copy-Item \$src \"\$d\\\$name.exe\"; Remove-Item \$src; \"\$name swapped\" }; Copy-Item C:\\explorust\\explorust-open.exe C:\\explorust\\explorust-open.stage.exe; Copy-Item C:\\explorust\\explorust-keys.exe C:\\explorust\\explorust-keys.stage.exe; swap C:\\explorust\\explorust.next.exe explorust; swap C:\\explorust\\explorust-open.stage.exe explorust-open; swap C:\\explorust\\explorust-keys.stage.exe explorust-keys; swap C:\\explorust\\explorust-guard.next.exe explorust-guard" >/dev/null
+  timeout 90 os win run g1 --ps -- "\$d='$pf'; function swap(\$src, \$name) { if (-not (Test-Path \$src)) { return }; Remove-Item \"\$d\\\$name.old\" -EA SilentlyContinue; if (Test-Path \"\$d\\\$name.exe\") { Rename-Item \"\$d\\\$name.exe\" \"\$name.old\" }; Copy-Item \$src \"\$d\\\$name.exe\"; Remove-Item \$src; \"\$name swapped\" }; Copy-Item C:\\explorust\\explorust-open.exe C:\\explorust\\explorust-open.stage.exe; Copy-Item C:\\explorust\\explorust-keys.exe C:\\explorust\\explorust-keys.stage.exe; swap C:\\explorust\\explorust.next.exe explorust; swap C:\\explorust\\explorust-open.stage.exe explorust-open; swap C:\\explorust\\explorust-keys.stage.exe explorust-keys; swap C:\\explorust\\explorust-guard.next.exe explorust-guard; \$dll=\"\$d\\explorust_inject.dll\"; if (Test-Path C:\\explorust\\explorust_inject.dll) { Remove-Item \"\$dll.old\" -EA SilentlyContinue; if (Test-Path \$dll) { Rename-Item \$dll explorust_inject.dll.old }; Copy-Item C:\\explorust\\explorust_inject.dll \$dll; 'explorust_inject swapped' }" >/dev/null
 fi
 # Any explorust.exe can ask the running one to reload.
 timeout 90 os win run g1 --desktop -- 'C:\explorust\explorust.exe' --reload >/dev/null 2>&1 || true

@@ -23,7 +23,7 @@ const STORES: [&str; 2] = ["Root", "TrustedPublisher"];
 /// What runs from the install folder: the guard, the shell, the folder handler, the UWP probe
 /// some host builds start beside explorust.exe, the toast listener's helper with its sparse
 /// package (`package.rs`), and the UI-access keyboard hook.
-const FILES: [&str; 7] = [
+const FILES: [&str; 8] = [
     "explorust-guard.exe",
     "explorust.exe",
     "explorust-open.exe",
@@ -31,6 +31,7 @@ const FILES: [&str; 7] = [
     "explorust-notify.exe",
     crate::package::MSIX,
     "explorust-keys.exe",
+    "explorust_inject.dll",
 ];
 
 pub fn elevated() -> bool {
