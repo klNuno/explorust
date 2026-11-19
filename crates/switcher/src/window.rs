@@ -93,6 +93,12 @@ pub fn run() {
         Err(e) => log::line(&format!("switcher: windows not created: {e}")),
         Ok((cmd, panel)) => {
             ST.with(|c| *c.borrow_mut() = Some(Sw::new(cmd, panel)));
+            if let Err(e) = crate::taskview::create() {
+                log::line(&format!("task view window not created: {e}"));
+            }
+            if let Err(e) = crate::snap::create() {
+                log::line(&format!("snap window not created: {e}"));
+            }
             let mut msg = MSG::default();
             // SAFETY: a plain message loop on this thread.
             while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
@@ -101,6 +107,8 @@ pub fn run() {
                     DispatchMessageW(&msg);
                 }
             }
+            crate::taskview::destroy();
+            crate::snap::destroy();
             let state = ST.with(|c| c.borrow_mut().take());
             if let Some(mut s) = state {
                 s.unregister();
@@ -381,7 +389,7 @@ impl Sw {
     }
 }
 
-fn spawn_icons(target: HWND, wanted: Vec<(String, Option<String>, String)>, px: i32) {
+pub(crate) fn spawn_icons(target: HWND, wanted: Vec<(String, Option<String>, String)>, px: i32) {
     if wanted.is_empty() {
         return;
     }
@@ -537,6 +545,8 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 Some((bus::Command::SwitcherNext, arg)) => on_next(arg == 1),
                 Some((bus::Command::SwitcherCommit, _)) => commit("alt up"),
                 Some((bus::Command::SwitcherCancel, _)) => cancel(),
+                Some((bus::Command::TaskView, _)) => crate::taskview::toggle(),
+                Some((bus::Command::SnapLayouts, _)) => crate::snap::toggle(),
                 Some((bus::Command::DesktopNew, _)) => crate::desktops::new_desktop(),
                 Some((bus::Command::DesktopSwitch, arg)) => crate::desktops::switch(arg),
                 Some((bus::Command::DesktopClose, _)) => crate::desktops::close_current(),

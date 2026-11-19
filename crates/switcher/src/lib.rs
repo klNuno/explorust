@@ -5,7 +5,8 @@
 //! Windows 11's: acrylic backdrop, one tile per window with its app icon, title and a live DWM
 //! thumbnail, the selection ring gliding between tiles, hover and click to select, a close button.
 //! Commit brings the selected window to the foreground (restoring it when minimized), Cancel
-//! leaves the original foreground in place. Task View and virtual desktops come later.
+//! leaves the original foreground in place. Win+Tab opens Task View (`taskview`), Ctrl+Win+D/Left/Right/F4 drive Windows' virtual desktops
+//! (`desktops`, `vdesk`), Win+Z opens the snap layouts flyout (`snap`).
 //!
 //! Contract with the shell (`crates/shell/src/components.rs`): `run()` is called on a thread of
 //! its own, creates its windows (its command window has the class `bus::class_of(Owner::Switcher)`),
@@ -24,6 +25,12 @@ mod desktops;
 mod log;
 #[cfg(target_os = "windows")]
 mod scene;
+#[cfg(target_os = "windows")]
+mod snap;
+#[cfg(target_os = "windows")]
+mod taskview;
+#[cfg(target_os = "windows")]
+mod tv_scene;
 #[cfg(target_os = "windows")]
 mod vdesk;
 #[cfg(target_os = "windows")]
