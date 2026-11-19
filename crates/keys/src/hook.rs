@@ -25,6 +25,9 @@ static CTRL: AtomicBool = AtomicBool::new(false);
 static ALT: AtomicBool = AtomicBool::new(false);
 /// The switcher is open: Alt up commits, Esc cancels.
 static SWITCHING: AtomicBool = AtomicBool::new(false);
+/// Alt+Tab took a Tab since Alt went down: the app in front saw Alt down alone, so its Alt up is
+/// masked or the app would show its menu or its key tips (Windows' own Alt+Tab leaves none).
+static ALT_MASK: AtomicBool = AtomicBool::new(false);
 /// The key whose down was swallowed, so its up is swallowed too.
 static SWALLOWED: AtomicU32 = AtomicU32::new(0);
 /// A part answered a chord (or the tap) since Win went down: Win up is masked.
@@ -97,9 +100,10 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         if kb.dwExtraInfo == OWN_INPUT {
-            if !down && matches!(kb.vkCode, VK_LWIN | VK_RWIN) {
-                // Input resets who may take the foreground, and the masked Win up is input: grant
-                // it again once this event is through (the Run dialog and Start often come later).
+            if !down && matches!(kb.vkCode, VK_LWIN | VK_RWIN | VK_LALT | VK_RALT | VK_ALT) {
+                // Input resets who may take the foreground, and a masked Win or Alt up is input:
+                // grant it again once this event is through (the Run dialog, Start and the window
+                // Alt+Tab picked often come later).
                 // SAFETY: posts to the hook thread, which pumps messages.
                 let _ = unsafe { PostThreadMessageW(THREAD.load(Relaxed), MSG_REGRANT, WPARAM(0), LPARAM(0)) };
             }
@@ -128,7 +132,12 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
     match vk {
         VK_SHIFT | VK_LSHIFT | VK_RSHIFT => SHIFT.store(down, Relaxed),
         VK_CTRL | VK_LCTRL | VK_RCTRL => CTRL.store(down, Relaxed),
-        VK_ALT | VK_LALT | VK_RALT => ALT.store(down, Relaxed),
+        VK_ALT | VK_LALT | VK_RALT => {
+            ALT.store(down, Relaxed);
+            if down {
+                ALT_MASK.store(false, Relaxed);
+            }
+        }
         VK_LWIN | VK_RWIN => {
             if down {
                 if !WIN.swap(true, Relaxed) {
@@ -148,8 +157,7 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
                 // Windows opens its own Start or search when it sees Win go down and up alone,
                 // which is what a swallowed chord leaves. When explorust answered, this Win up is
                 // swallowed and sent again after an unassigned key, as AutoHotkey does.
-                if answered {
-                    release_win_masked(vk);
+                if answered && release_masked(vk, true) {
                     return Some(LRESULT(1));
                 }
             }
@@ -158,9 +166,13 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
         _ => {}
     }
     match vk {
-        VK_ALT | VK_LALT | VK_RALT if !down && SWITCHING.swap(false, Relaxed) => {
-            post(Command::SwitcherCommit, 0);
-            return None;
+        VK_ALT | VK_LALT | VK_RALT if !down => {
+            // Sent first, so the commit's foreground grant comes after this input (see `hook`).
+            let mask = ALT_MASK.swap(false, Relaxed) && release_masked(vk, vk == VK_RALT);
+            if SWITCHING.swap(false, Relaxed) {
+                post(Command::SwitcherCommit, 0);
+            }
+            return mask.then_some(LRESULT(1));
         }
         _ => {}
     }
@@ -183,6 +195,7 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
     }
     if vk == VK_TAB && alt && post(Command::SwitcherNext, SHIFT.load(Relaxed) as isize) {
         SWITCHING.store(true, Relaxed);
+        ALT_MASK.store(true, Relaxed);
         return Some(swallow(vk));
     }
     if !SWITCHING.load(Relaxed) {
@@ -217,8 +230,10 @@ fn escape() -> bool {
     set.is_ok()
 }
 
-/// Sends the mask key down and up, then `win` up, marked as the hook's own input.
-fn release_win_masked(win: u32) {
+/// Sends the mask key down and up, then `key` up (Win, or Alt after Alt+Tab), marked as the
+/// hook's own input. Win and right Alt are extended keys. False when Windows refused the input (a
+/// hook without UI access under an elevated window): the real key up must then go through.
+fn release_masked(released: u32, extended: bool) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
     };
@@ -229,10 +244,15 @@ fn release_win_masked(win: u32) {
     let inputs = [
         key(VK_MASK, KEYBD_EVENT_FLAGS(0)),
         key(VK_MASK, KEYEVENTF_KEYUP),
-        key(win as u16, KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY),
+        key(released as u16, if extended { KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY } else { KEYEVENTF_KEYUP }),
     ];
     // SAFETY: SendInput reads the three INPUTs from a live array.
-    unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+    let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+    if sent != inputs.len() as u32 {
+        log(&format!("masked key up for {released:#x} not sent ({sent} of 3): the real one goes through"));
+        return false;
+    }
+    true
 }
 
 /// Posts a command, first letting its part take the foreground: the key went to the hook, not to
