@@ -93,6 +93,11 @@ pub fn decode(f: &IWICImagingFactory, path: &str, fit: Option<(u32, u32)>) -> Re
                 let (bw, bh) = if turns % 2 == 1 { (bh, bw) } else { (bw, bh) };
                 let k = (bw as f64 / w as f64).min(bh as f64 / h as f64);
                 let (sw, sh) = (((w as f64 * k).round() as u32).max(1), ((h as f64 * k).round() as u32).max(1));
+                // The codec's own scaling (JPEG decodes 1/2, 1/4, 1/8 in the IDCT): Direct2D
+                // scales the rest when drawing, the full decode refines it.
+                if let Ok(img) = transformed(f, &frame, sw, sh) {
+                    return Ok(Decoded { full_w: w, full_h: h, turns, frames: vec![(img, 0)] });
+                }
                 let scaler = f.CreateBitmapScaler()?;
                 scaler.Initialize(&frame, sw, sh, WICBitmapInterpolationModeFant)?;
                 windows_core::Interface::cast(&scaler)?
@@ -101,6 +106,40 @@ pub fn decode(f: &IWICImagingFactory, path: &str, fit: Option<(u32, u32)>) -> Re
         };
         let img = pixels(f, &src)?;
         Ok(Decoded { full_w: w, full_h: h, turns, frames: vec![(img, 0)] })
+    }
+}
+
+/// Bytes a pixel for the formats a codec's transform answers with.
+fn bytes_per_pixel(fmt: &GUID) -> Option<u32> {
+    if *fmt == GUID_WICPixelFormat24bppBGR || *fmt == GUID_WICPixelFormat24bppRGB {
+        Some(3)
+    } else if *fmt == GUID_WICPixelFormat32bppBGR || *fmt == GUID_WICPixelFormat32bppBGRA || *fmt == GUID_WICPixelFormat32bppPBGRA {
+        Some(4)
+    } else if *fmt == GUID_WICPixelFormat8bppGray {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Decodes through the codec's IWICBitmapSourceTransform at the closest size it scales to
+/// natively (at least the asked size when it can), then converts to premultiplied BGRA.
+fn transformed(f: &IWICImagingFactory, frame: &IWICBitmapFrameDecode, sw: u32, sh: u32) -> Result<Image> {
+    unsafe {
+        let t: IWICBitmapSourceTransform = windows_core::Interface::cast(frame)?;
+        let (mut w, mut h) = (sw, sh);
+        t.GetClosestSize(&mut w, &mut h)?;
+        let mut fmt = GUID_WICPixelFormat32bppPBGRA;
+        t.GetClosestPixelFormat(&mut fmt)?;
+        let bpp = bytes_per_pixel(&fmt).ok_or_else(|| windows_core::Error::from(windows::Win32::Foundation::E_NOTIMPL))?;
+        let stride = (w * bpp).div_ceil(4) * 4;
+        let mut buf = vec![0u8; (stride * h) as usize];
+        t.CopyPixels(std::ptr::null(), w, h, &fmt, WICBitmapTransformRotate0, stride, &mut buf)?;
+        if fmt == GUID_WICPixelFormat32bppPBGRA {
+            return Ok(Image { w, h, px: buf });
+        }
+        let bmp = f.CreateBitmapFromMemory(w, h, &fmt, stride, &buf)?;
+        pixels(f, &windows_core::Interface::cast(&bmp)?)
     }
 }
 

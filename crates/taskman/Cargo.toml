@@ -10,6 +10,7 @@ path = "src/bin/explorust-taskman.rs"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 render = { path = "../render" }
+shelldata = { path = "../shelldata" }
 windows-core.workspace = true
 windows-numerics = "0.3.1"
 windows = { workspace = true, features = [

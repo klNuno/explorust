@@ -2,9 +2,11 @@
 //! EnumWindows, GPU engines from PDH, system totals (GetSystemTimes, memory, network octets).
 
 use super::log;
-use crate::model::{History, Proc, cpu_percent};
+use crate::model::{History, Proc, busy_percent, cpu_percent};
 use crate::parse::{gpu_instance, processes};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
@@ -32,6 +34,8 @@ pub struct Totals {
     pub disk: History,
     pub net: History,
     pub gpu: History,
+    /// Busy percent of each logical processor.
+    pub cores: Vec<History>,
     pub mem_used: u64,
     pub mem_total: u64,
     pub net_in: f64,
@@ -46,9 +50,16 @@ pub struct Sampler {
     prev_t: i64,
     ncpu: u32,
     meta: HashMap<(u32, i64), Meta>,
-    desc: HashMap<String, String>,
+    /// FileDescription by exe path, filled by the names worker; a path asked once.
+    desc: Arc<Mutex<HashMap<String, String>>>,
+    /// App icons by exe path (premultiplied BGRA, a side), read by the same worker.
+    pub icons: Arc<Mutex<HashMap<String, (u32, Vec<u8>)>>>,
+    asked: HashSet<String>,
+    names: Option<Sender<String>>,
     gpu: Option<(PDH_HQUERY, PDH_HCOUNTER)>,
+    gpu_rx: Option<Receiver<Option<(isize, isize)>>>,
     sys_prev: (u64, u64, u64),
+    core_prev: Vec<[i64; 3]>,
     net_prev: (u64, u64),
     pub procs: Vec<Proc>,
     pub metas: Vec<Meta>,
@@ -133,26 +144,39 @@ impl Sampler {
     pub fn new() -> Self {
         let mut si = SYSTEM_INFO::default();
         unsafe { GetSystemInfo(&mut si) };
-        let gpu = unsafe {
-            let mut q = PDH_HQUERY::default();
-            let mut c = PDH_HCOUNTER::default();
-            (PdhOpenQueryW(None, 0, &mut q) == 0
-                && PdhAddEnglishCounterW(q, w!(r"\GPU Engine(*)\Utilization Percentage"), 0, &mut c) == 0)
-                .then(|| {
-                    PdhCollectQueryData(q);
-                    (q, c)
-                })
-        };
-        log::line(&format!("sampler: {} cpus, gpu counters {}", si.dwNumberOfProcessors, gpu.is_some()));
+        // PDH's GPU engine counters take long to open: a worker opens them, the first samples go
+        // without GPU values.
+        let (gtx, grx) = channel();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let g = unsafe {
+                let mut q = PDH_HQUERY::default();
+                let mut c = PDH_HCOUNTER::default();
+                (PdhOpenQueryW(None, 0, &mut q) == 0
+                    && PdhAddEnglishCounterW(q, w!(r"\GPU Engine(*)\Utilization Percentage"), 0, &mut c) == 0)
+                    .then(|| {
+                        PdhCollectQueryData(q);
+                        (q.0 as isize, c.0 as isize)
+                    })
+            };
+            log::line(&format!("gpu counters {} in {:.1} ms", g.is_some(), t.elapsed().as_secs_f64() * 1000.0));
+            let _ = gtx.send(g);
+        });
+        log::line(&format!("sampler: {} cpus", si.dwNumberOfProcessors));
         let mut s = Sampler {
             buf: vec![0; 1 << 16],
             prev: HashMap::new(),
             prev_t: 0,
             ncpu: si.dwNumberOfProcessors.max(1),
             meta: HashMap::new(),
-            desc: HashMap::new(),
-            gpu,
+            desc: Arc::new(Mutex::new(HashMap::new())),
+            icons: Arc::new(Mutex::new(HashMap::new())),
+            asked: HashSet::new(),
+            names: None,
+            gpu: None,
+            gpu_rx: Some(grx),
             sys_prev: (0, 0, 0),
+            core_prev: Vec::new(),
             net_prev: (0, 0),
             procs: Vec::new(),
             metas: Vec::new(),
@@ -162,6 +186,7 @@ impl Sampler {
                 disk: History::default(),
                 net: History::default(),
                 gpu: History::default(),
+                cores: Vec::new(),
                 mem_used: 0,
                 mem_total: 0,
                 net_in: 0.0,
@@ -228,8 +253,75 @@ impl Sampler {
         (by_pid, total)
     }
 
+    /// Starts the worker that reads version resources (FileDescription) off the UI thread;
+    /// `done` runs on the worker after each batch, so the window can rename its rows.
+    pub fn start_names(&mut self, icon_px: i32, done: impl Fn() + Send + 'static) {
+        let (tx, rx) = channel::<String>();
+        let (desc, icons) = (self.desc.clone(), self.icons.clone());
+        std::thread::spawn(move || {
+            use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            while let Ok(first) = rx.recv() {
+                let t = std::time::Instant::now();
+                let mut n = 0;
+                let batch: Vec<String> = std::iter::once(first).chain(rx.try_iter()).collect();
+                for path in &batch {
+                    let d = description(path);
+                    desc.lock().unwrap().insert(path.clone(), d);
+                    n += 1;
+                }
+                // Names first (they change the rows), then the icons.
+                done();
+                let names_ms = t.elapsed().as_secs_f64() * 1000.0;
+                for path in batch {
+                    if let Some(img) = shelldata::icons::icon_for_path(&path, icon_px) {
+                        if img.width == img.height {
+                            let mut px = img.bgra;
+                            for p in px.chunks_exact_mut(4) {
+                                let a = p[3] as u32;
+                                for c in &mut p[..3] {
+                                    *c = ((*c as u32 * a + 127) / 255) as u8;
+                                }
+                            }
+                            icons.lock().unwrap().insert(path, (img.width, px));
+                        }
+                    }
+                }
+                log::line(&format!(
+                    "names: {n} version resources in {names_ms:.1} ms, icons by {:.1} ms",
+                    t.elapsed().as_secs_f64() * 1000.0
+                ));
+                done();
+            }
+            unsafe { CoUninitialize() };
+        });
+        for p in self.asked.iter() {
+            let _ = tx.send(p.clone());
+        }
+        self.names = Some(tx);
+    }
+
+    /// Puts the descriptions read so far on the current rows.
+    pub fn rename(&mut self) {
+        let desc = self.desc.lock().unwrap();
+        for (p, m) in self.procs.iter_mut().zip(self.metas.iter_mut()) {
+            if let Some(d) = desc.get(&m.path).filter(|d| !d.is_empty()) {
+                m.desc = d.clone();
+                p.name = d.clone();
+            }
+        }
+    }
+
     pub fn tick(&mut self) {
         let t0 = std::time::Instant::now();
+        if let Some(rx) = &self.gpu_rx {
+            if let Ok(g) = rx.try_recv() {
+                self.gpu = g.map(|(q, c)| (PDH_HQUERY(q as _), PDH_HCOUNTER(c as _)));
+                self.gpu_rx = None;
+            }
+        }
         let raw = self.query();
         let t = now();
         let dt = t - self.prev_t;
@@ -252,11 +344,18 @@ impl Sampler {
             prev.insert(key, (r.cpu, r.io));
             disk_total += disk;
             threads += r.threads as u64;
-            let meta = self.meta.entry(key).or_insert_with(|| {
-                let path = image_path(r.pid);
-                let desc = if path.is_empty() { String::new() } else { self.desc.entry(path.clone()).or_insert_with(|| description(&path)).clone() };
-                Meta { path, desc }
-            });
+            let meta = self.meta.entry(key).or_insert_with(|| Meta { path: image_path(r.pid), desc: String::new() });
+            if meta.desc.is_empty() && !meta.path.is_empty() {
+                match self.desc.lock().unwrap().get(&meta.path) {
+                    Some(d) => meta.desc = d.clone(),
+                    None if self.asked.insert(meta.path.clone()) => {
+                        if let Some(tx) = &self.names {
+                            let _ = tx.send(meta.path.clone());
+                        }
+                    }
+                    None => {}
+                }
+            }
             let lower = meta.path.to_ascii_lowercase();
             // Windows processes: the kernel, protected ones (no path) and images under C:\Windows.
             let system = r.pid == 4 || lower.is_empty() || lower.starts_with(r"c:\windows\");
@@ -318,6 +417,8 @@ impl Sampler {
                 self.net_prev = (inb, outb);
             }
         }
+        self.cores();
+        let tt = &mut self.totals;
         tt.disk.push(disk_total);
         tt.gpu.push(gpu_total);
         self.cost_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -325,6 +426,29 @@ impl Sampler {
 }
 
 impl Sampler {
+    /// Per-processor times (SystemProcessorPerformanceInformation, 48 bytes each: idle,
+    /// kernel, user, dpc, interrupt, count), turned into busy percents.
+    fn cores(&mut self) {
+        let n = self.ncpu as usize;
+        let mut buf = vec![[0i64; 6]; n];
+        let mut ret = 0u32;
+        let st = unsafe { NtQuerySystemInformation(8, buf.as_mut_ptr().cast(), (n * 48) as u32, &mut ret) };
+        if st != 0 {
+            return;
+        }
+        let cur: Vec<[i64; 3]> = buf.iter().take(ret as usize / 48).map(|c| [c[0], c[1], c[2]]).collect();
+        let tt = &mut self.totals;
+        if tt.cores.len() != cur.len() {
+            tt.cores = vec![History::default(); cur.len()];
+        }
+        if self.core_prev.len() == cur.len() {
+            for (i, (c, p)) in cur.iter().zip(&self.core_prev).enumerate() {
+                tt.cores[i].push(busy_percent(c[0] - p[0], c[1] - p[1], c[2] - p[2]));
+            }
+        }
+        self.core_prev = cur;
+    }
+
     pub fn ncpu_pub(&self) -> u32 {
         self.ncpu
     }

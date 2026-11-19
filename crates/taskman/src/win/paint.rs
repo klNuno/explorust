@@ -2,7 +2,7 @@
 //! heat-tinted cells, the performance tiles and graph, the startup list.
 
 use super::{App, Hit, Page, first_frame, theme};
-use crate::model::{History, Section, mb, mbps, pct, rate};
+use crate::model::{Col, History, Section, mb, mbps, pct, rate};
 use render::rgba;
 use render::text::{Align, Text, draw};
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -16,6 +16,7 @@ pub struct Fonts {
     pub bold: IDWriteTextFormat,
     pub title: IDWriteTextFormat,
     pub glyph: IDWriteTextFormat,
+    pub small_glyph: IDWriteTextFormat,
     pub big: IDWriteTextFormat,
 }
 
@@ -28,6 +29,7 @@ impl Fonts {
             bold: f("Segoe UI Variable Text", 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, Align::Leading),
             title: f("Segoe UI Variable Display", 20.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, Align::Leading),
             glyph: f("Segoe Fluent Icons", 16.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Center),
+            small_glyph: f("Segoe Fluent Icons", 8.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Center),
             big: f("Segoe UI Variable Display", 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, Align::Trailing),
         }
     }
@@ -106,29 +108,44 @@ impl App {
         x0 - 4.0 * k
     }
 
+    /// Left edge of a page's content, right of the rail.
+    pub fn x0(&self) -> f32 {
+        (if self.rail_open { 228.0 } else { 64.0 }) * self.k
+    }
+
+    /// Windows 11's navigation rail: the hamburger, then the pages with their labels when open.
     fn rail(&mut self, b: &B) {
         let k = self.k;
-        let items = [(Page::Processes, '\u{E71D}'), (Page::Performance, '\u{E9D9}'), (Page::Startup, '\u{E7B5}')];
-        for (i, (page, g)) in items.into_iter().enumerate() {
+        let pages = [
+            (Page::Processes, '\u{E71D}', self.t("Processes", "Processus").to_string()),
+            (Page::Performance, '\u{E9D9}', self.t("Performance", "Performances").to_string()),
+            (Page::Startup, '\u{E7B5}', self.t("Startup apps", "Applications de démarrage").to_string()),
+        ];
+        let rail_w = (if self.rail_open { 212.0 } else { 40.0 }) * k;
+        let items = std::iter::once((Hit::Rail, '\u{E700}', String::new())).chain(pages.into_iter().map(|(p, g, l)| (Hit::Nav(p), g, l)));
+        for (i, (hit, g, label)) in items.enumerate() {
             let (x0, y0) = (4.0 * k, (8.0 + i as f32 * 40.0) * k);
-            let (x1, y1) = (x0 + 40.0 * k, y0 + 36.0 * k);
+            let (x1, y1) = (x0 + if hit == Hit::Rail { 40.0 * k } else { rail_w }, y0 + 36.0 * k);
             let ctx = &self.surface.ctx;
             unsafe {
-                if self.page == page {
+                if hit == Hit::Nav(self.page) {
                     ctx.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r(x0, y0, x1, y1), radiusX: 4.0 * k, radiusY: 4.0 * k }, &b.sel);
                     ctx.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r(x0, y0 + 10.0 * k, x0 + 3.0 * k, y1 - 10.0 * k), radiusX: 1.5 * k, radiusY: 1.5 * k }, &b.accent);
-                } else if self.hover == Some(Hit::Nav(page)) {
+                } else if self.hover == Some(hit) {
                     ctx.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r(x0, y0, x1, y1), radiusX: 4.0 * k, radiusY: 4.0 * k }, &b.hover);
                 }
             }
-            draw(ctx, &self.text, &self.f.glyph, &g.to_string(), x0, x1, y0 + 24.0 * k, &b.text, false);
-            self.hits.push((x0, y0, x1, y1, Hit::Nav(page)));
+            draw(ctx, &self.text, &self.f.glyph, &g.to_string(), x0, x0 + 40.0 * k, y0 + 24.0 * k, &b.text, false);
+            if self.rail_open && !label.is_empty() {
+                draw(ctx, &self.text, &self.f.body, &label, x0 + 48.0 * k, x1 - 4.0 * k, y0 + 23.0 * k, &b.text, false);
+            }
+            self.hits.push((x0, y0, x1, y1, hit));
         }
     }
 
     fn header(&mut self, b: &B, title: &str) -> f32 {
         let k = self.k;
-        draw(&self.surface.ctx, &self.text, &self.f.title, title, 64.0 * k, 400.0 * k, 36.0 * k, &b.text, false);
+        draw(&self.surface.ctx, &self.text, &self.f.title, title, self.x0(), self.x0() + 340.0 * k, 36.0 * k, &b.text, false);
         let w = self.size.0 as f32;
         let label = self.t("Windows Task Manager", "Gestionnaire Windows").to_string();
         self.button(b, w - 12.0 * k, '\u{E8A7}', &label, Hit::RealTaskmgr, true)
@@ -150,7 +167,7 @@ impl App {
             xr -= c;
         }
         edges.reverse();
-        let name_x = 64.0 * k;
+        let name_x = self.x0();
         let t = &self.s.totals;
         let mem_pct = t.mem.last();
         let heads = [
@@ -163,11 +180,24 @@ impl App {
         let ctx = &self.surface.ctx;
         let hy = 56.0 * k;
         draw(ctx, &self.text, &self.f.body, self.t("Name", "Nom"), name_x + 8.0 * k, edges[0].0, hy + 34.0 * k, &b.dim, false);
+        let cols = [Some(Col::Cpu), Some(Col::Mem), Some(Col::Disk), None, Some(Col::Gpu)];
+        let mut sort_hits = vec![(name_x, hy, edges[0].0, hy + 44.0 * k, Hit::Sort(Col::Name))];
         for (i, (v, l)) in heads.iter().enumerate() {
             let (x0, x1) = edges[i];
             draw(ctx, &self.text, &self.f.big, v, x0, x1 - 8.0 * k, hy + 16.0 * k, &b.text, true);
             draw(ctx, &self.text, &self.f.right, l, x0, x1 - 8.0 * k, hy + 34.0 * k, &b.dim, false);
+            if let Some(c) = cols[i] {
+                sort_hits.push((x0, hy, x1, hy + 44.0 * k, Hit::Sort(c)));
+            }
         }
+        // The sorted column: Task Manager's small chevron at the top of its header.
+        if let Some((col, asc)) = self.sort {
+            if let Some(&(x0, _, x1, _, _)) = sort_hits.iter().find(|h| h.4 == Hit::Sort(col)) {
+                let g = if asc { '\u{E70E}' } else { '\u{E70D}' };
+                draw(ctx, &self.text, &self.f.small_glyph, &g.to_string(), x0, x1, hy + 2.0 * k, &b.dim, false);
+            }
+        }
+        self.hits.extend(sort_hits);
         unsafe { ctx.FillRectangle(&r(name_x, hy + 44.0 * k, w - 16.0 * k, hy + 45.0 * k), &b.line) };
         let top = hy + 46.0 * k;
         let row_h = 28.0 * k;
@@ -244,6 +274,17 @@ impl App {
                         draw(&ctx, &self.text, &self.f.glyph, &gl.to_string(), name_x, name_x + 24.0 * k, base + 2.0 * k, &b.dim, false);
                         self.hits.push((name_x, y0.max(top), name_x + 24.0 * k, y0 + row_h, Hit::Expand(lead)));
                     }
+                    let path = match child {
+                        None => self.s.metas.get(g.lead).map(|m| m.path.as_str()),
+                        Some(pid) => self.s.procs.iter().position(|p| p.pid == pid).and_then(|i| self.s.metas.get(i)).map(|m| m.path.as_str()),
+                    };
+                    if let Some(icon) = path.and_then(|p| self.icons.get(p)) {
+                        let (ix, iy) = (name_x + indent, y0 + (row_h - 16.0 * k) / 2.0);
+                        unsafe {
+                            ctx.DrawBitmap(icon, Some(&r(ix, iy, ix + 16.0 * k, iy + 16.0 * k)), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+                        }
+                    }
+                    let indent = indent + 24.0 * k;
                     draw(&ctx, &self.text, &self.f.body, &name, name_x + indent, edges[0].0 - 8.0 * k, base, &b.text, false);
                     let norm = [vals[0] / ncpu, vals[1] / mem_total * 8.0, vals[2] / 10_485_760.0, 0.0, vals[4] / 100.0];
                     for i in 0..5 {
@@ -326,7 +367,7 @@ impl App {
             (self.t("Network", "Réseau"), format!("{} {} {} {}", self.t("S:", "E:"), mbps(t.net_out), self.t("R:", "R:"), mbps(t.net_in)), &t.net, net_max),
             ("GPU", pct(t.gpu.last()), &t.gpu, 100.0),
         ];
-        let (lx0, lx1) = (60.0 * k, 280.0 * k);
+        let (lx0, lx1) = (self.x0() - 4.0 * k, self.x0() + 216.0 * k);
         for (i, (name, val, hist, max)) in tiles.iter().enumerate() {
             let y0 = (60.0 + i as f32 * 68.0) * k;
             let rect = r(lx0, y0, lx1, y0 + 62.0 * k);
@@ -348,7 +389,22 @@ impl App {
         let ctx = &self.surface.ctx;
         draw(ctx, &self.text, &self.f.title, name, gx0, w - 16.0 * k, 84.0 * k, &b.text, false);
         let gr = r(gx0, 100.0 * k, w - 24.0 * k, (h - 130.0 * k).max(160.0 * k));
-        self.graph(b, hist, *max, gr, true);
+        let cores = &self.s.totals.cores;
+        if self.tile == 0 && cores.len() > 1 {
+            // CPU: one graph per logical processor, as Task Manager's "Logical processors" view.
+            let n = cores.len();
+            let cols = (n as f32).sqrt().ceil() as usize;
+            let rows = n.div_ceil(cols);
+            let gap = 6.0 * k;
+            let cw = (gr.right - gr.left - gap * (cols - 1) as f32) / cols as f32;
+            let ch = (gr.bottom - gr.top - gap * (rows - 1) as f32) / rows as f32;
+            for (i, h) in cores.iter().enumerate() {
+                let (cx, cy) = (gr.left + (i % cols) as f32 * (cw + gap), gr.top + (i / cols) as f32 * (ch + gap));
+                self.graph(b, h, 100.0, r(cx, cy, cx + cw, cy + ch), true);
+            }
+        } else {
+            self.graph(b, hist, *max, gr, true);
+        }
         draw(ctx, &self.text, &self.f.body, self.t("60 seconds", "60 secondes"), gx0, w, gr.bottom + 16.0 * k, &b.dim, false);
         let lines = [
             format!("{} {val}", self.t("Now:", "Actuel :")),
@@ -369,7 +425,8 @@ impl App {
         let label = if sel == Some(false) { self.t("Enable", "Activer") } else { self.t("Disable", "Désactiver") }.to_string();
         self.button(b, x, if sel == Some(false) { '\u{E73E}' } else { '\u{E711}' }, &label, Hit::Toggle, sel.is_some());
         let ctx = self.surface.ctx.clone();
-        let (c0, c1, c2) = (64.0 * k, 300.0 * k, 400.0 * k);
+        let x0 = self.x0();
+        let (c0, c1, c2) = (x0, x0 + 236.0 * k, x0 + 336.0 * k);
         let hy = 84.0 * k;
         draw(&ctx, &self.text, &self.f.body, self.t("Name", "Nom"), c0 + 8.0 * k, c1, hy, &b.dim, false);
         draw(&ctx, &self.text, &self.f.body, self.t("Status", "Statut"), c1, c2, hy, &b.dim, false);

@@ -7,7 +7,7 @@ mod sample;
 mod startup;
 mod theme;
 
-use crate::model::{Group, group};
+use crate::model::{Col, Group, group, sort};
 use sample::Sampler;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -26,6 +26,8 @@ use windows_core::{HSTRING, w};
 
 const CLASS: windows_core::PCWSTR = w!("explorust.TaskManager");
 const TIMER: usize = 1;
+/// The names worker read more version resources: rename the rows.
+const WM_NAMES: u32 = WM_APP + 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
@@ -36,6 +38,8 @@ pub enum Page {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Hit {
+    /// The hamburger: opens or closes the rail's labels.
+    Rail,
     Nav(Page),
     EndTask,
     RealTaskmgr,
@@ -45,6 +49,8 @@ pub enum Hit {
     Expand(u32),
     Tile(usize),
     Startup(usize),
+    /// A column header: sort by it (again: reverse).
+    Sort(Col),
 }
 
 pub struct App {
@@ -59,6 +65,10 @@ pub struct App {
     pub page: Page,
     pub s: Sampler,
     pub groups: Vec<Group>,
+    pub sort: Option<(Col, bool)>,
+    pub rail_open: bool,
+    /// App icons as D2D bitmaps by exe path, made from the worker's pixels.
+    pub icons: std::collections::HashMap<String, windows::Win32::Graphics::Direct2D::ID2D1Bitmap1>,
     pub expanded: HashSet<u32>,
     pub selected: Option<(u32, Option<u32>)>,
     pub scroll: f32,
@@ -173,8 +183,11 @@ fn window() -> i32 {
             return 1;
         };
         let f = paint::Fonts::new(&text, k);
+        log::line(&format!("window and device ready {:.1} ms after process start", log::since_start()));
         let s = Sampler::new();
+        log::line(&format!("first sample {:.1} ms after process start", log::since_start()));
         let groups = group(&s.procs);
+        log::line(&format!("first sample {} processes", s.procs.len()));
         let app = App {
             hwnd,
             surface,
@@ -187,6 +200,10 @@ fn window() -> i32 {
             page: Page::Processes,
             s,
             groups,
+            sort: None,
+            // Open on a wide window, as Windows' Task Manager.
+            rail_open: size.0 as f32 / k >= 900.0,
+            icons: std::collections::HashMap::new(),
             expanded: HashSet::new(),
             selected: None,
             scroll: 0.0,
@@ -202,6 +219,12 @@ fn window() -> i32 {
         APP.with(|a| *a.borrow_mut() = Some(app));
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         with(|a| a.paint());
+        let target = hwnd.0 as usize;
+        with(|a| {
+            a.s.start_names((16.0 * a.k).round() as i32, move || {
+                let _ = PostMessageW(Some(HWND(target as _)), WM_NAMES, WPARAM(0), LPARAM(0));
+            })
+        });
         SetTimer(Some(hwnd), TIMER, 1000, None);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -216,7 +239,7 @@ fn window() -> i32 {
 impl App {
     fn tick(&mut self) {
         self.s.tick();
-        self.groups = group(&self.s.procs);
+        self.regroup();
         self.ticks += 1;
         // Own cost every 60 s: CPU time over wall time, of one core and of the machine.
         if self.ticks % 60 == 0 {
@@ -237,6 +260,14 @@ impl App {
                 self.page
             ));
             self.cpu_at = (c, t);
+        }
+    }
+
+    /// Groups the last sample and applies the column sort.
+    fn regroup(&mut self) {
+        self.groups = group(&self.s.procs);
+        if let Some((col, asc)) = self.sort {
+            sort(&mut self.groups, col, asc);
         }
     }
 
@@ -299,6 +330,7 @@ impl App {
 
     fn click(&mut self, h: Hit) {
         match h {
+            Hit::Rail => self.rail_open = !self.rail_open,
             Hit::Nav(p) => {
                 self.page = p;
                 self.scroll = 0.0;
@@ -323,6 +355,15 @@ impl App {
             }
             Hit::Tile(i) => self.tile = i,
             Hit::Startup(i) => self.startup_sel = Some(i),
+            Hit::Sort(col) => {
+                // Name starts A to Z, values largest first; a second click reverses.
+                self.sort = match self.sort {
+                    Some((c, asc)) if c == col => Some((col, !asc)),
+                    _ => Some((col, col == Col::Name)),
+                };
+                self.regroup();
+                log::line(&format!("sort {:?}", self.sort));
+            }
         }
         self.paint();
     }
@@ -367,6 +408,23 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 let _ = GetClientRect(hwnd, &mut r);
                 FillRect(HDC(wp.0 as _), &r, HBRUSH(GetStockObject(BLACK_BRUSH).0));
                 LRESULT(1)
+            }
+            WM_NAMES => {
+                with(|a| {
+                    a.s.rename();
+                    let new: Vec<(String, (u32, Vec<u8>))> = {
+                        let icons = a.s.icons.lock().unwrap();
+                        icons.iter().filter(|(p, _)| !a.icons.contains_key(*p)).map(|(p, v)| (p.clone(), v.clone())).collect()
+                    };
+                    for (p, (side, px)) in new {
+                        if let Ok(b) = a.surface.bitmap(side, side, &px) {
+                            a.icons.insert(p, b);
+                        }
+                    }
+                    a.regroup();
+                    a.paint();
+                });
+                LRESULT(0)
             }
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();

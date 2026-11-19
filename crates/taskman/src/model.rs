@@ -92,6 +92,42 @@ pub fn group(procs: &[Proc]) -> Vec<Group> {
     groups
 }
 
+/// A column of the processes table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Col {
+    Name,
+    Cpu,
+    Mem,
+    Disk,
+    Gpu,
+}
+
+/// Sorts groups inside their section by a column, as Task Manager does when a header is
+/// clicked: values largest first unless `asc`, names A to Z unless `!asc`; ties by name.
+pub fn sort(groups: &mut [Group], col: Col, asc: bool) {
+    let name = |g: &Group| g.name.to_lowercase();
+    groups.sort_by(|a, b| {
+        let by = match col {
+            Col::Name => name(a).cmp(&name(b)),
+            Col::Cpu => b.cpu.total_cmp(&a.cpu),
+            Col::Mem => b.mem.cmp(&a.mem),
+            Col::Disk => b.disk.total_cmp(&a.disk),
+            Col::Gpu => b.gpu.total_cmp(&a.gpu),
+        };
+        let by = if col == Col::Name { if asc { by } else { by.reverse() } } else if asc { by.reverse() } else { by };
+        a.section.cmp(&b.section).then(by).then_with(|| name(a).cmp(&name(b)))
+    });
+}
+
+/// Busy percent of one processor from deltas of its idle, kernel (idle included) and user times.
+pub fn busy_percent(idle: i64, kernel: i64, user: i64) -> f64 {
+    let all = kernel + user;
+    if all <= 0 {
+        return 0.0;
+    }
+    ((all - idle).max(0) as f64 / all as f64 * 100.0).clamp(0.0, 100.0)
+}
+
 /// CPU percent of all cores from a delta of process time over a delta of wall time (100 ns).
 pub fn cpu_percent(dcpu: i64, dwall: i64, ncpu: u32) -> f64 {
     if dwall <= 0 || ncpu == 0 {
@@ -153,6 +189,30 @@ mod tests {
         assert_eq!(chrome.mem, 30);
         assert_eq!(g[0].name, "chrome.exe");
         assert_eq!(g.len(), 3);
+    }
+
+    #[test]
+    fn sort_keeps_sections_and_orders_by_column() {
+        let mut ps = vec![p(1, 0, "a.exe", true), p(2, 0, "b.exe", true), p(3, 0, "c.exe", false)];
+        ps[0].mem = 10;
+        ps[1].mem = 30;
+        ps[2].mem = 99;
+        let mut g = group(&ps);
+        sort(&mut g, Col::Mem, false);
+        let names: Vec<_> = g.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["b.exe", "a.exe", "c.exe"]);
+        sort(&mut g, Col::Mem, true);
+        assert_eq!(g[0].name, "a.exe");
+        sort(&mut g, Col::Name, false);
+        assert_eq!(g[0].name, "b.exe");
+        assert_eq!(g[2].section, Section::Background);
+    }
+
+    #[test]
+    fn busy_from_processor_times() {
+        assert_eq!(busy_percent(50, 80, 20), 50.0);
+        assert_eq!(busy_percent(0, 0, 0), 0.0);
+        assert_eq!(busy_percent(100, 100, 0), 0.0);
     }
 
     #[test]

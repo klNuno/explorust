@@ -103,13 +103,11 @@ pub fn unregister() -> bool {
 /// Opens Settings > Default apps on the viewer's page, where the user picks it per type: Windows
 /// only accepts a default from the user (UserChoice is hashed), never silently.
 pub fn defaults() -> bool {
-    let r: Result<()> = unsafe {
-        (|| {
-            let ui: IApplicationAssociationRegistrationUI =
-                CoCreateInstance(&ApplicationAssociationRegistrationUI, None, CLSCTX_INPROC_SERVER)?;
-            ui.LaunchAdvancedAssociationUI(&HSTRING::from(APP))
-        })()
-    };
-    log::line(&format!("defaults ui: {r:?}"));
-    r.is_ok()
+    // IApplicationAssociationRegistrationUI::LaunchAdvancedAssociationUI answers 0x80070490 on
+    // 26300: Settings' own page for a registered app takes its place.
+    let uri = format!("ms-settings:defaultapps?registeredAppUser={}", APP.replace(' ', "%20"));
+    let r = unsafe { ShellExecuteW(None, w!("open"), &HSTRING::from(uri.as_str()), PCWSTR::null(), PCWSTR::null(), windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL) };
+    let ok = r.0 as usize > 32;
+    log::line(&format!("defaults {uri}: {}", r.0 as usize));
+    ok
 }

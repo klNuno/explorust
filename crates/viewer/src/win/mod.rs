@@ -33,6 +33,22 @@ pub const BAR_H: f32 = 48.0;
 
 /// A full decode handed from the worker thread to the UI thread.
 type Slot = Arc<Mutex<Option<(u64, Decoded)>>>;
+/// Scaled decodes of the neighbours, made after the current image is complete.
+type Cache = Arc<Mutex<Vec<(String, Decoded)>>>;
+
+/// Runs `f` with a WIC factory on a worker thread (COM multithreaded there).
+fn worker(f: impl FnOnce(&IWICImagingFactory) + Send + 'static) {
+    std::thread::spawn(move || {
+        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if let Ok(wic) = factory() {
+                f(&wic);
+            }
+            CoUninitialize();
+        }
+    });
+}
 
 pub struct App {
     pub hwnd: HWND,
@@ -59,6 +75,10 @@ pub struct App {
     slot: Slot,
     pinch: f64,
     first_frame: bool,
+    /// The first decode, started at process start while the window and the device are made.
+    early: Option<std::sync::mpsc::Receiver<windows_core::Result<Decoded>>>,
+    cache: Cache,
+    pending_full: bool,
     pub size: (u32, u32),
     pub k: f32,
 }
@@ -112,6 +132,16 @@ fn window(path: Option<String>) -> i32 {
         let mut wa = RECT::default();
         let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut wa as *mut _ as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
         let (ww, wh) = ((wa.right - wa.left) * 7 / 10, (wa.bottom - wa.top) * 8 / 10);
+        // Decode at once on a worker, to about the window's size, while this thread makes the
+        // window, the D3D device and the text formats.
+        let early = path.clone().map(|p| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let fit = (ww.max(1) as u32, wh.max(1) as u32);
+            worker(move |f| {
+                let _ = tx.send(decode::decode(f, &p, Some(fit)));
+            });
+            rx
+        });
         let title = path.as_deref().map(|p| p.rsplit('\\').next().unwrap_or(p).to_string()).unwrap_or_else(|| "Photos".into());
         let Ok(hwnd) = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -142,6 +172,7 @@ fn window(path: Option<String>) -> i32 {
             log::line("surface, text or WIC failed");
             return 1;
         };
+        log::line(&format!("window and device ready {:.1} ms after process start", log::since_start()));
         use windows::Win32::Graphics::DirectWrite::*;
         let ui = text.format("Segoe UI Variable Text", 14.0 * k, DWRITE_FONT_WEIGHT_NORMAL, render::text::Align::Leading).unwrap();
         let glyphs = text.format("Segoe Fluent Icons", 16.0 * k, DWRITE_FONT_WEIGHT_NORMAL, render::text::Align::Center).unwrap();
@@ -170,6 +201,9 @@ fn window(path: Option<String>) -> i32 {
             slot: Arc::new(Mutex::new(None)),
             pinch: 0.0,
             first_frame: true,
+            early,
+            cache: Arc::new(Mutex::new(Vec::new())),
+            pending_full: false,
             size,
             k,
         };
@@ -179,12 +213,18 @@ fn window(path: Option<String>) -> i32 {
         with(|a| a.load(true));
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         with(|a| a.paint());
+        let mut o = POINT::default();
+        let _ = ClientToScreen(hwnd, &mut o);
+        log::line(&format!("client at {},{} size {}x{} scale {}", o.x, o.y, size.0, size.1, k));
         with(|a| {
             let dir = a.path.rsplit_once('\\').map(|(d, _)| d.to_string()).unwrap_or_default();
             if !dir.is_empty() {
                 a.list = folder::images(a.hwnd, &dir);
                 a.at = a.list.iter().position(|p| p.eq_ignore_ascii_case(&a.path)).unwrap_or(0);
                 log::line(&format!("folder {dir}: {} images, at {}, {:.1} ms since start", a.list.len(), a.at, log::since_start()));
+            }
+            if !a.pending_full {
+                a.prefetch();
             }
         });
         let mut msg = MSG::default();
@@ -230,12 +270,25 @@ impl App {
         }
         let t = std::time::Instant::now();
         let area = self.area();
-        match decode::decode(&self.wic, &self.path, Some((area.2 as u32, area.3 as u32))) {
+        let cached = {
+            let mut c = self.cache.lock().unwrap();
+            c.iter().position(|(p, _)| *p == self.path).map(|i| c.swap_remove(i).1)
+        };
+        let (got, how) = if let Some(rx) = self.early.take() {
+            (rx.recv().unwrap_or_else(|_| Err(E_FAIL.into())), "started at process start")
+        } else if let Some(d) = cached {
+            (Ok(d), "prefetched")
+        } else {
+            (decode::decode(&self.wic, &self.path, Some((area.2 as u32, area.3 as u32))), "on the UI thread")
+        };
+        self.pending_full = false;
+        match got {
             Ok(d) => {
                 let scaled = d.frames.len() == 1 && d.frames[0].0.w < d.full_w;
+                let (sw, sh) = (d.frames[0].0.w, d.frames[0].0.h);
                 self.take(d);
                 log::line(&format!(
-                    "first frame {} {}x{} decoded in {:.1} ms{}",
+                    "first frame {} {}x{} ({sw}x{sh}) ready in {:.1} ms, {how}{}",
                     self.path,
                     self.img.0,
                     self.img.1,
@@ -243,22 +296,20 @@ impl App {
                     if scaled { " (scaled)" } else { "" }
                 ));
                 if scaled {
+                    self.pending_full = true;
                     let (slot, path, epoch, hwnd) = (self.slot.clone(), self.path.clone(), self.epoch, self.hwnd.0 as usize);
-                    std::thread::spawn(move || {
-                        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
-                        unsafe {
-                            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-                            let t = std::time::Instant::now();
-                            if let Ok(f) = factory() {
-                                if let Ok(d) = decode::decode(&f, &path, None) {
-                                    log::line(&format!("full decode {path} in {:.1} ms", t.elapsed().as_secs_f64() * 1000.0));
-                                    *slot.lock().unwrap() = Some((epoch, d));
-                                    let _ = PostMessageW(Some(HWND(hwnd as _)), WM_DECODED, WPARAM(epoch as usize), LPARAM(0));
-                                }
+                    worker(move |f| {
+                        let t = std::time::Instant::now();
+                        if let Ok(d) = decode::decode(f, &path, None) {
+                            log::line(&format!("full decode {path} in {:.1} ms", t.elapsed().as_secs_f64() * 1000.0));
+                            *slot.lock().unwrap() = Some((epoch, d));
+                            unsafe {
+                                let _ = PostMessageW(Some(HWND(hwnd as _)), WM_DECODED, WPARAM(epoch as usize), LPARAM(0));
                             }
-                            CoUninitialize();
                         }
                     });
+                } else {
+                    self.prefetch();
                 }
             }
             Err(e) => {
@@ -285,6 +336,37 @@ impl App {
                 SetTimer(Some(self.hwnd), TIMER_ANIM, self.frames[0].1, None);
             }
         }
+    }
+
+    /// Decodes the previous and next images scaled to the window on a worker, so browsing
+    /// shows them at once; the cache keeps only the neighbours of the current image.
+    fn prefetch(&mut self) {
+        let n = self.list.len();
+        if n < 2 {
+            return;
+        }
+        let mut want: Vec<String> = [step(n, self.at, true), step(n, self.at, false)].iter().map(|&i| self.list[i].clone()).collect();
+        want.dedup();
+        want.retain(|p| *p != self.path);
+        {
+            let mut c = self.cache.lock().unwrap();
+            c.retain(|(p, _)| want.contains(p));
+            want.retain(|p| !c.iter().any(|(q, _)| q == p));
+        }
+        if want.is_empty() {
+            return;
+        }
+        let a = self.area();
+        let (fit, cache) = ((a.2 as u32, a.3 as u32), self.cache.clone());
+        worker(move |f| {
+            for p in want {
+                let t = std::time::Instant::now();
+                if let Ok(d) = decode::decode(f, &p, Some(fit)) {
+                    log::line(&format!("prefetched {p} in {:.1} ms", t.elapsed().as_secs_f64() * 1000.0));
+                    cache.lock().unwrap().push((p, d));
+                }
+            }
+        });
     }
 
     fn title(&self) {
@@ -442,6 +524,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                                 a.view = v;
                             }
                             a.paint();
+                            a.pending_full = false;
+                            a.prefetch();
                         }
                     }
                 });
