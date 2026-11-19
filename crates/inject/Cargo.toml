@@ -1,0 +1,23 @@
+[package]
+name = "inject"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+# One crate, two artifacts: `explorust_inject.dll` (the hook procedure that styles a window from
+# inside its process) and the loader linked into explorust (`explorust_inject::run`), which finds
+# the target windows from an out-of-context WinEvent hook and loads the DLL into their thread only.
+[lib]
+name = "explorust_inject"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "inject-dev"
+path = "src/bin/inject-dev.rs"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = [
+  "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Accessibility", "Win32_UI_Controls",
+  "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader",
+  "Win32_System_Threading", "Win32_System_SystemInformation",
+] }

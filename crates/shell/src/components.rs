@@ -47,6 +47,12 @@ pub fn spawn_all() {
             log::line(&format!("{name}: thread not started: {e}"));
         }
     }
+    // The injector has no bus owner: it answers no hotkey, only window shows of other apps.
+    if off.iter().any(|o| o == "inject") {
+        log::line("inject: off (parts-off.txt)");
+    } else if let Err(e) = std::thread::Builder::new().name("inject".into()).spawn(|| supervise("inject", explorust_inject::run)) {
+        log::line(&format!("inject: thread not started: {e}"));
+    }
 }
 
 fn supervise(name: &str, run: fn()) {
@@ -71,6 +77,7 @@ fn supervise(name: &str, run: fn()) {
 
 /// Asks every part to close its windows, and gives them a moment to do it.
 pub fn shutdown_all() {
+    explorust_inject::shutdown();
     let mut asked = 0;
     for (owner, _) in PARTS {
         if bus::post_to(owner, bus::Command::Shutdown, 0) {
