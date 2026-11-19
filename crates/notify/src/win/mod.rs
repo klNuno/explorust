@@ -4,6 +4,7 @@
 mod card;
 mod listen;
 mod system;
+mod twinui;
 
 use crate::log;
 use crate::model::{self, Banner, Hit, Toast};
@@ -97,7 +98,7 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     // SAFETY: ends this thread's message loop.
                     unsafe { PostQuitMessage(0) };
                 }
-                Some((cmd, _)) => log::line(&format!("notify: {cmd:?} not handled yet")),
+                Some((cmd, arg)) => panel(cmd, arg),
                 None => {}
             }
             LRESULT(0)
@@ -119,6 +120,40 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         // SAFETY: default handling.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+/// Win+N, Win+V and Win+.: Windows' own panels, asked for through the immersive shell on a
+/// thread of their own (a cross-process call to the shell must never stall the UI thread).
+fn panel(cmd: bus::Command, arg: isize) {
+    let _ = std::thread::Builder::new().name("notify-panel".into()).spawn(move || {
+        use windows::Win32::System::Com::COINIT_MULTITHREADED;
+        // SAFETY: COM for this short-lived thread only.
+        let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+        let t0 = std::time::Instant::now();
+        let r = match cmd {
+            bus::Command::NotificationCenter if arg > 0 => twinui::notification_center_hotkey(arg as u32 - 1).map(|_| format!("hotkey {} sent", arg - 1)),
+            bus::Command::NotificationCenter => twinui::toggle_notification_center().map(|v| format!("visible {v}")),
+            bus::Command::ClipboardHistory => twinui::show_clipboard_history().map(|_| "shown".into()),
+            bus::Command::EmojiPanel => {
+                let kind = if arg > 0 { arg as u32 } else { twinui::HOTKEY_EMOJI };
+                twinui::shell_hotkey(kind).map(|_| format!("hotkey {kind} sent"))
+            }
+            _ => Ok("not handled".into()),
+        };
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        match r {
+            Ok(m) => log::line(&format!("notify: {cmd:?}: {m} in {ms:.1} ms")),
+            Err(e) => log::line(&format!("notify: {cmd:?} failed in {ms:.1} ms: {e}")),
+        }
+        if cmd == bus::Command::NotificationCenter {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            log::line(&format!("notify: notification center visible 1.5 s later: {:?}", twinui::notification_center_visible()));
+        }
+        if com {
+            // SAFETY: balances the CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+    });
 }
 
 fn added(toast: Toast) {

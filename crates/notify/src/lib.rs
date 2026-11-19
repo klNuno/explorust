@@ -1,4 +1,5 @@
-//! explorust's toasts (step notify-1); the notification center and quick settings come next.
+//! explorust's toasts (step notify-1) and Windows' own notification center, clipboard history and
+//! emoji panel on Win+N, Win+V and Win+. (step notify-2, `win/twinui.rs`).
 //!
 //! Without explorer nobody starts ShellExperienceHost, which draws Windows' toasts, yet the
 //! notification platform still accepts and stores every toast. This part reads them through the
