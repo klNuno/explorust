@@ -65,7 +65,7 @@ fn log_view_event_window_state(kind: &str, hwnd: usize) {
     let visible = unsafe { IsWindowVisible(window) }.as_bool();
     let _ = unsafe { GetWindowRect(window, &mut rect) };
     let _ = unsafe { GetClientRect(window, &mut client) };
-    println!(
+    hlog!(
         "phase=view-event-window-state kind={kind} hwnd={hwnd:#x} pid={pid} tid={tid} parent={parent:#x} visible={visible} style={style:#x} ex_style={ex_style:#x} rect={rect:?} client={client:?}"
     );
 }
@@ -77,13 +77,13 @@ struct HostReadiness(Option<std::sync::mpsc::SyncSender<Result<(), String>>>);
 impl HostReadiness {
     fn ready(&mut self) {
         if let Some(sender) = self.0.take() {
-            tracing::info!("embedded UWP shell host ready");
+            hlog!("phase=host-ready result=signalled");
             let _ = sender.send(Ok(()));
         }
     }
 
     fn failed(&mut self, phase: &'static str, error: impl std::fmt::Display) {
-        tracing::warn!(phase, %error, "embedded UWP shell host failed to start");
+        hlog!("phase={phase} result=failed error={error}");
         if let Some(sender) = self.0.take() {
             let _ = sender.send(Err(format!("{phase}: {error}")));
         }
@@ -108,7 +108,7 @@ pub(crate) fn configure_dpi_awareness() -> Result<(), String> {
     // SAFETY: Callers invoke this before creating any HWND in this process.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
         .map_err(|error| error.to_string())?;
-    println!("phase=SetProcessDpiAwarenessContext result=per-monitor-v2");
+    hlog!("phase=SetProcessDpiAwarenessContext result=per-monitor-v2");
     Ok(())
 }
 
@@ -289,7 +289,7 @@ pub fn run_managed_host(parent_pid: u32) -> ExitCode {
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
 
     if parent_pid == 0 {
-        eprintln!("phase=host-parent error=invalid-pid");
+        hlog!("phase=host-parent error=invalid-pid");
         return ExitCode::FAILURE;
     }
     // SAFETY: Windows validates the PID and requested right. The handle is
@@ -297,7 +297,7 @@ pub fn run_managed_host(parent_pid: u32) -> ExitCode {
     let parent = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) } {
         Ok(handle) => ParentHandle(handle),
         Err(error) => {
-            eprintln!("phase=host-parent error={error}");
+            hlog!("phase=host-parent error={error}");
             return ExitCode::FAILURE;
         }
     };
@@ -345,7 +345,6 @@ fn run_host_with_parent(
     view_event_app: Option<String>,
     mut readiness: HostReadiness,
 ) -> ExitCode {
-    use std::io::Write;
     use windows::Win32::{
         System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
         UI::WindowsAndMessaging::{
@@ -353,8 +352,14 @@ fn run_host_with_parent(
         },
     };
 
+    let started = Instant::now();
+    hlog!(
+        "phase=host-start windows={} pid={} auto_present={auto_present}",
+        crate::log::windows_build(),
+        std::process::id()
+    );
     if configure_process_dpi && let Err(error) = configure_dpi_awareness() {
-        eprintln!("phase=host-dpi error={error}");
+        hlog!("phase=host-dpi error={error}");
         readiness.failed("host-dpi", error);
         return ExitCode::FAILURE;
     }
@@ -365,23 +370,25 @@ fn run_host_with_parent(
     };
     // SAFETY: This thread balances successful COM initialization below.
     if let Err(error) = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok() {
-        eprintln!("phase=host-com error={error}");
+        hlog!("phase=host-com error={error}");
         readiness.failed("host-com", error);
         return ExitCode::FAILURE;
     }
     let redirect = match fallback_band1::FallbackBandRedirect::install() {
         Ok(redirect) => redirect,
         Err(error) => {
-            eprintln!("phase=host-band-redirect error={error}");
+            hlog!("phase=host-band-redirect error={error}");
             readiness.failed("host-band-redirect", error);
             unsafe { CoUninitialize() };
             return ExitCode::FAILURE;
         }
     };
-    let controller = match start_immersive_shell_controller(false, false, true) {
+    hlog!("phase=host-band-redirect result=installed");
+    let skip_touch_keyboard = skip_touch_keyboard();
+    let controller = match start_immersive_shell_controller(false, false, skip_touch_keyboard) {
         Ok(controller) => controller,
         Err(error) => {
-            eprintln!("phase=host-controller error={error}");
+            hlog!("phase=host-controller error={error}");
             readiness.failed("host-controller", error);
             drop(redirect);
             unsafe { CoUninitialize() };
@@ -401,7 +408,7 @@ fn run_host_with_parent(
         } {
             Ok(manager) => manager,
             Err(error) => {
-                eprintln!("phase=view-event-frame-manager error={error}");
+                hlog!("phase=view-event-frame-manager error={error}");
                 drop(controller);
                 drop(redirect);
                 unsafe { CoUninitialize() };
@@ -410,11 +417,11 @@ fn run_host_with_parent(
         };
         match crate::frame_service_direct::ensure_frame_pool(&manager) {
             Ok(pool) => {
-                println!("phase=view-event-frame-pool result=ready");
+                hlog!("phase=view-event-frame-pool result=ready");
                 Some((manager, pool))
             }
             Err(error) => {
-                eprintln!("phase=view-event-frame-pool error={error}");
+                hlog!("phase=view-event-frame-pool error={error}");
                 drop(manager);
                 drop(controller);
                 drop(redirect);
@@ -429,7 +436,7 @@ fn run_host_with_parent(
         match publish_immersive_shell_broker() {
             Ok(broker) => Some(broker),
             Err(error) => {
-                eprintln!("phase=broker-host error={error}");
+                hlog!("phase=broker-host error={error}");
                 readiness.failed("broker-host", error);
                 #[cfg(feature = "diagnostics")]
                 drop(frame_pool);
@@ -466,7 +473,7 @@ fn run_host_with_parent(
         match crate::view_event_trace::ViewEventTrace::register(callback_result, app_id) {
             Ok(trace) => Some(trace),
             Err(error) => {
-                eprintln!("phase=view-event-register error={error}");
+                hlog!("phase=view-event-register error={error}");
                 None
             }
         }
@@ -475,8 +482,7 @@ fn run_host_with_parent(
     };
     #[cfg(not(feature = "diagnostics"))]
     let _ = trace_view_events;
-    println!("phase=host-ready");
-    let _ = std::io::stdout().flush();
+    hlog!("phase=host-ready");
     #[cfg(feature = "diagnostics")]
     if trace_view_events.is_some()
         && let Some(app_id) = view_event_app.as_deref()
@@ -485,10 +491,9 @@ fn run_host_with_parent(
             .ok()
             .map(|path| path.with_file_name("nickel-windows-app-probe.exe"));
         match probe.and_then(|probe| std::process::Command::new(probe).arg(app_id).spawn().ok()) {
-            Some(child) => println!("phase=view-event-test-launch pid={}", child.id()),
-            None => eprintln!("phase=view-event-test-launch error=spawn-failed"),
+            Some(child) => hlog!("phase=view-event-test-launch pid={}", child.id()),
+            None => hlog!("phase=view-event-test-launch error=spawn-failed"),
         }
-        let _ = std::io::stdout().flush();
     }
     #[cfg(feature = "diagnostics")]
     let keep_alive = (broker, controller, redirect);
@@ -497,14 +502,14 @@ fn run_host_with_parent(
     if pump_messages {
         // SAFETY: This thread owns the HWND and consumes its timer messages.
         if unsafe { SetTimer(Some(shell_window.window), 0x71, 250, None) } == 0 {
-            eprintln!("phase=auto-present error=SetTimer-failed");
+            hlog!("phase=auto-present error=SetTimer-failed");
             readiness.failed("auto-present", "SetTimer failed");
             drop(keep_alive);
             // SAFETY: Balances this thread's successful CoInitializeEx.
             unsafe { CoUninitialize() };
             return ExitCode::FAILURE;
         }
-        println!("phase=host-message-loop");
+        hlog!("phase=host-message-loop ready_ms={}", started.elapsed().as_millis());
         readiness.ready();
         let mut message = MSG::default();
         // SAFETY: The shell window belongs to this thread, and the message
@@ -515,22 +520,22 @@ fn run_host_with_parent(
                 && message.wParam.0 == 0x71
             {
                 if parent.as_ref().is_some_and(ParentHandle::exited) {
-                    println!("phase=host-parent result=exited");
+                    hlog!("phase=host-parent result=exited");
                     break;
                 }
                 #[cfg(feature = "diagnostics")]
                 if view_event_exit_at.is_some_and(|deadline| Instant::now() >= deadline) {
                     if let Some(process_id) = view_event_app_pid {
                         match terminate_view_event_app(process_id) {
-                            Ok(()) => println!(
+                            Ok(()) => hlog!(
                                 "phase=view-event-cleanup pid={process_id} result=terminated"
                             ),
                             Err(error) => {
-                                println!("phase=view-event-cleanup pid={process_id} error={error}")
+                                hlog!("phase=view-event-cleanup pid={process_id} error={error}")
                             }
                         }
                     }
-                    println!("phase=view-event-one-shot result=complete");
+                    hlog!("phase=view-event-one-shot result=complete");
                     break;
                 }
                 #[cfg(feature = "diagnostics")]
@@ -539,15 +544,15 @@ fn run_host_with_parent(
                 {
                     if let Some(process_id) = view_event_app_pid {
                         match terminate_view_event_app(process_id) {
-                            Ok(()) => println!(
+                            Ok(()) => hlog!(
                                 "phase=view-event-cleanup pid={process_id} result=terminated"
                             ),
                             Err(error) => {
-                                println!("phase=view-event-cleanup pid={process_id} error={error}")
+                                hlog!("phase=view-event-cleanup pid={process_id} error={error}")
                             }
                         }
                     }
-                    println!("phase=view-event-one-shot result=timeout");
+                    hlog!("phase=view-event-one-shot result=timeout");
                     break;
                 }
                 if auto_present {
@@ -558,7 +563,7 @@ fn run_host_with_parent(
                     .as_mut()
                     .and_then(crate::view_event_trace::ViewEventTrace::poll_frame_hwnd)
                 {
-                    println!("phase=view-event-frame-ready hwnd={frame:#x}");
+                    hlog!("phase=view-event-frame-ready hwnd={frame:#x}");
                     view_event_frame_hwnd = Some(frame);
                     log_view_event_window_state("frame", frame);
                     if let Some(core) = view_event_core_hwnd {
@@ -580,12 +585,12 @@ fn run_host_with_parent(
                     .as_mut()
                     .and_then(crate::view_event_trace::ViewEventTrace::poll_core_target)
                 {
-                    println!("phase=view-event-core-ready interface={interface:#x} hwnd={hwnd:#x}");
+                    hlog!("phase=view-event-core-ready interface={interface:#x} hwnd={hwnd:#x}");
                     view_event_core_hwnd = Some(hwnd);
                     view_event_app_pid = Some(process_id);
                     match probe_view_wrapper_discovery(interface, hwnd) {
                         Ok(()) => {
-                            println!("phase=view-event-discovery result=called");
+                            hlog!("phase=view-event-discovery result=called");
                             view_event_presentation = Some((
                                 wrapper,
                                 interface,
@@ -595,7 +600,7 @@ fn run_host_with_parent(
                                 process_id,
                             ));
                         }
-                        Err(error) => println!("phase=view-event-discovery error={error}"),
+                        Err(error) => hlog!("phase=view-event-discovery error={error}"),
                     }
                 }
                 #[cfg(feature = "diagnostics")]
@@ -616,10 +621,10 @@ fn run_host_with_parent(
                         };
                         match acquired {
                             Ok(proxy) => {
-                                println!("phase=view-event-get-frame result=called");
+                                hlog!("phase=view-event-get-frame result=called");
                                 view_event_frame_proxy = Some(proxy);
                             }
-                            Err(error) => println!("phase=view-event-get-frame error={error}"),
+                            Err(error) => hlog!("phase=view-event-get-frame error={error}"),
                         }
                     }
                     if let Some(proxy) = view_event_frame_proxy.as_ref() {
@@ -630,53 +635,53 @@ fn run_host_with_parent(
                             app_id,
                         ) {
                             Ok(frame_hwnd) => {
-                                println!(
+                                hlog!(
                                     "phase=view-event-set-presented-window frame={frame_hwnd:#x} core={hwnd:#x} result=called"
                                 );
                                 match probe_view_wrapper_set_frame(
                                     frame_window_interface,
                                     frame_hwnd,
                                 ) {
-                                    Ok(()) => println!(
+                                    Ok(()) => hlog!(
                                         "phase=view-event-set-frame hwnd={frame_hwnd:#x} result=called"
                                     ),
-                                    Err(error) => println!(
+                                    Err(error) => hlog!(
                                         "phase=view-event-set-frame hwnd={frame_hwnd:#x} error={error}"
                                     ),
                                 }
                                 match probe_frame_set_position(proxy.as_raw() as usize) {
                                     Ok(()) => {}
-                                    Err(error) => println!(
+                                    Err(error) => hlog!(
                                         "phase=view-event-set-position hwnd={hwnd:#x} error={error}"
                                     ),
                                 }
                                 match probe_frame_fit_to_work_area(proxy.as_raw() as usize) {
-                                    Ok(()) => println!(
+                                    Ok(()) => hlog!(
                                         "phase=view-event-fit-frame hwnd={frame_hwnd:#x} result=called"
                                     ),
-                                    Err(error) => println!(
+                                    Err(error) => hlog!(
                                         "phase=view-event-fit-frame hwnd={frame_hwnd:#x} error={error}"
                                     ),
                                 }
                                 match probe_view_wrapper_set_size(wrapper, frame_hwnd) {
                                     Ok(()) => {}
-                                    Err(error) => println!(
+                                    Err(error) => hlog!(
                                         "phase=view-event-set-size hwnd={hwnd:#x} error={error}"
                                     ),
                                 }
                             }
                             Err(error) => {
-                                println!("phase=view-event-set-presented-window error={error}")
+                                hlog!("phase=view-event-set-presented-window error={error}")
                             }
                         }
                     }
                     match probe_view_wrapper_readiness(interface, hwnd) {
-                        Ok(()) => println!("phase=view-event-readiness result=called"),
-                        Err(error) => println!("phase=view-event-readiness error={error}"),
+                        Ok(()) => hlog!("phase=view-event-readiness result=called"),
+                        Err(error) => hlog!("phase=view-event-readiness error={error}"),
                     }
                     match probe_view_wrapper_uncloak(cloak_interface) {
                         Ok(()) => {
-                            println!(
+                            hlog!(
                                 "phase=view-event-uncloak hwnd={hwnd:#x} pid={process_id} result=called"
                             );
                             let app_id = view_event_app.as_deref().unwrap_or_default();
@@ -689,20 +694,20 @@ fn run_host_with_parent(
                             .ok()
                             .map(|window| window.0 as usize)
                             .unwrap_or_default();
-                            println!(
+                            hlog!(
                                 "phase=view-event-frame-state app={app_id} frame={frame:?} core={hwnd:#x} parent={parent:#x}"
                             );
-                            println!(
+                            hlog!(
                                 "phase=view-event-frame-windows values={:?}",
                                 crate::auto_present::frame_windows()
                             );
                             match probe_view_wrapper_foreground(cloak_interface) {
                                 Ok(()) => {
-                                    println!(
+                                    hlog!(
                                         "phase=view-event-foreground hwnd={hwnd:#x} result=called"
                                     );
                                 }
-                                Err(error) => println!(
+                                Err(error) => hlog!(
                                     "phase=view-event-foreground hwnd={hwnd:#x} error={error}"
                                 ),
                             }
@@ -713,57 +718,52 @@ fn run_host_with_parent(
                             }
                         }
                         Err(error) => {
-                            println!(
+                            hlog!(
                                 "phase=view-event-uncloak hwnd={hwnd:#x} pid={process_id} error={error}"
                             )
                         }
                     }
                 }
-                let _ = std::io::stdout().flush();
                 continue;
             }
             if message.hwnd == shell_window.window && message.message == 0x806c {
                 match switch_settings_view_in_host() {
-                    Ok(()) => println!("phase=host-switch-settings result=success"),
-                    Err(error) => println!("phase=host-switch-settings error={error}"),
+                    Ok(()) => hlog!("phase=host-switch-settings result=success"),
+                    Err(error) => hlog!("phase=host-switch-settings error={error}"),
                 }
-                let _ = std::io::stdout().flush();
                 continue;
             }
             if message.hwnd == shell_window.window && message.message == 0x806d {
                 let wrapper = message.wParam.0;
                 let hwnd = message.lParam.0 as usize;
                 match probe_window_discovery(wrapper, hwnd) {
-                    Ok(()) => println!(
+                    Ok(()) => hlog!(
                         "phase=host-window-discovery wrapper={wrapper:#x} hwnd={hwnd:#x} result=called"
                     ),
-                    Err(error) => println!("phase=host-window-discovery error={error}"),
+                    Err(error) => hlog!("phase=host-window-discovery error={error}"),
                 }
-                let _ = std::io::stdout().flush();
                 continue;
             }
             if message.hwnd == shell_window.window && message.message == 0x806e {
                 let wrapper = message.wParam.0;
                 let hwnd = message.lParam.0 as usize;
                 match probe_window_visibility(wrapper, hwnd) {
-                    Ok(()) => println!(
+                    Ok(()) => hlog!(
                         "phase=host-window-visible wrapper={wrapper:#x} hwnd={hwnd:#x} result=called"
                     ),
-                    Err(error) => println!("phase=host-window-visible error={error}"),
+                    Err(error) => hlog!("phase=host-window-visible error={error}"),
                 }
-                let _ = std::io::stdout().flush();
                 continue;
             }
             if message.hwnd == shell_window.window && message.message == 0x806f {
                 let wrapper = message.wParam.0;
                 let hwnd = message.lParam.0 as usize;
                 match probe_window_layout(wrapper, hwnd) {
-                    Ok(()) => println!(
+                    Ok(()) => hlog!(
                         "phase=host-window-layout wrapper={wrapper:#x} hwnd={hwnd:#x} result=called"
                     ),
-                    Err(error) => println!("phase=host-window-layout error={error}"),
+                    Err(error) => hlog!("phase=host-window-layout error={error}"),
                 }
-                let _ = std::io::stdout().flush();
                 continue;
             }
             unsafe {
@@ -771,6 +771,7 @@ fn run_host_with_parent(
                 DispatchMessageW(&message);
             }
         }
+        hlog!("phase=host-message-loop result=ended");
         // SAFETY: Cancel the timer before the window guard destroys its HWND.
         let _ = unsafe { KillTimer(Some(shell_window.window), 0x71) };
     } else {
@@ -786,6 +787,21 @@ fn run_host_with_parent(
     unsafe { CoUninitialize() };
     ExitCode::SUCCESS
 }
+
+/// explorust: whether the controller skips twinui's TouchKeyboardExperienceManager component
+/// (emoji panel, clipboard view, voice typing). `EXPLORUST_UWP_TOUCH_KEYBOARD=0` skips it,
+/// `1` creates it; the default is set from the g1 tests (uwp-2).
+#[cfg(target_os = "windows")]
+fn skip_touch_keyboard() -> bool {
+    match std::env::var("EXPLORUST_UWP_TOUCH_KEYBOARD").as_deref() {
+        Ok("0") => true,
+        Ok("1") => false,
+        _ => SKIP_TOUCH_KEYBOARD_DEFAULT,
+    }
+}
+
+#[cfg(target_os = "windows")]
+const SKIP_TOUCH_KEYBOARD_DEFAULT: bool = true;
 
 #[cfg(target_os = "windows")]
 fn publish_immersive_shell_broker() -> windows::core::Result<windows::core::IUnknown> {
@@ -816,7 +832,7 @@ fn publish_immersive_shell_broker() -> windows::core::Result<windows::core::IUnk
         std::mem::transmute(vtable.add(3).read())
     };
     let status = unsafe { publish(host.as_raw(), shell.as_raw(), std::ptr::null_mut()) };
-    println!("phase=broker-host-publish hresult={status:?}");
+    hlog!("phase=broker-host-publish hresult={status:?}");
     status.ok()?;
     Ok(host)
 }

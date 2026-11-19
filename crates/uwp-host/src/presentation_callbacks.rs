@@ -233,7 +233,7 @@ pub(crate) fn probe_view_wrapper_set_size(
     unsafe { set_size(interface as *mut c_void, size) }
         .ok()
         .map_err(|error| error.to_string())?;
-    println!("phase=view-event-set-size width={width} height={height} result=called");
+    hlog!("phase=view-event-set-size width={width} height={height} result=called");
     Ok(())
 }
 
@@ -309,7 +309,7 @@ pub(crate) fn probe_frame_set_position(frame_proxy: usize) -> Result<(), String>
     status
         .ok()
         .map_err(|error| format!("set position to {bounds:?}: {error}"))?;
-    println!("phase=view-event-set-position bounds={bounds:?} result=called");
+    hlog!("phase=view-event-set-position bounds={bounds:?} result=called");
     Ok(())
 }
 
@@ -415,57 +415,68 @@ pub(crate) fn probe_frame_fit_to_work_area(frame_proxy: usize) -> Result<(), Str
         .map_err(|error| error.to_string())
 }
 
+/// explorust: the address of `symbol` once it is found in the vtable of the wrapper object at
+/// `object` (the `UwpWindowWrapper` primary interface, the one `find_wrapper` validated).
+/// Replaces upstream's check of the first ten bytes of each function, which broke on 26300.9974
+/// when the compiler changed HandlePresentationReadinessChange's prologue (it now saves rbp and
+/// rsi too). A vtable match proves the object really dispatches to this PDB address, whatever the
+/// function's code looks like. The slot is logged once per symbol.
+#[cfg(target_os = "windows")]
+fn wrapper_method(object: usize, symbol: &str) -> Result<usize, String> {
+    use std::{collections::HashMap, sync::Mutex};
+    static SLOTS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+    const MAX_SLOTS: usize = 96;
+
+    let address = crate::symbols::address("twinui.pcshell.dll", symbol)?;
+    // SAFETY: find_wrapper validated `object` as a live UwpWindowWrapper in this process whose
+    // first field is its vtable, a table of at least MAX_SLOTS entries in twinui's .rdata.
+    let vtable = unsafe { (object as *const *const usize).read() };
+    if vtable.is_null() {
+        return Err("null wrapper vtable".into());
+    }
+    let slot = (0..MAX_SLOTS).find(|&i| unsafe { vtable.add(i).read() } == address);
+    let Some(slot) = slot else {
+        return Err(format!("{symbol} at {address:#x} is not in the wrapper vtable {vtable:p}"));
+    };
+    let mut slots = SLOTS.lock().unwrap();
+    let slots = slots.get_or_insert_with(HashMap::new);
+    if slots.insert(symbol.to_owned(), slot) != Some(slot) {
+        hlog!("phase=wrapper-method slot={slot} address={address:#x} symbol={symbol}");
+    }
+    Ok(address)
+}
+
 #[cfg(target_os = "windows")]
 fn probe_window_discovery_interface(
     discovered_interface: usize,
     hwnd: usize,
 ) -> Result<(), String> {
     use std::ffi::c_void;
-    use windows::Win32::{
-        Foundation::HWND, System::LibraryLoader::GetModuleHandleW,
-        UI::WindowsAndMessaging::IsWindow,
-    };
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::IsWindow};
 
-    const PROLOGUE: [u8; 10] = [0x48, 0x89, 0x5c, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20];
     if discovered_interface == 0
         || hwnd == 0
         || !unsafe { IsWindow(Some(HWND(hwnd as *mut c_void))) }.as_bool()
     {
         return Err("invalid wrapper or HWND".into());
     }
-    // SAFETY: The controller loads this Windows DLL before pumping messages.
-    let module = unsafe { GetModuleHandleW(windows::core::w!("twinui.pcshell.dll")) }
-        .map_err(|error| error.to_string())?;
-    let address = crate::symbols::address(
-        "twinui.pcshell.dll",
+    let address = wrapper_method(
+        discovered_interface,
         "?WindowDiscoveredFromShellHook@UwpWindowWrapperBase@@UEAAXPEAUHWND__@@@Z",
     )?;
-    // SAFETY: The exact-module PDB identified the function. The byte check
-    // rejects an incompatible implementation before the diagnostic call.
-    let actual = unsafe { std::slice::from_raw_parts(address as *const u8, PROLOGUE.len()) };
-    if actual != PROLOGUE {
-        return Err(format!(
-            "unexpected window discovery prologue at {address:#x}"
-        ));
-    }
     type DiscoverWindow = unsafe extern "system" fn(*mut c_void, *mut c_void);
-    // SAFETY: The caller converted its live wrapper pointer to the
-    // UwpWindowWrapperBase subobject expected by this method. The HWND belongs
-    // to the same app.
+    // SAFETY: The address is the wrapper's own vtable entry for this PDB-named method.
     let discover: DiscoverWindow = unsafe { std::mem::transmute(address) };
     unsafe { discover(discovered_interface as *mut c_void, hwnd as *mut c_void) };
+    hlog!("phase=window-discovered object={discovered_interface:#x} core={hwnd:#x}");
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 pub(crate) fn probe_window_visibility(wrapper: usize, hwnd: usize) -> Result<(), String> {
     use std::ffi::c_void;
-    use windows::Win32::{
-        Foundation::HWND, System::LibraryLoader::GetModuleHandleW,
-        UI::WindowsAndMessaging::IsWindow,
-    };
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::IsWindow};
 
-    const PROLOGUE: [u8; 10] = [0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18];
     let visibility_interface = wrapper
         .checked_sub(0x20)
         .ok_or("wrapper pointer is too small")?;
@@ -473,31 +484,18 @@ pub(crate) fn probe_window_visibility(wrapper: usize, hwnd: usize) -> Result<(),
     {
         return Err("invalid wrapper or HWND".into());
     }
-    // SAFETY: The caller supplies a live wrapper pointer identified by the
-    // matching PDB, and +0x138 holds this wrapper's client HWND in the validated layout.
     let client_hwnd = unsafe { ((wrapper + 0x138) as *const usize).read() };
     if client_hwnd != hwnd {
         return Err(format!(
             "wrapper client HWND {client_hwnd:#x} differs from {hwnd:#x}"
         ));
     }
-    // SAFETY: The controller loads this Windows DLL before pumping messages.
-    let module = unsafe { GetModuleHandleW(windows::core::w!("twinui.pcshell.dll")) }
-        .map_err(|error| error.to_string())?;
-    let address = crate::symbols::address(
-        "twinui.pcshell.dll",
+    let address = wrapper_method(
+        visibility_interface,
         "?VisibilityChanged@UwpWindowWrapperBase@@UEAAXW4EventPhase@@W4Visibility@@@Z",
     )?;
-    // SAFETY: The module is loaded; the PDB and prologue guard identify this
-    // private diagnostic method on the current Windows build.
-    let actual = unsafe { std::slice::from_raw_parts(address as *const u8, PROLOGUE.len()) };
-    if actual != PROLOGUE {
-        return Err(format!("unexpected visibility prologue at {address:#x}"));
-    }
     type VisibilityChanged = unsafe extern "system" fn(*mut c_void, u32, u32);
-    // SAFETY: The live wrapper is checked against its client HWND above. The
-    // interface offset and EventPhase=1, Visibility=1 come from the validated
-    // PDB and disassembly. The host's shell thread owns the controller.
+    // SAFETY: The address is the wrapper's own vtable entry for this PDB-named method.
     let visibility_changed: VisibilityChanged = unsafe { std::mem::transmute(address) };
     unsafe { visibility_changed(visibility_interface as *mut c_void, 1, 1) };
     Ok(())
@@ -506,12 +504,8 @@ pub(crate) fn probe_window_visibility(wrapper: usize, hwnd: usize) -> Result<(),
 #[cfg(target_os = "windows")]
 pub(crate) fn probe_window_layout(wrapper: usize, hwnd: usize) -> Result<(), String> {
     use std::ffi::c_void;
-    use windows::Win32::{
-        Foundation::HWND, System::LibraryLoader::GetModuleHandleW,
-        UI::WindowsAndMessaging::IsWindow,
-    };
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::IsWindow};
 
-    const PROLOGUE: [u8; 10] = [0x48, 0x89, 0x5c, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20];
     let event_interface = wrapper
         .checked_sub(0x20)
         .ok_or("wrapper pointer is too small")?;
@@ -519,37 +513,25 @@ pub(crate) fn probe_window_layout(wrapper: usize, hwnd: usize) -> Result<(), Str
     {
         return Err("invalid wrapper or HWND".into());
     }
-    // SAFETY: The pointer comes from a live wrapper in this diagnostic host;
-    // the validated layout has its client HWND at interface +0x138.
     let client_hwnd = unsafe { ((wrapper + 0x138) as *const usize).read() };
     if client_hwnd != hwnd {
         return Err(format!(
             "wrapper client HWND {client_hwnd:#x} differs from {hwnd:#x}"
         ));
     }
-    // SAFETY: The controller loads this Windows DLL before pumping messages.
-    let module = unsafe { GetModuleHandleW(windows::core::w!("twinui.pcshell.dll")) }
-        .map_err(|error| error.to_string())?;
-    let address = crate::symbols::address(
-        "twinui.pcshell.dll",
+    let address = wrapper_method(
+        event_interface,
         "?HandlePresentationReadinessChange@UwpWindowWrapperBase@@UEAAX_K@Z",
     )?;
-    // SAFETY: The PDB and prologue guard identify this private diagnostic
-    // method on the current Windows build.
-    let actual = unsafe { std::slice::from_raw_parts(address as *const u8, PROLOGUE.len()) };
-    if actual != PROLOGUE {
-        return Err(format!("unexpected layout event prologue at {address:#x}"));
-    }
     type LayoutEvent = unsafe extern "system" fn(*mut c_void, u64);
-    // SAFETY: The live wrapper's HWND was checked above. This build's PDB and
-    // disassembly identify event 0x26 as clearing layout wait flag 2.
+    // SAFETY: The address is the wrapper's own vtable entry for this PDB-named method.
     let layout_event: LayoutEvent = unsafe { std::mem::transmute(address) };
-    // SAFETY: In the validated layout the readiness wait flags are immediately after
-    // the client HWND, whose value was checked above.
     let flags = (wrapper + 0x140) as *const u32;
     let before = unsafe { flags.read() };
     unsafe { layout_event(event_interface as *mut c_void, 0x26) };
     let after = unsafe { flags.read() };
-    println!("phase=layout-wait-flags before={before:#x} after={after:#x}");
+    if before != after {
+        hlog!("phase=layout-wait-flags core={hwnd:#x} before={before:#x} after={after:#x}");
+    }
     Ok(())
 }

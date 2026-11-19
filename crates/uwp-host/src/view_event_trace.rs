@@ -99,8 +99,7 @@ unsafe extern "system" fn invoke(
     args: *mut c_void,
 ) -> HRESULT {
     let elapsed_ms = unsafe { (*this).started.elapsed().as_millis() };
-    println!("phase=view-event-enter elapsed_ms={elapsed_ms} wrapper={wrapper:p} args={args:p}");
-    let _ = std::io::stdout().flush();
+    hlog!("phase=view-event-enter elapsed_ms={elapsed_ms} wrapper={wrapper:p} args={args:p}");
     let mut event_type = -1;
     if !args.is_null() {
         type GetEventType = unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT;
@@ -110,7 +109,7 @@ unsafe extern "system" fn invoke(
             let get_event_type: GetEventType =
                 unsafe { std::mem::transmute(args_vtable.add(6).read()) };
             let status = unsafe { get_event_type(args, &mut event_type) };
-            println!("phase=view-event-type hresult={status:?} value={event_type}");
+            hlog!("phase=view-event-type hresult={status:?} value={event_type}");
 
             // The event type alone does not distinguish all of the launch
             // geometry carried by ShowAsViewMode. Record the concrete event
@@ -120,13 +119,13 @@ unsafe extern "system" fn invoke(
             let mut iid_count = 0;
             let mut iids = std::ptr::null_mut();
             let iid_status = unsafe { get_iids(args, &mut iid_count, &mut iids) };
-            println!("phase=view-event-args-iids hresult={iid_status:?} count={iid_count}");
+            hlog!("phase=view-event-args-iids hresult={iid_status:?} count={iid_count}");
             if iid_status.is_ok() && !iids.is_null() {
                 for (index, iid) in unsafe { std::slice::from_raw_parts(iids, iid_count as usize) }
                     .iter()
                     .enumerate()
                 {
-                    println!("phase=view-event-args-iid index={index} iid={iid:?}");
+                    hlog!("phase=view-event-args-iid index={index} iid={iid:?}");
                 }
                 unsafe { CoTaskMemFree(Some(iids.cast())) };
             }
@@ -150,7 +149,7 @@ unsafe extern "system" fn invoke(
             let mut iid_count = 0;
             let mut iids = std::ptr::null_mut();
             let iid_status = unsafe { get_iids(wrapper, &mut iid_count, &mut iids) };
-            println!("phase=view-event-iids hresult={iid_status:?} count={iid_count}");
+            hlog!("phase=view-event-iids hresult={iid_status:?} count={iid_count}");
             if iid_status.is_ok() && !iids.is_null() {
                 for (index, iid) in unsafe { std::slice::from_raw_parts(iids, iid_count as usize) }
                     .iter()
@@ -163,7 +162,7 @@ unsafe extern "system" fn invoke(
                     } else {
                         std::ptr::null()
                     };
-                    println!(
+                    hlog!(
                         "phase=view-event-iid index={index} iid={iid:?} hresult={status:?} interface={interface:p} vtable={candidate_vtable:p}"
                     );
                     if status.is_ok() && !interface.is_null() {
@@ -182,7 +181,7 @@ unsafe extern "system" fn invoke(
                             let get_process_id: GetProcessId =
                                 unsafe { std::mem::transmute(candidate_vtable.add(54).read()) };
                             let pid_status = unsafe { get_process_id(interface, &mut process_id) };
-                            println!(
+                            hlog!(
                                 "phase=view-event-process-id hresult={pid_status:?} pid={process_id}"
                             );
                             if pid_status.is_ok() {
@@ -231,10 +230,9 @@ unsafe extern "system" fn invoke(
                 unsafe { CoTaskMemFree(Some(iids.cast())) };
             }
             if !frame_interface.is_null() {
-                println!(
+                hlog!(
                     "phase=view-event-frame-method interface={frame_interface:p} slot={frame_slot:?} method={frame_method:#x}"
                 );
-                let _ = std::io::stdout().flush();
                 type GetFrameHwnd = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
                 let get_frame: GetFrameHwnd = unsafe { std::mem::transmute(frame_method) };
                 frame = Some(unsafe { get_frame(frame_interface) } as usize);
@@ -249,15 +247,14 @@ unsafe extern "system" fn invoke(
             }
         }
     }
-    println!(
+    hlog!(
         "phase=view-event elapsed_ms={elapsed_ms} type={event_type} wrapper={wrapper:p} args={args:p} frame_slot={frame_slot:?} frame_method={frame_method:#x} frame={frame:?}"
     );
     let result = match unsafe { (*this).result } {
         ViewEventCallbackResult::Success => HRESULT(0),
         ViewEventCallbackResult::NotImplemented => E_NOTIMPL,
     };
-    println!("phase=view-event-return hresult={result:?}");
-    let _ = std::io::stdout().flush();
+    hlog!("phase=view-event-return hresult={result:?}");
     result
 }
 
@@ -340,7 +337,7 @@ impl ViewEventTrace {
             unsafe { release(callback) };
             return Err(format!("register view events: {error}"));
         }
-        println!("phase=view-event-register token={token} callback_result={result:?}");
+        hlog!("phase=view-event-register token={token} callback_result={result:?}");
         Ok(Self {
             dispatcher,
             callback,
@@ -444,7 +441,7 @@ impl Drop for ViewEventTrace {
         let vtable = unsafe { self.dispatcher.as_raw().cast::<*const usize>().read() };
         let unregister: Unregister = unsafe { std::mem::transmute(vtable.add(7).read()) };
         let status = unsafe { unregister(self.dispatcher.as_raw(), self.token) };
-        println!("phase=view-event-unregister hresult={status:?}");
+        hlog!("phase=view-event-unregister hresult={status:?}");
         let retained = unsafe {
             (*self.callback)
                 .retained_frame_interface

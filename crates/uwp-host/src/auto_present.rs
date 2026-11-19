@@ -217,6 +217,10 @@ trait Presentation {
 
 struct NativePresentation;
 
+thread_local! {
+    static LAST_STATE: std::cell::RefCell<HashMap<usize, String>> = std::cell::RefCell::new(HashMap::new());
+}
+
 struct Readiness {
     associated: bool,
     wait_flags: u32,
@@ -411,12 +415,11 @@ impl AutoPresent {
                 }
                 Err(error) => {
                     if error != pending.last_error {
-                        tracing::warn!(app = app_id, frame = frame.hwnd, core = ?pending.core,
-                            elapsed_ms = now.duration_since(pending.started).as_millis(), %error,
-                            "UWP presentation pending; will retry");
-                        eprintln!(
-                            "phase=auto-present app={app_id:?} frame={:#x} error={error}",
-                            frame.hwnd
+                        hlog!(
+                            "phase=auto-present app={app_id:?} frame={:#x} core={:?} after_ms={} error={error}",
+                            frame.hwnd,
+                            pending.core.map(|core| core.hwnd),
+                            now.duration_since(pending.started).as_millis()
                         );
                         pending.last_error = error;
                     }
@@ -425,16 +428,11 @@ impl AutoPresent {
             };
             if pending.observe(now, ready) {
                 let core = pending.core.expect("ready presentation has a matched core");
-                tracing::info!(
-                    app = app_id,
-                    frame = frame.hwnd,
-                    core = core.hwnd,
-                    elapsed_ms = now.duration_since(pending.started).as_millis(),
-                    "UWP presentation ready"
-                );
-                println!(
-                    "phase=auto-present result=ready app={app_id:?} frame={:#x} core={:#x}",
-                    frame.hwnd, core.hwnd
+                hlog!(
+                    "phase=auto-present result=ready app={app_id:?} frame={:#x} core={:#x} after_ms={}",
+                    frame.hwnd,
+                    core.hwnd,
+                    now.duration_since(pending.started).as_millis()
                 );
                 self.complete.insert((*frame, core));
                 self.pending.remove(frame);
@@ -442,8 +440,11 @@ impl AutoPresent {
                 if !pending.slow_reported
                     && now.duration_since(pending.started) >= Duration::from_secs(15)
                 {
-                    tracing::warn!(app = app_id, frame = frame.hwnd, core = ?pending.core,
-                        last_error = pending.last_error, "UWP presentation is slow; continuing recovery every five seconds");
+                    hlog!(
+                        "phase=auto-present app={app_id:?} frame={:#x} result=slow after_ms=15000 last_error={}; retrying every 5 s",
+                        frame.hwnd,
+                        pending.last_error
+                    );
                     pending.slow_reported = true;
                 }
                 pending.retry(now);
@@ -536,17 +537,18 @@ impl Presentation for NativePresentation {
         if readiness.ready() {
             return Ok(true);
         }
-        tracing::debug!(
-            app = app_id,
-            frame = frame.hwnd,
-            core = core.hwnd,
-            wait_flags = wrapper.wait_flags,
-            attached,
-            visible,
-            frame_cloaked,
-            core_cloaked,
-            "UWP presentation state"
+        let state = format!(
+            "app={app_id:?} frame={:#x} core={:#x} client={:#x} wait_flags={:#x} attached={attached} visible={visible} frame_cloaked={frame_cloaked} core_cloaked={core_cloaked}",
+            frame.hwnd, core.hwnd, wrapper.client, wrapper.wait_flags
         );
+        // Log a frame's state only when it changes, not on every 250 ms retry.
+        LAST_STATE.with_borrow_mut(|last| {
+            last.retain(|hwnd, _| unsafe { IsWindow(Some(HWND(*hwnd as *mut c_void))) }.as_bool());
+            if last.get(&frame.hwnd) != Some(&state) {
+                hlog!("phase=auto-present-state {state}");
+                last.insert(frame.hwnd, state);
+            }
+        });
         if wrapper.client == 0 {
             crate::presentation_callbacks::probe_window_discovery(wrapper.interface, core.hwnd)?;
         }

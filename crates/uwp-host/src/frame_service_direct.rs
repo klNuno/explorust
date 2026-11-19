@@ -59,7 +59,7 @@ impl IServiceProvider_Impl for LoggingServiceProvider_Impl {
         }
         // SAFETY: COM supplies valid GUID pointers for this synchronous call.
         let (service, interface) = unsafe { (*guidservice, *riid) };
-        println!("phase=QueryService service={service:?} interface={interface:?}");
+        hlog!("phase=QueryService service={service:?} interface={interface:?}");
         if service == SHELL_CHROME_CONTROLS_IID && interface == SHELL_CHROME_CONTROLS_IID {
             return DIAGNOSTIC_CHROME_OBJECT.with(|cell| {
                 let borrowed = cell.borrow();
@@ -72,7 +72,7 @@ impl IServiceProvider_Impl for LoggingServiceProvider_Impl {
                 // but does not implement shell chrome controls methods.
                 unsafe { *ppvobject = owned.as_raw() };
                 std::mem::forget(owned);
-                println!("phase=QueryService chrome-placeholder=provided");
+                hlog!("phase=QueryService chrome-placeholder=provided");
                 Ok(())
             });
         }
@@ -119,7 +119,7 @@ impl FramePool {
                 .unwrap_or(512);
             String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(pooled_id, length) })
         };
-        println!(
+        hlog!(
             "phase=frame-pool-entry count={pool_count} app_id={pooled_label:?} glom={pooled_glom}"
         );
         let globals_address = crate::symbols::address("twinui.pcshell.dll", IAM_GLOBALS)?;
@@ -129,7 +129,7 @@ impl FramePool {
         }
         let reconstitution_flag = unsafe { globals.add(0x6c) };
         let previous_flag = unsafe { reconstitution_flag.read() };
-        println!("phase=frame-pool-reconstitution previous={previous_flag}");
+        hlog!("phase=frame-pool-reconstitution previous={previous_flag}");
         unsafe { reconstitution_flag.write(1) };
         let requested: Vec<u16> = app_id.encode_utf16().chain([0]).collect();
         let mut raw = ptr::null_mut();
@@ -180,7 +180,7 @@ pub(crate) fn ensure_frame_pool(manager: &IUnknown) -> std::result::Result<Frame
             "manager internal vtable outside twinui: {internal_vtable:#x}"
         ));
     }
-    println!("phase=manager-internal vtable={internal_vtable:#x}");
+    hlog!("phase=manager-internal vtable={internal_vtable:#x}");
 
     // The manager's initialization stores its own frame service at +0x260.
     // Use that instance so subsequent manager callbacks see the same service.
@@ -194,13 +194,13 @@ pub(crate) fn ensure_frame_pool(manager: &IUnknown) -> std::result::Result<Frame
             .read()
     };
     let manager_owned = !raw_frame.is_null();
-    println!("phase=manager-frame-service present={manager_owned}");
+    hlog!("phase=manager-frame-service present={manager_owned}");
     if !manager_owned {
         // SAFETY: The code prefix, function signature, and manager subobject
         // were verified against this installed DLL and its matching PDB.
         let create: CreateFrameService = unsafe { std::mem::transmute(address) };
         let result = unsafe { create(internal.cast(), &FRAME_SERVICE_IID, &mut raw_frame) };
-        println!("phase=CApplicationFrameService_CreateInstance hresult={result:?}");
+        hlog!("phase=CApplicationFrameService_CreateInstance hresult={result:?}");
         result
             .ok()
             .map_err(|error| format!("frame service creation: {error}"))?;
@@ -228,7 +228,7 @@ pub(crate) fn ensure_frame_pool(manager: &IUnknown) -> std::result::Result<Frame
             .map_err(|error| format!("IObjectWithSite: {error}"))?;
         // SAFETY: SetSite retains the live manager's IUnknown as its COM site.
         unsafe { site.SetSite(manager) }.map_err(|error| format!("SetSite: {error}"))?;
-        println!("phase=frame-service-site result=success");
+        hlog!("phase=frame-service-site result=success");
     }
 
     // SAFETY: This interface's vtable was identified in the matching PDB.
@@ -248,7 +248,7 @@ pub(crate) fn ensure_frame_pool(manager: &IUnknown) -> std::result::Result<Frame
     let complete: CompleteInitialization = unsafe { std::mem::transmute(complete_address) };
     let result = unsafe { complete(frame.as_raw(), provider.as_raw()) };
     DIAGNOSTIC_CHROME_OBJECT.with(|cell| *cell.borrow_mut() = None);
-    println!("phase=CompleteInitialization hresult={result:?}");
+    hlog!("phase=CompleteInitialization hresult={result:?}");
     result
         .ok()
         .map_err(|error| format!("frame service initialization: {error}"))?;
@@ -262,11 +262,11 @@ pub(crate) fn ensure_frame_pool(manager: &IUnknown) -> std::result::Result<Frame
             expected_ensure
         ));
     }
-    println!("phase=EnsureFramePool starting");
+    hlog!("phase=EnsureFramePool starting");
     // SAFETY: The method signature and address were verified against this DLL.
     let ensure: EnsureFramePool = unsafe { std::mem::transmute(ensure_address) };
     let result = unsafe { ensure(frame.as_raw()) };
-    println!("phase=EnsureFramePool hresult={result:?}");
+    hlog!("phase=EnsureFramePool hresult={result:?}");
     result
         .ok()
         .map_err(|error| format!("frame pool creation: {error}"))?;
@@ -285,7 +285,7 @@ pub fn probe(manager: &IUnknown, app_id: &str) -> std::result::Result<(), String
     let launcher = std::env::current_exe()
         .map_err(|error| format!("fixture path: {error}"))?
         .with_file_name("nickel-windows-app-probe.exe");
-    println!("phase=ActivateApplication starting");
+    hlog!("phase=ActivateApplication starting");
     let mut child = Command::new(launcher)
         .arg(app_id)
         .spawn()
@@ -311,8 +311,8 @@ pub fn probe(manager: &IUnknown, app_id: &str) -> std::result::Result<(), String
         }
         thread::sleep(Duration::from_millis(10));
     };
-    println!("phase=ActivateApplication dispatched_messages={dispatched}");
-    println!("phase=ActivateApplication probe_status={status}");
+    hlog!("phase=ActivateApplication dispatched_messages={dispatched}");
+    hlog!("phase=ActivateApplication probe_status={status}");
     if status.success() {
         Ok(())
     } else {

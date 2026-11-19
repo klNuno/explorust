@@ -29,7 +29,10 @@ pub(crate) fn address(module_name: &str, symbol: &str) -> Result<usize, String> 
             .ok_or("symbol address overflow".into());
     }
 
-    let rva = resolve_pdb_symbol(&module.pdb, symbol)?;
+    let rva = resolve_pdb_symbol(&module.pdb, symbol).inspect_err(|error| {
+        hlog!("phase=symbols module={module_name} result=unresolved error={error}");
+    })?;
+    hlog!("phase=symbols module={module_name} rva={rva:#x} symbol={symbol}");
     {
         let mut resolved = module.resolved.lock().unwrap();
         resolved.insert(symbol.to_owned(), rva);
@@ -81,12 +84,23 @@ fn module(module_name: &str) -> Result<Arc<ModuleSymbols>, String> {
     let cache = symbol_cache()?.join(&pdb_name).join(&key);
     let pdb_path = cache.join(&pdb_name);
     let manifest = cache.join("nickel-uwu-symbols.txt");
+    let version = file_version(&image_path).unwrap_or_else(|| "?".into());
     if !pdb_path.exists() {
-        download_pdb(&pdb_name, &key, &pdb_path)?;
+        let started = std::time::Instant::now();
+        hlog!("phase=symbols module={module_name} version={version} pdb={pdb_name}/{key} result=downloading");
+        download_pdb(&pdb_name, &key, &pdb_path).inspect_err(|error| {
+            hlog!("phase=symbols module={module_name} result=download-failed error={error}");
+        })?;
+        hlog!(
+            "phase=symbols module={module_name} result=downloaded in {} ms",
+            started.elapsed().as_millis()
+        );
+    } else {
+        hlog!("phase=symbols module={module_name} version={version} pdb={pdb_name}/{key} result=cached");
     }
     if let Err(error) = validate_pdb(&pdb_path, &key, codeview.age()) {
         // explorust: a damaged cache entry heals itself once instead of failing every logon.
-        tracing::warn!(%error, "symbol cache entry is damaged: downloading it again");
+        hlog!("phase=symbols module={module_name} result=damaged error={error}; downloading again");
         let _ = fs::remove_file(&pdb_path);
         let _ = fs::remove_file(&manifest);
         download_pdb(&pdb_name, &key, &pdb_path)?;
@@ -104,6 +118,41 @@ fn module(module_name: &str) -> Result<Arc<ModuleSymbols>, String> {
         .unwrap()
         .insert(module_name.to_owned(), module.clone());
     Ok(module)
+}
+
+/// explorust: the file version of a loaded module (`10.0.26100.9278`), for the log.
+fn file_version(path: &Path) -> Option<String> {
+    use windows::{
+        Win32::Storage::FileSystem::{
+            GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
+        },
+        core::{HSTRING, w},
+    };
+    let name = HSTRING::from(path.as_os_str());
+    // SAFETY: the buffers are sized from GetFileVersionInfoSizeW and outlive the queries.
+    unsafe {
+        let size = GetFileVersionInfoSizeW(&name, None);
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        GetFileVersionInfoW(&name, None, size, data.as_mut_ptr().cast()).ok()?;
+        let mut info = std::ptr::null_mut();
+        let mut len = 0u32;
+        if !VerQueryValueW(data.as_ptr().cast(), w!("\\"), &mut info, &mut len).as_bool()
+            || info.is_null()
+        {
+            return None;
+        }
+        let info = &*(info as *const VS_FIXEDFILEINFO);
+        Some(format!(
+            "{}.{}.{}.{}",
+            info.dwFileVersionMS >> 16,
+            info.dwFileVersionMS & 0xffff,
+            info.dwFileVersionLS >> 16,
+            info.dwFileVersionLS & 0xffff
+        ))
+    }
 }
 
 fn symbol_cache() -> Result<PathBuf, String> {

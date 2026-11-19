@@ -23,7 +23,7 @@ impl ShellWindowGuard {
         type SetShellWindowEx = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
 
         if !unsafe { GetShellWindow() }.is_invalid() {
-            eprintln!("phase=shell-window result=already-registered");
+            hlog!("phase=shell-window result=already-registered");
             return None;
         }
         let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
@@ -34,7 +34,7 @@ impl ShellWindowGuard {
         let library = match unsafe { libloading::Library::new(path) } {
             Ok(library) => library,
             Err(error) => {
-                eprintln!("phase=load-user32 error={error}");
+                hlog!("phase=load-user32 error={error}");
                 return None;
             }
         };
@@ -43,7 +43,7 @@ impl ShellWindowGuard {
         let set_shell = match unsafe { library.get::<SetShellWindowEx>(b"SetShellWindowEx\0") } {
             Ok(symbol) => symbol,
             Err(error) => {
-                eprintln!("phase=resolve-SetShellWindowEx error={error}");
+                hlog!("phase=resolve-SetShellWindowEx error={error}");
                 return None;
             }
         };
@@ -67,7 +67,7 @@ impl ShellWindowGuard {
         } {
             Ok(window) => window,
             Err(error) => {
-                eprintln!(
+                hlog!(
                     "phase=create-shell-window hresult={:?} error={error}",
                     error.code()
                 );
@@ -79,7 +79,7 @@ impl ShellWindowGuard {
         let registered = unsafe { set_shell(window.0, std::ptr::null_mut()) } != 0;
         if !registered {
             let error = unsafe { GetLastError() };
-            eprintln!(
+            hlog!(
                 "phase=SetShellWindowEx result=failed last_error={}",
                 error.0
             );
@@ -87,7 +87,7 @@ impl ShellWindowGuard {
             return None;
         }
         let matches = unsafe { GetShellWindow() } == window;
-        println!(
+        hlog!(
             "phase=SetShellWindowEx result=success shell_hwnd={:?} matches_own_window={matches}",
             window.0
         );

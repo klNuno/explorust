@@ -142,7 +142,7 @@ impl Drop for FallbackBandRedirect {
     fn drop(&mut self) {
         // SAFETY: The guard still owns both DLLs and the validated IAT slot.
         if let Err(error) = unsafe { write_slot(self.slot, self.original_slot_value) } {
-            eprintln!("phase=restore-fallback-import error={error}");
+            hlog!("phase=restore-fallback-import error={error}");
         }
     }
 }

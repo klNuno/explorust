@@ -44,7 +44,7 @@ pub(crate) fn start_immersive_shell_controller(
         .map_err(|error| format!("query builder2: {error}"))?;
     // SAFETY: QueryInterface returned one owned IUnknown-compatible reference.
     let builder2 = unsafe { IUnknown::from_raw(builder2_raw) };
-    println!(
+    hlog!(
         "phase=ImmersiveShellBuilder interfaces builder={:p} builder2={:p}",
         builder.as_raw(),
         builder2.as_raw()
@@ -60,7 +60,7 @@ pub(crate) fn start_immersive_shell_controller(
         let vtable = interface.cast::<*const usize>().read();
         vtable.add(3).read()
     });
-    println!(
+    hlog!(
         "phase=ImmersiveShellBuilder methods={create_methods:#x?} expected_create={expected_create:#x}"
     );
     if scenario1 {
@@ -72,7 +72,7 @@ pub(crate) fn start_immersive_shell_controller(
         // SAFETY: The pointer matches the PDB-verified SetShellScenario method.
         let set_scenario: SetScenario = unsafe { std::mem::transmute(scenario_address) };
         let result = unsafe { set_scenario(builder2.as_raw(), 1) };
-        println!("phase=ImmersiveShellBuilder-SetScenario1 hresult={result:?}");
+        hlog!("phase=ImmersiveShellBuilder-SetScenario1 hresult={result:?}");
         result
             .ok()
             .map_err(|error| format!("set scenario: {error}"))?;
@@ -87,7 +87,7 @@ pub(crate) fn start_immersive_shell_controller(
     let create: CreateController = unsafe { std::mem::transmute(create_address) };
     let mut controller_raw = std::ptr::null_mut();
     let result = unsafe { create(create_interface, &mut controller_raw) };
-    println!("phase=ImmersiveShellBuilder-CreateController hresult={result:?}");
+    hlog!("phase=ImmersiveShellBuilder-CreateController hresult={result:?}");
     result
         .ok()
         .map_err(|error| format!("create controller through builder: {error}"))?;
@@ -101,18 +101,15 @@ pub(crate) fn start_immersive_shell_controller(
         let vtable = controller.as_raw().cast::<*const usize>().read();
         vtable.add(3).read()
     };
-    let behavior_vtable = if skip_window_events || skip_touch_keyboard {
-        Some(install_component_filter(
-            &controller,
-            builder_module.0 as usize,
-            skip_window_events,
-            skip_touch_keyboard,
-        )?)
-    } else {
-        None
-    };
+    // explorust: the filter is always installed, so every component shows in the log.
+    let behavior_vtable = Some(install_component_filter(
+        &controller,
+        builder_module.0 as usize,
+        skip_window_events,
+        skip_touch_keyboard,
+    )?);
     let expected = crate::symbols::address("Windows.ImmersiveShell.ServiceProvider.dll", START)?;
-    println!("phase=ImmersiveShellController start={start_address:#x} expected={expected:#x}");
+    hlog!("phase=ImmersiveShellController start={start_address:#x} expected={expected:#x}");
     if start_address != expected {
         return Err("controller vtable does not match its loaded symbols".into());
     }
@@ -120,7 +117,7 @@ pub(crate) fn start_immersive_shell_controller(
     // method, whose ABI is HRESULT Start(void). The object is still alive.
     let start: Start = unsafe { std::mem::transmute(start_address) };
     let result = unsafe { start(controller.as_raw()) };
-    println!("phase=ImmersiveShellController-Start hresult={result:?}");
+    hlog!("phase=ImmersiveShellController-Start hresult={result:?}");
     result
         .ok()
         .map_err(|error| format!("start controller: {error}"))?;
@@ -178,14 +175,17 @@ unsafe extern "system" fn should_create_component_diagnostic(
         class == Some(WINDOW_MANAGEMENT_EVENTS) && SKIP_WINDOW_EVENTS.load(Ordering::Acquire);
     let is_touch_keyboard = class == Some(TOUCH_KEYBOARD_EXPERIENCE_MANAGER)
         && SKIP_TOUCH_KEYBOARD.load(Ordering::Acquire);
-    if result.is_ok() && (is_window_events || is_touch_keyboard || index >= limit) {
+    let skipped = result.is_ok() && (is_window_events || is_touch_keyboard || index >= limit);
+    // explorust: every component the controller asks about, so a component Windows adds or
+    // needs after an update shows in the log.
+    let wanted = if result.is_ok() { unsafe { should_create.read() } } else { -1 };
+    hlog!(
+        "phase=component index={index} class={:?} create={wanted} skip={skipped} hresult={result:?}",
+        class.unwrap_or_default()
+    );
+    if skipped {
         // SAFETY: The COM method contract provides this writable output.
         unsafe { should_create.write(0) };
-        if is_window_events || is_touch_keyboard || index == limit {
-            println!(
-                "phase=skip-component index={index} window_events={is_window_events} touch_keyboard={is_touch_keyboard}"
-            );
-        }
     }
     result
 }
@@ -223,7 +223,7 @@ fn install_component_filter(
     const SHOULD_CREATE: &str =
         "?ShouldCreateComponent@CImmersiveShellCreationBehavior@@UEAAJIPEAHPEAU_GUID@@@Z";
     let expected = crate::symbols::address("twinui.pcshell.dll", SHOULD_CREATE)?;
-    println!("phase=creation-behavior should_create={method:#x} expected={expected:#x}");
+    hlog!("phase=creation-behavior should_create={method:#x} expected={expected:#x}");
     if method != expected {
         return Err("creation behavior vtable does not match its loaded symbols".into());
     }
@@ -238,7 +238,7 @@ fn install_component_filter(
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(u32::MAX);
-    println!("phase=creation-behavior component_limit={limit}");
+    hlog!("phase=creation-behavior component_limit={limit}");
     COMPONENT_LIMIT.store(limit, Ordering::Release);
     // SAFETY: The COM object resides in writable heap memory. The copied
     // vtable remains alive until after its owning controller is dropped.

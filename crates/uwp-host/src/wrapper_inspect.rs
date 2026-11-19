@@ -123,7 +123,6 @@ pub fn find_wrapper(frame: usize) -> Result<Wrapper, Box<dyn std::error::Error>>
             "twinui.pcshell.dll",
             "??_7UwpWindowWrapper@@6B?$ChainInterfaces@UIUwpWindowWrapperInternal@@UIWindowWrapper@ViewManagerInterop@Shell@Internal@Windows@@VNil@Details@WRL@Microsoft@@V789Microsoft@@V789Microsoft@@V789Microsoft@@V789Microsoft@@V789Microsoft@@V789Microsoft@@V789Microsoft@@@WRL@Microsoft@@@",
         )?;
-    println!("phase=inspect-host pid={host_pid} twinui={module_base:#x} frame={frame:#x}");
 
     // Validate cached ownership on every use. Shell restarts and dispatcher
     // replacement must not turn an old address into the active controller.
@@ -145,6 +144,7 @@ pub fn find_wrapper(frame: usize) -> Result<Wrapper, Box<dyn std::error::Error>>
     {
         return Ok(wrapper);
     }
+    hlog!("phase=wrapper-scan pid={host_pid} twinui={module_base:#x} frame={frame:#x}");
     let mut cursor = 0usize;
     let mut scanned = 0usize;
     let mut buffer = vec![0u8; CHUNK_BYTES];
@@ -197,7 +197,7 @@ pub fn find_wrapper(frame: usize) -> Result<Wrapper, Box<dyn std::error::Error>>
                 let candidate = address + offset;
                 if let Some(wrapper) = inspect(candidate) {
                     LAST_DISPATCHER.set(Some((host_pid, module_base, candidate)));
-                    println!(
+                    hlog!(
                         "phase=wrapper-found dispatcher={candidate:#x} interface={:#x} frame={frame:#x} client={:#x} wait_flags={:#x}",
                         wrapper.interface, wrapper.client, wrapper.wait_flags
                     );

@@ -1,5 +1,8 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
+#[macro_use]
+mod log;
+
 #[cfg(target_os = "windows")]
 mod auto_present;
 #[cfg(target_os = "windows")]
