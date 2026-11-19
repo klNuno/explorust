@@ -22,6 +22,8 @@ mod actions;
 #[cfg(target_os = "windows")]
 mod components;
 #[cfg(target_os = "windows")]
+mod comsec;
+#[cfg(target_os = "windows")]
 mod events;
 #[cfg(target_os = "windows")]
 mod guardwatch;
@@ -36,6 +38,11 @@ mod selftest;
 
 #[cfg(target_os = "windows")]
 fn main() {
+    // Before any COM call of the process (AppContainer hosts call back into twinui here).
+    match comsec::init() {
+        Ok(()) => log::line("COM security set (explorer's SDDL, AppContainers allowed)"),
+        Err(e) => log::line(&format!("COM security not set: {e}")),
+    }
     std::process::exit(run::main());
 }
 
