@@ -10,6 +10,8 @@ pub enum Act {
     Terminal { admin: bool },
     /// The Run dialog.
     Run,
+    /// explorust's task manager (explorust-taskman.exe beside explorust.exe), else Windows' taskmgr.exe.
+    TaskManager,
     /// A bus command answered by another part.
     Search,
     Files,
@@ -53,7 +55,7 @@ pub const MENU: [Entry; 20] = [
     it(9, "Term&inal", "Term&inal", Act::Terminal { admin: false }),
     it(10, "Terminal (&Admin)", "Terminal (&admin)", Act::Terminal { admin: true }),
     Entry::Separator,
-    it(11, "&Task Manager", "Gestionnaire des &tâches", Act::Open("taskmgr.exe")),
+    it(11, "&Task Manager", "Gestionnaire des &tâches", Act::TaskManager),
     it(12, "Setti&ngs", "Para&mètres", Act::Open("ms-settings:")),
     it(13, "File &Explorer", "&Explorateur de fichiers", Act::Files),
     it(14, "&Search", "&Rechercher", Act::Search),

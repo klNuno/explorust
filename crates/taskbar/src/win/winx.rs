@@ -71,6 +71,7 @@ fn run(act: Act) {
                 || open("powershell.exe", verb, None)
         }
         Act::Run => run_dialog(),
+        Act::TaskManager => task_manager(),
         Act::SignOut | Act::Sleep | Act::ShutDown | Act::Restart => power(act),
         Act::Search | Act::Files | Act::Desktop => false,
     };
@@ -94,6 +95,20 @@ fn open(file: &str, verb: Option<&str>, args: Option<&str>) -> bool {
     };
     // SAFETY: the strings outlive the call.
     unsafe { ShellExecuteExW(&mut sei) }.is_ok()
+}
+
+/// Our task manager when it sits beside the running explorust.exe (first frame about 145 ms in g1),
+/// else Windows' own. Ctrl+Shift+Esc stays on Windows' Task Manager.
+fn task_manager() -> bool {
+    let ours = std::env::current_exe().ok().map(|e| e.with_file_name("explorust-taskman.exe")).filter(|p| p.is_file());
+    if let Some(p) = ours {
+        let ok = open(&p.display().to_string(), None, None);
+        log::line(&format!("win+x task manager {}: {}", p.display(), if ok { "ok" } else { "failed, taskmgr.exe" }));
+        if ok {
+            return true;
+        }
+    }
+    open("taskmgr.exe", None, None)
 }
 
 type RunFileDlg = unsafe extern "system" fn(isize, isize, isize, isize, isize, u32) -> i32;
