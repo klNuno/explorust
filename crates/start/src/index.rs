@@ -91,7 +91,10 @@ fn open() -> windows_core::Result<Db> {
 fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32) {
     // SAFETY: COM for this worker thread, for its whole life.
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    let mut db: Option<Db> = None;
+    // Opened before the first key: the first query on a cold provider took 1.7 s in g1.
+    let t = Instant::now();
+    let mut db: Option<Db> = open().ok();
+    log::line(&format!("index: provider ready {} in {:.0} ms", db.is_some(), t.elapsed().as_secs_f32() * 1000.0));
     let mut pending: Option<(u64, String)> = None;
     loop {
         let Some(mut job) = pending.take().or_else(|| rx.recv().ok()) else { break };

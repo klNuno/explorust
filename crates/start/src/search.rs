@@ -56,7 +56,9 @@ impl Entry {
 fn fuzzy(s: &str, q: &str) -> Option<u32> {
     let s: Vec<char> = s.chars().collect();
     let mut score: i32 = 200;
-    let mut i = 0;
+    // The first letter must start a word, as initials do: "calc" does not find "Local Security".
+    let q0 = q.chars().find(|c| *c != ' ')?;
+    let mut i = (0..s.len()).find(|&i| s[i] == q0 && (i == 0 || is_sep(s[i - 1])))?;
     let mut last: Option<usize> = None;
     for qc in q.chars().filter(|c| *c != ' ') {
         let mut found = None;
@@ -374,6 +376,9 @@ mod tests {
         assert_eq!(r, vec![4]);
         let r: Vec<usize> = rank(&e, |_| 0, "clcultor", 10).into_iter().map(|x| x.0).collect();
         assert_eq!(r, vec![4]);
+        let e = entries(&["Calculator", "Local Security Policy"]);
+        let r: Vec<usize> = rank(&e, |_| 0, "calc", 10).into_iter().map(|x| x.0).collect();
+        assert_eq!(r, vec![0]);
         assert!(rank(&e, |_| 0, "  ", 10).is_empty());
     }
 

@@ -65,6 +65,18 @@ pub enum Act {
 }
 
 impl Start {
+    /// Draws the search view once while cloaked, so the first key does not pay for font loading.
+    pub fn warm(&mut self) {
+        if self.shown {
+            return;
+        }
+        let t = std::time::Instant::now();
+        self.set_query("a".into());
+        let _ = self.draw();
+        self.set_query(String::new());
+        crate::log::line(&format!("search: view warmed in {:.1} ms", t.elapsed().as_secs_f32() * 1000.0));
+    }
+
     pub fn refresh_uses(&mut self) {
         self.app_uses = self.apps.iter().map(|a| self.usage.iter().find(|(id, _)| id.eq_ignore_ascii_case(&a.aumid)).map_or(0, |u| u.1)).collect();
     }

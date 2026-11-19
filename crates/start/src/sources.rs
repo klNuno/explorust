@@ -81,12 +81,14 @@ pub fn load_settings() -> Vec<Setting> {
             unresolved += 1;
             continue;
         };
-        if out.iter().any(|s| s.name == name && s.link == r.link) {
+        if out.iter().any(|s| s.name.eq_ignore_ascii_case(&name) && s.link == r.link) {
             continue;
         }
         let keywords = r.keywords.iter().filter_map(|k| resolve(k)).flat_map(|k| settings::split_keywords(&k)).collect();
         out.push(Setting { name, link: r.link, keywords });
     }
+    let sample: Vec<String> = out.iter().filter(|s| s.name.to_lowercase().contains("display")).take(3).map(|s| format!("{} -> {}", s.name, s.link)).collect();
+    log::line(&format!("settings: sample {}", sample.join(" | ")));
     log::line(&format!("settings: {} pages from {files} files in {}, {unresolved} names not resolved", out.len(), dir.display()));
     out
 }

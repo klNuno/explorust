@@ -11,7 +11,8 @@ use crate::{apps, log, power};
 use std::cell::RefCell;
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::Graphics::Dwm::DwmFlush;
+use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmFlush, DwmGetCompositionTimingInfo};
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
@@ -75,7 +76,36 @@ pub fn backspace() {
     });
 }
 
+fn qpc() -> i64 {
+    let mut v = 0;
+    // SAFETY: writes the counter into a local.
+    let _ = unsafe { QueryPerformanceCounter(&mut v) };
+    v
+}
+
+/// The QPC time of the first vblank after `at`, when DWM composes the frame presented before it,
+/// and the refresh period, from DWM's timing info.
+fn next_vblank(at: i64) -> Option<(i64, i64)> {
+    let mut t = DWM_TIMING_INFO { cbSize: size_of::<DWM_TIMING_INFO>() as u32, ..Default::default() };
+    // SAFETY: fills a local struct sized above.
+    unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut t) }.ok()?;
+    let period = t.qpcRefreshPeriod as i64;
+    if period <= 0 {
+        return None;
+    }
+    let mut v = t.qpcVBlank as i64;
+    if v < at {
+        v += ((at - v) / period + 1) * period;
+    }
+    Some((v, period))
+}
+
 fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
+    let mut freq = 0;
+    // SAFETY: writes the frequency into a local.
+    let _ = unsafe { QueryPerformanceFrequency(&mut freq) };
+    let ms = |a: i64, b: i64| (b - a) as f32 * 1000.0 / freq.max(1) as f32;
+    let q0 = qpc();
     // SAFETY: the time of the key message being handled and the tick now, both in ms.
     let queued = unsafe { (GetTickCount() as i32).wrapping_sub(GetMessageTime()) };
     let t0 = Instant::now();
@@ -99,13 +129,17 @@ fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
         }
     });
     KEY_AT.with(|k| *k.borrow_mut() = Some(t0));
-    let present = t0.elapsed().as_secs_f32() * 1000.0;
+    let qp = qpc();
+    let present = ms(q0, qp);
+    let vblank = next_vblank(qp);
     // SAFETY: waits for the composition that shows the frame just presented.
     let _ = unsafe { DwmFlush() };
-    let frame = t0.elapsed().as_secs_f32() * 1000.0;
-    let total = queued.max(0) as f32 + frame;
+    let flushed = t0.elapsed().as_secs_f32() * 1000.0;
+    let queued = queued.max(0) as f32;
+    let (frame, refresh) = vblank.map_or((flushed, 0.0), |(v, p)| (ms(q0, v), ms(0, p)));
+    let total = queued + frame;
     log::line(&format!(
-        "search key {key} \"{q}\": queue {queued} ms, ranked {ranked:.2} ms, presented {present:.1} ms, on screen {frame:.1} ms, key to frame {total:.1} ms{}; apps {apps}, settings {settings}{}",
+        "search key {key} \"{q}\": queue {queued} ms, ranked {ranked:.2} ms, presented {present:.1} ms, shown at the vblank {frame:.1} ms (refresh {refresh:.1} ms), DwmFlush back {flushed:.1} ms, key to frame {total:.1} ms{}; apps {apps}, settings {settings}{}",
         if total <= 16.0 { "" } else { " (over 16)" },
         if calc { ", calculator" } else { "" }
     ));

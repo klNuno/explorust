@@ -202,8 +202,26 @@ fn on_loaded(l: Loaded) {
             s.pages(),
             s.recs.len()
         ));
+        s.warm();
         let _ = s.draw();
     });
+}
+
+/// Class and process of a window, for the deactivation log.
+fn describe_window(h: HWND) -> String {
+    if h.is_invalid() {
+        // SAFETY: plain window queries.
+        let fg = unsafe { GetForegroundWindow() };
+        return if fg.is_invalid() { "no window".into() } else { format!("foreground {}", describe_window(fg)) };
+    }
+    let mut class = [0u16; 128];
+    let mut pid = 0u32;
+    // SAFETY: plain window queries into local buffers.
+    let n = unsafe {
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        GetClassNameW(h, &mut class)
+    };
+    format!("{} (pid {pid})", String::from_utf16_lossy(&class[..n.max(0) as usize]))
 }
 
 fn cloak(hwnd: HWND, on: bool) {
@@ -698,7 +716,7 @@ unsafe extern "system" fn menu_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
         }
         WM_ACTIVATE => {
             if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE && with(|s| s.shown && !s.menu_open) == Some(true) {
-                hide(false, "deactivated");
+                hide(false, &format!("deactivated, to {}", describe_window(HWND(lp.0 as _))));
             }
         }
         WM_KEYDOWN => {
