@@ -9,6 +9,9 @@
 //! - `--reload`: ask it to exit with code 5; the guard then swaps in `explorust.next.exe` beside it,
 //!   if there is one, and starts explorust again (the guest's deploy loop).
 //!
+//! Keys: installed in Program Files, explorust starts `explorust-keys.exe` (the UI-access hook,
+//! `keyhost`); a dev build hooks the keyboard in-process.
+//!
 //! Exit codes: 0 clean quit, 2 the UWP host failed, 3 another shell owns the session, 4 self-test
 //! failed, 5 reload. The guard restarts explorust on any code but 0.
 
@@ -21,9 +24,9 @@ mod components;
 #[cfg(target_os = "windows")]
 mod events;
 #[cfg(target_os = "windows")]
-mod hotkeys;
-#[cfg(target_os = "windows")]
 mod guardwatch;
+#[cfg(target_os = "windows")]
+mod keyhost;
 #[cfg(target_os = "windows")]
 mod log;
 #[cfg(target_os = "windows")]

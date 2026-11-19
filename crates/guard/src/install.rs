@@ -1,6 +1,7 @@
-//! The uiAccess install. explorust.exe built with `uiAccess="true"` (EXPLORUST_UIACCESS=1, signed
-//! by `tools/authenticode-sign.py`) sees keys over elevated windows, but Windows only starts it from
-//! a secure folder and signed by a certificate the machine trusts. `--install` run elevated copies
+//! The uiAccess install. explorust-keys.exe, the shell's keyboard hook, built with
+//! `uiAccess="true"` (EXPLORUST_UIACCESS=1, signed by `tools/authenticode-sign.py`) sees keys over
+//! elevated windows, but Windows only starts it from a secure folder and signed by a certificate the
+//! machine trusts; explorust.exe stays a plain build and starts it from there. `--install` run elevated copies
 //! the shell to `%ProgramFiles%\explorust` and trusts the certificate below in the machine's Root and
 //! TrustedPublisher stores; `--restore` run elevated undoes both.
 
@@ -20,15 +21,16 @@ use windows::core::{HSTRING, PCWSTR};
 const CERT: &[u8] = include_bytes!("../res/explorust-codesign.cer");
 const STORES: [&str; 2] = ["Root", "TrustedPublisher"];
 /// What runs from the install folder: the guard, the shell, the folder handler, the UWP probe
-/// some host builds start beside explorust.exe, and the toast listener's helper with its sparse
-/// package (`package.rs`).
-const FILES: [&str; 6] = [
+/// some host builds start beside explorust.exe, the toast listener's helper with its sparse
+/// package (`package.rs`), and the UI-access keyboard hook.
+const FILES: [&str; 7] = [
     "explorust-guard.exe",
     "explorust.exe",
     "explorust-open.exe",
     "nickel-windows-app-probe.exe",
     "explorust-notify.exe",
     crate::package::MSIX,
+    "explorust-keys.exe",
 ];
 
 pub fn elevated() -> bool {

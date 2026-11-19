@@ -22,9 +22,8 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <!-- uiAccess: build.rs turns it to "true" when EXPLORUST_UIACCESS=1. Such an exe only starts
-             signed by a trusted certificate and from Program Files or System32; then its keyboard
-             hook sees keys over elevated windows. -->
+        <!-- No UI access here, so the apps explorust starts get a plain token: the hook that must
+             see keys over elevated windows lives in explorust-keys.exe (crates/keys). -->
         <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>
     </security>

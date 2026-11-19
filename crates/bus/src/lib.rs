@@ -59,6 +59,9 @@ pub enum Command {
     SwitcherMove = 22,
     /// Delete while the switcher is open: close the selected window.
     SwitcherClose = 23,
+    /// Win+R, Win+I and the other one-line shell actions (lParam = `ShellAction as isize`). They run
+    /// in explorust itself, so what they start gets its plain token, never the hook exe's UI access.
+    ShellAction = 24,
 }
 
 impl Command {
@@ -88,6 +91,7 @@ impl Command {
             21 => EmojiPanel,
             22 => SwitcherMove,
             23 => SwitcherClose,
+            24 => ShellAction,
             _ => return None,
         })
     }
@@ -103,6 +107,7 @@ impl Command {
             WinX | TaskbarNth | TaskbarFocus | TrayFocus => Owner::Taskbar,
             FilesOpen => Owner::Files,
             ShowDesktop => Owner::Desktop,
+            ShellAction => Owner::Shell,
             // Sent to each owner with `post_to`.
             Shutdown => Owner::Taskbar,
         }
@@ -117,9 +122,12 @@ pub enum Owner {
     Switcher,
     Notify,
     Files,
+    /// explorust's own command window, which runs the shell actions.
+    Shell,
 }
 
 impl Owner {
+    /// The parts (the shell's own window is not one).
     pub const ALL: [Owner; 6] =
         [Owner::Taskbar, Owner::Desktop, Owner::Start, Owner::Switcher, Owner::Notify, Owner::Files];
 
@@ -131,7 +139,58 @@ impl Owner {
             Owner::Switcher => "switcher",
             Owner::Notify => "notify",
             Owner::Files => "files",
+            Owner::Shell => "shell",
         }
+    }
+}
+
+/// The argument of `Command::ShellAction`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(isize)]
+pub enum ShellAction {
+    /// Win+R: Windows' own Run dialog.
+    RunDialog = 0,
+    /// Win+I.
+    Settings = 1,
+    /// Win+U.
+    EaseOfAccess = 2,
+    /// Win+P.
+    Projection = 3,
+    /// Win+K.
+    Connect = 4,
+    /// Win+Pause.
+    About = 5,
+    /// Win+Shift+S.
+    ScreenClip = 6,
+}
+
+impl ShellAction {
+    pub fn from_isize(v: isize) -> Option<ShellAction> {
+        use ShellAction::*;
+        Some(match v {
+            0 => RunDialog,
+            1 => Settings,
+            2 => EaseOfAccess,
+            3 => Projection,
+            4 => Connect,
+            5 => About,
+            6 => ScreenClip,
+            _ => return None,
+        })
+    }
+
+    /// The URI handed to ShellExecute; None for the Run dialog.
+    pub fn uri(self) -> Option<&'static str> {
+        use ShellAction::*;
+        Some(match self {
+            RunDialog => return None,
+            Settings => "ms-settings:",
+            EaseOfAccess => "ms-settings:easeofaccess",
+            Projection => "ms-settings-displays-topology:projection",
+            Connect => "ms-settings-connectabledevices:devicediscovery",
+            About => "ms-settings:about",
+            ScreenClip => "ms-screenclip:",
+        })
     }
 }
 
@@ -195,11 +254,22 @@ mod tests {
 
     #[test]
     fn every_command_round_trips() {
-        for v in 1..=23 {
+        for v in 1..=24 {
             let c = Command::from_u32(v).unwrap();
             assert_eq!(c as u32, v);
         }
         assert!(Command::from_u32(0).is_none());
-        assert!(Command::from_u32(24).is_none());
+        assert!(Command::from_u32(25).is_none());
+    }
+
+    #[test]
+    fn shell_actions_round_trip() {
+        for v in 0..=6 {
+            assert_eq!(ShellAction::from_isize(v).unwrap() as isize, v);
+        }
+        assert!(ShellAction::from_isize(7).is_none());
+        assert_eq!(ShellAction::RunDialog.uri(), None);
+        assert_eq!(Command::ShellAction.owner(), Owner::Shell);
+        assert_eq!(class_of(Owner::Shell), "explorust.shell");
     }
 }

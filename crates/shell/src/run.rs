@@ -1,7 +1,7 @@
 //! Argument parsing and the process lifetime: host thread up, optional self-test, ready signal,
 //! then wait for a quit request or the host's end.
 
-use crate::{actions, components, events, guardwatch, hotkeys, log, selftest};
+use crate::{actions, components, events, guardwatch, keyhost, log, selftest};
 use std::sync::mpsc;
 use std::time::Duration;
 use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
@@ -114,7 +114,7 @@ fn shell(args: &Args) -> i32 {
     // Dark menus and shell views for every part (uxtheme's app mode is process-wide).
     files::dark_mode_for_process();
     actions::spawn();
-    hotkeys::spawn();
+    keyhost::start();
     components::spawn_all();
     if let Some(pid) = args.guard {
         guardwatch::spawn(pid);
@@ -127,11 +127,13 @@ fn shell(args: &Args) -> i32 {
     loop {
         if quit.wait(250) {
             log::line("quit requested");
+            keyhost::stop();
             components::shutdown_all();
             return CLEAN;
         }
         if reload.wait(0) {
             log::line("reload requested");
+            keyhost::stop();
             components::shutdown_all();
             return RELOAD;
         }

@@ -9,7 +9,7 @@ $st = Get-ItemProperty "Registry::HKEY_USERS\$sid\Software\explorust" -EA Silent
 "LastGoodBuild = $($st.LastGoodBuild)"
 $v = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 "windows = $($v.CurrentBuildNumber).$($v.UBR)"
-Get-Process explorust-guard, explorust, explorer, ApplicationFrameHost, CalculatorApp, SystemSettings -EA SilentlyContinue |
+Get-Process explorust-guard, explorust, explorust-keys, explorer, ApplicationFrameHost, CalculatorApp, SystemSettings -EA SilentlyContinue |
     Select-Object Name, Id, SessionId, @{n = 'MB'; e = { [math]::Round($_.PrivateMemorySize64 / 1MB, 1) } }, StartTime |
     Format-Table -AutoSize | Out-String -Width 200
 $dir = "C:\Users\$User\AppData\Local\explorust"

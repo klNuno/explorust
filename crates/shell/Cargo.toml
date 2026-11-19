@@ -11,6 +11,7 @@ path = "src/main.rs"
 [target.'cfg(target_os = "windows")'.dependencies]
 uwp-host = { path = "../uwp-host" }
 bus = { path = "../bus" }
+keys = { path = "../keys" }
 taskbar = { path = "../taskbar" }
 desktop = { path = "../desktop" }
 start = { path = "../start" }

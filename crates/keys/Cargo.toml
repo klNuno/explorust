@@ -1,0 +1,21 @@
+[package]
+name = "keys"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+# The shell's keyboard hook. explorust runs it in-process in a dev build; installed, the small
+# `explorust-keys.exe` runs it with UI access (EXPLORUST_UIACCESS=1, signed), so keys reach the
+# shell over elevated windows while explorust and what it starts keep a plain token.
+[[bin]]
+name = "explorust-keys"
+path = "src/bin/explorust-keys.rs"
+
+[dependencies]
+bus = { path = "../bus" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = [
+  "Win32_Foundation", "Win32_System_Threading", "Win32_System_SystemInformation",
+  "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Security",
+] }
