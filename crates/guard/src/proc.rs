@@ -1,13 +1,22 @@
 //! Child processes and waits, as thin wrappers over CreateProcessW and WaitForMultipleObjects.
+//! An explorust.exe built with `uiAccess="true"` cannot come from CreateProcess in this
+//! medium-integrity guard (ERROR_ELEVATION_REQUIRED): ShellExecuteEx hands it to the AppInfo
+//! service, which checks the signature and the folder and starts it with UI access.
 
 use std::path::Path;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use crate::log;
+use windows::Win32::Foundation::{CloseHandle, ERROR_ELEVATION_REQUIRED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, EVENT_MODIFY_STATE, GetExitCodeProcess, INFINITE,
+    CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, EVENT_MODIFY_STATE, GetExitCodeProcess, GetProcessId,
+    INFINITE,
     OpenEventW, OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     PROCESS_TERMINATE, STARTUPINFOW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
-use windows::core::{HSTRING, PWSTR};
+use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+use windows::core::{HSTRING, PCWSTR, PWSTR};
+
+/// Set by explorust's `--quit`: the clean way out when this guard may not terminate it.
+const QUIT_EVENT: &str = r"Local\explorust-quit";
 
 pub struct Child {
     pub handle: HANDLE,
@@ -22,7 +31,7 @@ impl Child {
         let app = HSTRING::from(exe.as_os_str());
         let cwd = exe.parent().map(|p| HSTRING::from(p.as_os_str()));
         // SAFETY: cmd is a mutable NUL-terminated buffer as CreateProcessW requires.
-        unsafe {
+        let made = unsafe {
             CreateProcessW(
                 &app,
                 Some(PWSTR(cmd.as_mut_ptr())),
@@ -35,11 +44,43 @@ impl Child {
                 &si,
                 &mut pi,
             )
+        };
+        match made {
+            Ok(()) => {}
+            Err(e) if e.code() == ERROR_ELEVATION_REQUIRED.to_hresult() => return Self::shell_execute(exe, args),
+            Err(e) => return Err(format!("CreateProcess {}: {e}", exe.display())),
         }
-        .map_err(|e| format!("CreateProcess {}: {e}", exe.display()))?;
         // SAFETY: the thread handle is not needed.
         let _ = unsafe { CloseHandle(pi.hThread) };
         Ok(Child { handle: pi.hProcess, pid: pi.dwProcessId })
+    }
+
+    /// The uiAccess path: ShellExecuteEx asks the AppInfo service, which starts the exe with UI
+    /// access when it is signed by a trusted certificate and lives in a secure folder.
+    fn shell_execute(exe: &Path, args: &str) -> Result<Child, String> {
+        let file = HSTRING::from(exe.as_os_str());
+        let params = HSTRING::from(args);
+        let cwd = exe.parent().map(|p| HSTRING::from(p.as_os_str()));
+        let verb = HSTRING::from("open");
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+            lpVerb: PCWSTR(verb.as_ptr()),
+            lpFile: PCWSTR(file.as_ptr()),
+            lpParameters: PCWSTR(params.as_ptr()),
+            lpDirectory: cwd.as_ref().map(|c| PCWSTR(c.as_ptr())).unwrap_or(PCWSTR::null()),
+            nShow: 1,
+            ..Default::default()
+        };
+        // SAFETY: every string outlives the call; hProcess is ours to close.
+        unsafe { ShellExecuteExW(&mut info) }.map_err(|e| format!("ShellExecuteEx {}: {e}", exe.display()))?;
+        if info.hProcess.is_invalid() {
+            return Err(format!("ShellExecuteEx {}: no process handle", exe.display()));
+        }
+        // SAFETY: a valid process handle.
+        let pid = unsafe { GetProcessId(info.hProcess) };
+        log::line(&format!("CreateProcess needs elevation (uiAccess): started through ShellExecuteEx, pid {pid}"));
+        Ok(Child { handle: info.hProcess, pid })
     }
 
     /// Takes over a running process (an explorust whose guard died) as if this guard had started it.
@@ -58,10 +99,15 @@ impl Child {
     }
 
     /// Kills the process and waits until it is gone, so the shell window it owned is released.
+    /// A uiAccess explorust runs above this guard's integrity level, so TerminateProcess can be
+    /// refused: then explorust is asked to quit through its own event.
     pub fn kill(&self) {
         // SAFETY: valid process handle owned by self.
         unsafe {
-            let _ = TerminateProcess(self.handle, 1);
+            if let Err(e) = TerminateProcess(self.handle, 1) {
+                let asked = Event::set_existing(QUIT_EVENT);
+                log::line(&format!("terminate pid {}: {e}; quit event: {asked:?}", self.pid));
+            }
             WaitForSingleObject(self.handle, 10_000);
         }
     }

@@ -133,7 +133,9 @@ fn watch(child: &Child, fallback: &Event) -> End {
 fn swap_next(exe: &Path) {
     let next = exe.with_file_name("explorust.next.exe");
     if !next.exists() {
-        log::line("reload: restarting explorust");
+        // Installed in Program Files this guard cannot write beside explorust.exe: the elevated
+        // deploy (tools/g1-deploy.sh) has already swapped the new exe in.
+        log::line(&format!("reload: restarting {}", exe.display()));
         return;
     }
     // The old process has exited, but its image can stay mapped for a moment.

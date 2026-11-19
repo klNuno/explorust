@@ -3,7 +3,10 @@
 //!
 //! - no argument: run as the shell (see `supervise`).
 //! - `--install`: set the per-user Winlogon `Shell` value to this exe; takes effect at next logon.
+//!   Elevated, it first copies the shell to `%ProgramFiles%\explorust` and trusts the signing
+//!   certificate (the uiAccess build, see `install`), and the Shell value points to that copy.
 //! - `--restore`: delete that value (next logon is plain Windows) and start explorer if no shell runs.
+//!   Elevated, it also removes the Program Files copy and the certificate.
 //! - `--fallback`: ask a running guard to kill explorust and start explorer (same as Ctrl+Alt+Shift+F12).
 //! - `--status`: print the Shell value, the Windows build and the last good build.
 //! - `--adopt <pid>`: started by explorust when its guard died; supervises that explorust.
@@ -12,6 +15,7 @@
 
 mod folders;
 mod hotkey;
+mod install;
 mod log;
 mod policy;
 mod proc;
@@ -55,10 +59,12 @@ fn main() {
         },
         "--status" => {
             say(&format!(
-                "Shell={:?} build={} last_good={:?}",
+                "Shell={:?} build={} last_good={:?} installed={} certificate_trusted={}",
                 reg::shell(),
                 reg::windows_build(),
-                reg::last_good_build()
+                reg::last_good_build(),
+                install::dir().join("explorust.exe").exists(),
+                install::trusted()
             ));
             0
         }
@@ -88,9 +94,26 @@ fn install() -> u32 {
             return 1;
         }
     };
-    match reg::set_shell(&format!("\"{}\"", me.display())) {
+    let guard = if install::elevated() {
+        let from = me.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let copied = install::copy_files(&from).and_then(|g| install::trust(true).map(|t| (g, t)));
+        match copied {
+            Ok((guard, trust)) => {
+                say(&format!("install: shell copied to {}, certificate trusted ({trust})", install::dir().display()));
+                guard
+            }
+            Err(e) => {
+                say(&format!("install failed: {e}"));
+                return 1;
+            }
+        }
+    } else {
+        say("install: not elevated, so no Program Files copy: a uiAccess build will not start from here");
+        me
+    };
+    match reg::set_shell(&format!("\"{}\"", guard.display())) {
         Ok(()) => {
-            say(&format!("installed: next logon starts {}", me.display()));
+            say(&format!("installed: next logon starts {}", guard.display()));
             0
         }
         Err(e) => {
@@ -117,5 +140,21 @@ fn restore() -> u32 {
     };
     folders::handler(false);
     let _ = proc::Event::set_existing(supervise::FALLBACK_EVENT);
+    if !install::elevated() {
+        if install::dir().exists() || install::trusted() {
+            say("restore: run it elevated to remove the Program Files copy and the certificate");
+        }
+        return code;
+    }
+    // The running guard kills explorust on the fallback event; give it a moment to let go.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    say(&format!("restore: {}", install::remove_files()));
+    match install::trust(false) {
+        Ok(t) => say(&format!("restore: certificate {t}")),
+        Err(e) => {
+            say(&format!("restore: certificate: {e}"));
+            return 1;
+        }
+    }
     code
 }

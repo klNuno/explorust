@@ -16,4 +16,14 @@
         processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
     </dependentAssembly>
   </dependency>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <!-- uiAccess: build.rs turns it to "true" when EXPLORUST_UIACCESS=1. Such an exe only starts
+             signed by a trusted certificate and from Program Files or System32; then its keyboard
+             hook sees keys over elevated windows. -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
 </assembly>
