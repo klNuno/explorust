@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
-use windows::Win32::System::Ole::{IObjectWithSite, IOleWindow};
+use windows::Win32::System::Ole::IObjectWithSite;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_SHIFT};
 use windows::Win32::UI::Shell::{
     DefSubclassProc, IContextMenu, IFolderView2, IShellView, RemoveWindowSubclass, SVGIO_BACKGROUND,
@@ -146,7 +146,7 @@ unsafe extern "system" fn retry(_: HWND, _: u32, id: usize, _: u32) {
 fn try_hook(view: &IShellView) -> bool {
     // SAFETY: the view's own window, subclassed on its thread.
     unsafe {
-        let hwnd = match view.cast::<IOleWindow>().and_then(|w| w.GetWindow()) {
+        let hwnd = match view.GetWindow() {
             Ok(h) if !h.is_invalid() => h,
             other => {
                 log::line(&format!("hook: no view window yet ({:?})", other.err().map(|e| e.code())));
