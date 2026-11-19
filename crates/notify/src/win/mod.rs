@@ -1,0 +1,290 @@
+//! The UI thread: the command window `explorust.notify`, and one toast card window per toast on
+//! screen, stacked above the taskbar's right side.
+
+mod card;
+mod listen;
+mod system;
+
+use crate::log;
+use crate::model::{self, Banner, Hit, Toast};
+use card::Card;
+use std::cell::RefCell;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows_core::{HSTRING, PCWSTR, w};
+
+const CARD_CLASS: PCWSTR = w!("explorust.notify.toast");
+const TIMER_HIDE: usize = 1;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+
+struct State {
+    cmd: HWND,
+    /// Newest first.
+    cards: Vec<Card>,
+}
+
+thread_local! {
+    static ST: RefCell<Option<State>> = const { RefCell::new(None) };
+}
+
+pub fn run() {
+    // SAFETY: COM for this thread only (STA, the UI thread).
+    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+    log::line("notify: run");
+    match create() {
+        Err(e) => log::line(&format!("notify: windows not created: {e}")),
+        Ok(cmd) => {
+            ST.with(|c| *c.borrow_mut() = Some(State { cmd, cards: Vec::new() }));
+            listen::spawn(cmd);
+            let mut msg = MSG::default();
+            // SAFETY: a plain message loop on this thread.
+            while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+                unsafe {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            if let Some(s) = ST.with(|c| c.borrow_mut().take()) {
+                // SAFETY: destroys our own windows.
+                unsafe {
+                    for c in &s.cards {
+                        let _ = DestroyWindow(c.hwnd);
+                    }
+                    if IsWindow(Some(s.cmd)).as_bool() {
+                        let _ = DestroyWindow(s.cmd);
+                    }
+                }
+            }
+        }
+    }
+    log::line("notify: stopped");
+    if com {
+        // SAFETY: balances the CoInitializeEx above.
+        unsafe { CoUninitialize() };
+    }
+}
+
+fn create() -> windows_core::Result<HWND> {
+    // SAFETY: window classes and a window owned by this thread.
+    unsafe {
+        let inst = GetModuleHandleW(None)?;
+        let cmd_class = HSTRING::from(bus::class_of(bus::Owner::Notify));
+        let wc = WNDCLASSW { lpfnWndProc: Some(cmd_proc), hInstance: inst.into(), lpszClassName: PCWSTR(cmd_class.as_ptr()), ..Default::default() };
+        RegisterClassW(&wc);
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(card_proc),
+            hInstance: inst.into(),
+            lpszClassName: CARD_CLASS,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+        let cmd = CreateWindowExW(Default::default(), &cmd_class, w!("explorust notify"), WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(inst.into()), None)?;
+        bus::listen(cmd);
+        Ok(cmd)
+    }
+}
+
+unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        bus::MSG_COMMAND => {
+            match bus::decode(wparam, lparam) {
+                Some((bus::Command::Shutdown, _)) => {
+                    log::line("notify: shutdown");
+                    // SAFETY: ends this thread's message loop.
+                    unsafe { PostQuitMessage(0) };
+                }
+                Some((cmd, _)) => log::line(&format!("notify: {cmd:?} not handled yet")),
+                None => {}
+            }
+            LRESULT(0)
+        }
+        listen::MSG_ADDED => {
+            // SAFETY: the listener thread boxed this toast for us and gave up its ownership.
+            let toast = unsafe { Box::from_raw(lparam.0 as *mut Toast) };
+            added(*toast);
+            LRESULT(0)
+        }
+        listen::MSG_REMOVED => {
+            let id = wparam.0 as u32;
+            let hwnd = ST.with(|c| c.borrow().as_ref().and_then(|s| s.cards.iter().find(|k| k.toast.id == id).map(|k| k.hwnd)));
+            if let Some(h) = hwnd {
+                close(h, "removed from the center");
+            }
+            LRESULT(0)
+        }
+        // SAFETY: default handling.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn added(toast: Toast) {
+    let state = system::user_state();
+    let settings = system::settings(&toast.aumid);
+    let decision = model::banner(state, settings);
+    log::line(&format!(
+        "toast {} from '{}' ({}): {:?} (user state {state:?}, {settings:?}), title '{}'",
+        toast.id, toast.app, toast.aumid, decision, toast.title()
+    ));
+    if decision == Banner::Quiet {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let hwnd = match card::create_window(CARD_CLASS) {
+        Ok(h) => h,
+        Err(e) => return log::line(&format!("toast window not created: {e}")),
+    };
+    let card = match Card::new(hwnd, toast) {
+        Ok(c) => c,
+        Err(e) => {
+            // SAFETY: our window, never shown.
+            unsafe { let _ = DestroyWindow(hwnd); }
+            return log::line(&format!("toast card not drawn: {e}"));
+        }
+    };
+    let extra = ST.with(|c| {
+        let mut b = c.borrow_mut();
+        let s = b.as_mut()?;
+        s.cards.insert(0, card);
+        (s.cards.len() > model::MAX_ON_SCREEN).then(|| s.cards[s.cards.len() - 1].hwnd)
+    });
+    if let Some(old) = extra {
+        close(old, "pushed out by a newer toast");
+    }
+    layout();
+    // SAFETY: shows our window without activating it, arms its hide timer.
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetTimer(Some(hwnd), TIMER_HIDE, duration_ms(), None);
+    }
+    system::play_sound();
+    log::line(&format!("toast shown in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
+}
+
+/// Windows' "Dismiss notifications after this amount of time" (Accessibility), 5 s by default.
+fn duration_ms() -> u32 {
+    let mut secs = 0u32;
+    // SAFETY: reads one u32.
+    let ok = unsafe { SystemParametersInfoW(SPI_GETMESSAGEDURATION, 0, Some(&mut secs as *mut _ as _), Default::default()) }.is_ok();
+    if ok && secs > 0 { secs * 1000 } else { 5000 }
+}
+
+/// Places the cards, newest at the bottom right of the primary work area.
+fn layout() {
+    let mut work = RECT::default();
+    // SAFETY: reads the work area into a local.
+    let _ = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut work as *mut _ as _), Default::default()) };
+    ST.with(|c| {
+        let b = c.borrow();
+        let Some(s) = b.as_ref() else { return };
+        let scale = s.cards.first().map(|k| k.scale).unwrap_or(1.0);
+        let heights: Vec<f32> = s.cards.iter().map(|k| k.height_dip).collect();
+        let mut rects = model::stack((work.left, work.top, work.right, work.bottom), &heights, scale);
+        // Dev only: the left side, to compare with Windows' own toast while explorer runs.
+        if std::env::var_os("EXPLORUST_NOTIFY_LEFT").is_some() {
+            for r in &mut rects {
+                r.x = work.left as f32 + work.right as f32 - r.x - r.w;
+            }
+        }
+        for (k, r) in s.cards.iter().zip(rects) {
+            // SAFETY: moves our own window.
+            unsafe {
+                let _ = SetWindowPos(k.hwnd, Some(HWND_TOPMOST), r.x as i32, r.y as i32, r.w as i32, r.h as i32, SWP_NOACTIVATE);
+            }
+        }
+    });
+}
+
+fn close(hwnd: HWND, why: &str) {
+    let removed = ST.with(|c| {
+        let mut b = c.borrow_mut();
+        let s = b.as_mut()?;
+        let i = s.cards.iter().position(|k| k.hwnd == hwnd)?;
+        Some(s.cards.remove(i))
+    });
+    if let Some(card) = removed {
+        log::line(&format!("toast {} closed: {why}", card.toast.id));
+        drop(card);
+        // SAFETY: our own window.
+        unsafe { let _ = DestroyWindow(hwnd); }
+        layout();
+    }
+}
+
+fn with_card<R>(hwnd: HWND, f: impl FnOnce(&mut Card) -> R) -> Option<R> {
+    ST.with(|c| c.borrow_mut().as_mut().and_then(|s| s.cards.iter_mut().find(|k| k.hwnd == hwnd).map(f)))
+}
+
+unsafe extern "system" fn card_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_MOUSEMOVE => {
+            let (x, y) = point(lparam);
+            let started = with_card(hwnd, |k| {
+                let first = !k.hover;
+                k.hover = true;
+                let over = model::hit(x / k.scale, y / k.scale) == Hit::Close;
+                if over != k.hover_close {
+                    k.hover_close = over;
+                    k.paint();
+                }
+                first
+            });
+            if started == Some(true) {
+                // SAFETY: our window; the hide timer waits while the pointer is on the card.
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), TIMER_HIDE);
+                    let mut t = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+                    let _ = TrackMouseEvent(&mut t);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            with_card(hwnd, |k| {
+                k.hover = false;
+                if k.hover_close {
+                    k.hover_close = false;
+                    k.paint();
+                }
+            });
+            // SAFETY: rearms the hide timer of our window.
+            unsafe { SetTimer(Some(hwnd), TIMER_HIDE, duration_ms(), None) };
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = point(lparam);
+            let Some((hit, toast)) = with_card(hwnd, |k| (model::hit(x / k.scale, y / k.scale), k.toast.clone())) else { return LRESULT(0) };
+            match hit {
+                Hit::Close => close(hwnd, "close button"),
+                Hit::Body => {
+                    log::line(&format!("toast {} clicked: activating {}", toast.id, toast.aumid));
+                    // SAFETY: lets the app we start take the foreground (we got the click).
+                    unsafe { let _ = AllowSetForegroundWindow(ASFW_ANY); }
+                    system::activate(&toast.aumid);
+                    // Windows removes a clicked toast from the notification center too.
+                    if let Ok(l) = windows::UI::Notifications::Management::UserNotificationListener::Current() {
+                        let _ = l.RemoveNotification(toast.id);
+                    }
+                    close(hwnd, "clicked");
+                }
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TIMER_HIDE => {
+            // SAFETY: our timer.
+            unsafe { let _ = KillTimer(Some(hwnd), TIMER_HIDE); }
+            close(hwnd, "timed out");
+            LRESULT(0)
+        }
+        // SAFETY: default handling.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn point(lparam: LPARAM) -> (f32, f32) {
+    ((lparam.0 & 0xFFFF) as i16 as f32, ((lparam.0 >> 16) & 0xFFFF) as i16 as f32)
+}
