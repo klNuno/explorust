@@ -104,6 +104,21 @@ pub const LETTER_H: f32 = 36.0;
 pub const LIST_X: f32 = 52.0;
 pub const LIST_ICON: f32 = 24.0;
 
+/// Search results: the list on the left, the preview of the selected result on the right.
+pub const RESULTS: Rect = Rect::new(24.0, 84.0, 300.0, H - 66.0 - 84.0 - 12.0);
+pub const PREVIEW: Rect = Rect::new(336.0, 84.0, W - 24.0 - 336.0, H - 66.0 - 84.0 - 12.0);
+pub const RES_HEADER_H: f32 = 34.0;
+pub const RES_ROW_H: f32 = 40.0;
+pub const RES_BEST_H: f32 = 64.0;
+pub const PREVIEW_ICON: f32 = 64.0;
+/// Top of the first action row in the preview, and the height of each.
+pub const ACTIONS_Y: f32 = PREVIEW.y + 200.0;
+pub const ACTION_H: f32 = 36.0;
+
+pub fn action(i: usize) -> Rect {
+    Rect::new(PREVIEW.x + 8.0, ACTIONS_Y + i as f32 * ACTION_H, PREVIEW.w - 16.0, ACTION_H - 2.0)
+}
+
 /// Where the menu sits on a monitor: centred above the taskbar, in physical pixels.
 pub fn place(mon_left: i32, mon_right: i32, mon_bottom: i32, scale: f32) -> (i32, i32, i32, i32) {
     let w = (W * scale).round() as i32;
@@ -124,6 +139,8 @@ pub enum Hit {
     PageDot(usize),
     Rec(usize),
     Row(usize),
+    /// An action of the search preview panel.
+    Action(usize),
     User,
     Power,
 }
@@ -188,6 +205,14 @@ mod tests {
         assert_eq!(hit_main(cx, cy, 18, 2, 0), Hit::PageDot(1));
         let r = rec(3);
         assert_eq!(hit_main(r.x + 1.0, r.y + 1.0, 0, 1, 6), Hit::Rec(3));
+    }
+
+    #[test]
+    fn results_fit_beside_the_preview() {
+        assert!(RESULTS.right() < PREVIEW.x);
+        assert!(PREVIEW.right() <= W - 24.0);
+        assert!(action(5).bottom() <= PREVIEW.bottom());
+        assert!(RESULTS.bottom() <= BAND.y);
     }
 
     #[test]

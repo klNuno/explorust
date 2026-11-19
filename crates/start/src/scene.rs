@@ -21,6 +21,9 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows_core::{Interface, Result};
 use windows_numerics::{Matrix3x2, Vector2};
 
+mod results;
+pub use results::{Act, FileEntry, Found};
+
 const WHITE: Color = rgba(255, 255, 255, 1.0);
 const SECONDARY: Color = rgba(255, 255, 255, 0.786);
 const TERTIARY: Color = rgba(255, 255, 255, 0.545);
@@ -73,6 +76,9 @@ pub struct Start {
     body: IDWriteTextFormat,
     glyph: IDWriteTextFormat,
     glyph_small: IDWriteTextFormat,
+    title: IDWriteTextFormat,
+    center: IDWriteTextFormat,
+    glyph_big: IDWriteTextFormat,
     pub s: &'static Strings,
     pub user: String,
     pub apps: Vec<AppEntry>,
@@ -83,8 +89,13 @@ pub struct Start {
     pub page: usize,
     pub scroll: f32,
     pub query: String,
-    pub results: Vec<usize>,
-    pub sel: usize,
+    pub found: Found,
+    /// Search entries of `apps` (same order), their use counts, and the Settings pages.
+    pub app_index: Vec<crate::search::Entry>,
+    pub app_uses: Vec<u32>,
+    pub usage: Vec<(String, u32)>,
+    pub settings: Vec<crate::sources::Setting>,
+    pub settings_index: Vec<crate::search::Entry>,
     pub hover: Hit,
     pub search_focus: bool,
     /// Keyboard focus (Tab, arrows), drawn with Windows' focus rectangle.
@@ -125,6 +136,9 @@ impl Start {
         let body = trimmed(&text, text.format(ui, 14.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Leading)?)?;
         let glyph = text.format("Segoe Fluent Icons", 16.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?;
         let glyph_small = text.format("Segoe Fluent Icons", 8.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?;
+        let title = trimmed(&text, text.format("Segoe UI Variable Display", 20.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, Align::Center)?)?;
+        let center = trimmed(&text, text.format(ui, 12.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?)?;
+        let glyph_big = text.format("Segoe Fluent Icons", 40.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?;
         Ok(Self {
             hwnd,
             scale,
@@ -138,6 +152,9 @@ impl Start {
             body,
             glyph,
             glyph_small,
+            title,
+            center,
+            glyph_big,
             s,
             user,
             apps: Vec::new(),
@@ -148,8 +165,12 @@ impl Start {
             page: 0,
             scroll: 0.0,
             query: String::new(),
-            results: Vec::new(),
-            sel: 0,
+            found: Found::default(),
+            app_index: Vec::new(),
+            app_uses: Vec::new(),
+            usage: Vec::new(),
+            settings: Vec::new(),
+            settings_index: Vec::new(),
             hover: Hit::None,
             search_focus: false,
             focus: Hit::None,
@@ -177,6 +198,8 @@ impl Start {
             .collect();
         let names: Vec<&str> = self.apps.iter().map(|a| a.name.as_str()).collect();
         self.lines = model::all_apps_lines(&names);
+        self.app_index = self.apps.iter().map(|a| crate::search::Entry::new(&a.name, &crate::sources::app_keywords(&a.aumid))).collect();
+        self.refresh_uses();
         // Recommended: apps installed in the last 7 days and recent files, newest first.
         let mut recs: Vec<(i64, RecEntry)> = Vec::new();
         for a in &self.apps {
@@ -239,7 +262,11 @@ impl Start {
                     v.push(Hit::Row(i));
                 }
             }
-            View::Search => {}
+            View::Search => {
+                for i in 0..self.actions().len() {
+                    v.push(Hit::Action(i));
+                }
+            }
         }
         v.push(Hit::User);
         v.push(Hit::Power);
@@ -248,7 +275,7 @@ impl Start {
 
     pub fn tab(&mut self, back: bool) {
         let stops = self.tab_stops();
-        let cur = stops.iter().position(|h| std::mem::discriminant(h) == std::mem::discriminant(&self.focus));
+        let cur = stops.iter().position(|h| *h == self.focus).or_else(|| stops.iter().position(|h| std::mem::discriminant(h) == std::mem::discriminant(&self.focus)));
         let n = stops.len();
         let next = match (cur, back) {
             (None, false) => 0,
@@ -339,6 +366,8 @@ impl Start {
                 Rect::new(t.x + 2.0, t.y + 2.0, t.w - 4.0, t.h - 4.0)
             }
             Hit::Rec(i) => L::rec(i),
+            Hit::Action(i) => L::action(i),
+            Hit::Row(i) if self.view == View::Search => self.result_box(i)?,
             Hit::Row(i) => {
                 let (top, _, _) = *self.line_boxes().get(i)?;
                 let y = L::LIST.y + top - self.scroll;
@@ -374,7 +403,7 @@ impl Start {
     pub fn max_scroll(&self) -> f32 {
         let content = match self.view {
             View::AllApps => self.line_boxes().last().map(|(y, h, _)| y + h).unwrap_or(0.0),
-            View::Search => self.results.len() as f32 * L::ROW_H,
+            View::Search => return self.results_max_scroll(),
             View::Main => 0.0,
         };
         (content - L::LIST.h).max(0.0)
@@ -387,7 +416,10 @@ impl Start {
                 Line::App(i) => Some(*i),
                 Line::Letter(_) => None,
             },
-            View::Search => self.results.get(row).copied(),
+            View::Search => match self.found.rows.get(row)? {
+                crate::search::Row::Item(h) if h.kind == crate::search::Kind::App => Some(h.index),
+                _ => None,
+            },
             View::Main => None,
         }
     }
@@ -400,40 +432,22 @@ impl Start {
         if L::SEARCH.contains(x, y) {
             return Hit::Search;
         }
+        if self.view == View::Search {
+            return self.hit_results(x, y).unwrap_or_else(|| L::hit_band(x, y));
+        }
         if self.view == View::AllApps && L::header_button(L::PINNED_BASELINE, L::BACK_BTN_W).contains(x, y) {
             return Hit::Back;
         }
         if L::LIST.contains(x, y) {
             let ly = y - L::LIST.y + self.scroll;
-            match self.view {
-                View::AllApps => {
-                    for (top, h, i) in self.line_boxes() {
-                        if ly >= top && ly < top + h {
-                            return if matches!(self.lines[i], Line::App(_)) { Hit::Row(i) } else { Hit::None };
-                        }
-                    }
-                }
-                _ => {
-                    let i = (ly / L::ROW_H) as usize;
-                    if i < self.results.len() {
-                        return Hit::Row(i);
-                    }
+            for (top, h, i) in self.line_boxes() {
+                if ly >= top && ly < top + h {
+                    return if matches!(self.lines[i], Line::App(_)) { Hit::Row(i) } else { Hit::None };
                 }
             }
             return Hit::None;
         }
         L::hit_band(x, y)
-    }
-
-    pub fn set_query(&mut self, q: String) {
-        let names: Vec<&str> = self.apps.iter().map(|a| a.name.as_str()).collect();
-        self.results = model::filter(&names, &q);
-        self.query = q;
-        self.sel = 0;
-        self.focus = Hit::None;
-        self.scroll = 0.0;
-        self.view = if self.query.is_empty() { View::Main } else { View::Search };
-        self.dirty = true;
     }
 
     /// Back to the main view, as Start opens every time.
@@ -445,7 +459,7 @@ impl Start {
             self.page = 0;
             self.scroll = 0.0;
             self.query.clear();
-            self.results.clear();
+            self.found.clear();
             self.hover = Hit::None;
             self.dirty = true;
         }
@@ -644,23 +658,6 @@ impl Start {
                     Line::Letter(c) => self.txt(&self.header, &c.to_string(), L::LIST_X, 200.0, y + 24.0, WHITE),
                     Line::App(ai) => self.row(y, ai, self.hot(Hit::Row(i)), false),
                 }
-            }
-        });
-    }
-
-    fn draw_results(&self) {
-        let s = self.s;
-        self.txt(&self.header, s.results, L::HEADER_X, 400.0, L::PINNED_BASELINE, WHITE);
-        if self.results.is_empty() {
-            self.txt(&self.label_left, s.no_results, L::HEADER_X, L::W - 52.0, L::LIST.y + 24.0, SECONDARY);
-        }
-        self.list_clip(|| {
-            for (i, &ai) in self.results.iter().enumerate() {
-                let y = L::LIST.y + i as f32 * L::ROW_H - self.scroll;
-                if y + L::ROW_H < L::LIST.y || y > L::LIST.bottom() {
-                    continue;
-                }
-                self.row(y, ai, self.hover == Hit::Row(i), i == self.sel);
             }
         });
     }

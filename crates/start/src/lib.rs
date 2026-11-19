@@ -9,10 +9,14 @@
 
 pub mod layout;
 pub mod model;
+pub mod search;
+pub mod settings;
 pub mod strings;
 
 #[cfg(target_os = "windows")]
 mod apps;
+#[cfg(target_os = "windows")]
+mod index;
 #[cfg(target_os = "windows")]
 mod log;
 #[cfg(target_os = "windows")]
@@ -23,6 +27,8 @@ mod power;
 mod recent;
 #[cfg(target_os = "windows")]
 mod scene;
+#[cfg(target_os = "windows")]
+mod sources;
 #[cfg(target_os = "windows")]
 mod window;
 

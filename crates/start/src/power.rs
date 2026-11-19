@@ -22,6 +22,11 @@ pub fn set_dry_run(dry: bool) {
     DRY.store(dry, Relaxed);
 }
 
+/// True in the dev exe unless `--live-power`: also keeps folder opens from starting explorer.exe.
+pub fn is_dry() -> bool {
+    DRY.load(Relaxed)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Power {
     Sleep,

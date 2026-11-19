@@ -7,7 +7,7 @@ use crate::layout::{self as L, Hit};
 use crate::power::{self, Power};
 use crate::recent::{self, Recent};
 use crate::scene::{RecKind, Start, View};
-use crate::{log, menu, model, strings};
+use crate::{index, log, menu, model, strings};
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -29,7 +29,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_core::{HSTRING, PCWSTR, PWSTR, w};
 
+mod search;
+
 const WM_LOADED: u32 = WM_APP + 1;
+const WM_SETTINGS: u32 = WM_APP + 3;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const MENU_CLASS: PCWSTR = w!("explorust.start.menu");
 /// Acrylic tint, ABGR: Windows 11's dark Start base (#202020) at about 75%.
@@ -134,6 +137,7 @@ fn create() -> windows_core::Result<()> {
         ST.with(|c| *c.borrow_mut() = Some(start));
         log::line(&format!("start: resident window ready, cloaked, scale {scale}, {}", if s.french { "fr" } else { "en" }));
         spawn_loader(hwnd, (L::TILE_ICON * scale).round() as i32);
+        search::start(hwnd, (L::LIST_ICON * scale).round() as i32);
     }
     Ok(())
 }
@@ -181,6 +185,7 @@ fn now_unix() -> i64 {
 
 fn on_loaded(l: Loaded) {
     with(|s| {
+        s.usage = crate::sources::load_usage();
         s.set_apps(l.apps, l.recents, now_unix());
         let (pins, defaults) = apps::load_pins();
         if defaults {
@@ -334,6 +339,11 @@ enum Target {
 }
 
 fn launch(t: Target, from: &'static str) {
+    if let Target::App(a) = &t {
+        if let Some(u) = with(|s| s.count_use(a)) {
+            crate::sources::save_usage(&u);
+        }
+    }
     let _ = std::thread::Builder::new().name("start-launch".into()).spawn(move || {
         // SAFETY: COM for this worker thread.
         let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
@@ -380,6 +390,7 @@ fn activate(hit: Hit) {
         Launch(Target, &'static str),
         PowerMenu,
         UserMenu,
+        Search(usize),
     }
     let act = with(|s| {
         match hit {
@@ -405,6 +416,11 @@ fn activate(hit: Hit) {
                 Act::None
             }
             Hit::Tile(i) => s.tile_app(i).map_or(Act::None, |a| Act::Launch(Target::App(s.apps[a].aumid.clone()), "grid")),
+            Hit::Row(i) if s.view == View::Search => {
+                s.found.sel = Some(i);
+                Act::Search(0)
+            }
+            Hit::Action(i) => Act::Search(i),
             Hit::Row(i) => {
                 let from = if s.view == View::AllApps { "all apps" } else { "search" };
                 s.row_app(i).map_or(Act::None, |a| Act::Launch(Target::App(s.apps[a].aumid.clone()), from))
@@ -423,6 +439,7 @@ fn activate(hit: Hit) {
         Some(Act::Launch(t, from)) => launch(t, from),
         Some(Act::PowerMenu) => power_menu(),
         Some(Act::UserMenu) => user_menu(),
+        Some(Act::Search(i)) => search::run_action(i),
         _ => redraw(),
     }
 }
@@ -483,6 +500,12 @@ fn context(x: f32, y: f32) {
 }
 
 fn context_on(hit: Hit, x: f32, y: f32) {
+    if let Hit::Row(i) = hit {
+        if with(|s| s.view == View::Search) == Some(true) {
+            search::context(i, x, y);
+            return;
+        }
+    }
     let Some((app, pinned_pos, st)) = with(|s| {
         let app = match hit {
             Hit::Tile(i) => s.tile_app(i),
@@ -525,9 +548,11 @@ fn key(vk: u16) {
     enum Act {
         None,
         Hide,
-        Launch(String),
         Activate(Hit),
         Context(Hit),
+        Search(usize),
+        SearchContext,
+        Back,
     }
     let act = with(|s| {
         if !s.shown {
@@ -553,25 +578,17 @@ fn key(vk: u16) {
                 s.arrow(dx, dy);
                 Act::None
             }
-            v if v == VK_RETURN.0 && s.view == View::Search => {
-                s.results.get(s.sel).map_or(Act::None, |&a| Act::Launch(s.apps[a].aumid.clone()))
-            }
-            v if v == VK_DOWN.0 && s.view == View::Search => {
-                s.sel = (s.sel + 1).min(s.results.len().saturating_sub(1));
-                s.dirty = true;
+            v if v == VK_RETURN.0 && s.view == View::Search => Act::Search(match s.focus {
+                Hit::Action(i) => i,
+                _ => 0,
+            }),
+            v if v == VK_APPS.0 && s.view == View::Search => Act::SearchContext,
+            v if (v == VK_DOWN.0 || v == VK_UP.0) && s.view == View::Search => {
+                s.focus = Hit::None;
+                s.move_selection(if v == VK_DOWN.0 { 1 } else { -1 });
                 Act::None
             }
-            v if v == VK_UP.0 && s.view == View::Search => {
-                s.sel = s.sel.saturating_sub(1);
-                s.dirty = true;
-                Act::None
-            }
-            v if v == VK_BACK.0 && !s.query.is_empty() => {
-                let mut q = s.query.clone();
-                q.pop();
-                s.set_query(q);
-                Act::None
-            }
+            v if v == VK_BACK.0 && !s.query.is_empty() => Act::Back,
             v if v == VK_NEXT.0 && s.view == View::Main => {
                 s.page = (s.page + 1).min(s.pages() - 1);
                 s.dirty = true;
@@ -587,7 +604,13 @@ fn key(vk: u16) {
     });
     match act {
         Some(Act::Hide) => hide(true, "esc"),
-        Some(Act::Launch(a)) => launch(Target::App(a), "search"),
+        Some(Act::Search(i)) => search::run_action(i),
+        Some(Act::SearchContext) => {
+            if let Some((i, b)) = with(|s| s.found.sel.and_then(|i| s.result_box(i).map(|b| (i, b)))).flatten() {
+                search::context(i, b.x + 40.0, b.y + b.h / 2.0);
+            }
+        }
+        Some(Act::Back) => search::backspace(),
         Some(Act::Activate(h)) => activate(h),
         Some(Act::Context(h)) => {
             if let Some(b) = with(|s| s.box_of(h)).flatten() {
@@ -596,19 +619,6 @@ fn key(vk: u16) {
         }
         _ => redraw(),
     }
-}
-
-fn ch(c: u32) {
-    let Some(c) = char::from_u32(c).filter(|c| !c.is_control()) else { return };
-    with(|s| {
-        if s.shown {
-            let mut q = s.query.clone();
-            q.push(c);
-            s.set_query(q);
-            s.search_focus = true;
-        }
-    });
-    redraw();
 }
 
 fn wheel(delta: i16) {
@@ -668,6 +678,18 @@ unsafe extern "system" fn cmd_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
 unsafe extern "system" fn menu_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let scale = with(|s| s.scale).unwrap_or(1.0);
     match msg {
+        index::WM_FILES => {
+            // SAFETY: made by Box::into_raw in the index worker and posted once.
+            let b = unsafe { Box::from_raw(lp.0 as *mut index::Batch) };
+            search::files(*b);
+            return LRESULT(0);
+        }
+        WM_SETTINGS => {
+            // SAFETY: made by Box::into_raw in the settings loader and posted once.
+            let b = unsafe { Box::from_raw(lp.0 as *mut Vec<crate::sources::Setting>) };
+            search::settings_loaded(*b);
+            return LRESULT(0);
+        }
         WM_LOADED => {
             // SAFETY: the pointer was made by Box::into_raw in the loader and is posted once.
             let l = unsafe { Box::from_raw(lp.0 as *mut Loaded) };
@@ -684,7 +706,7 @@ unsafe extern "system" fn menu_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             return LRESULT(0);
         }
         WM_CHAR => {
-            ch(wp.0 as u32);
+            search::ch(wp.0 as u32);
             return LRESULT(0);
         }
         WM_MOUSEMOVE => {
