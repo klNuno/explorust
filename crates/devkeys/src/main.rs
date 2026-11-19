@@ -3,7 +3,9 @@
 //!
 //! `keys lwin+tab wait:2 esc`: each argument is a chord of `+`-joined key names, or `wait:<s>`.
 //! Names: ctrl alt shift lwin tab esc enter space left right up down f1..f24 a..z 0..9 period,
-//! or `vk<hex>`. The result goes to `keys.log` beside the exe.
+//! or `vk<hex>`. `down:<name>` and `up:<name>` press or release one key alone (hold Alt across a
+//! few Tabs), `type:<text>` types text as Unicode characters. The result goes to `keys.log` beside
+//! the exe.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -17,6 +19,17 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs_f32(s.parse().unwrap_or(1.0)));
                 format!("{arg}: ok")
             }
+            None if arg.starts_with("down:") || arg.starts_with("up:") => {
+                let (up, name) = arg.split_once(':').map(|(a, b)| (a == "up", b)).unwrap_or((false, ""));
+                match win::one(name, up) {
+                    Ok(()) => format!("{arg}: ok"),
+                    Err(e) => format!("{arg}: {e}"),
+                }
+            }
+            None if arg.starts_with("type:") => match win::text(&arg[5..]) {
+                Ok(n) => format!("type: sent {n} events, foreground {}", win::foreground()),
+                Err(e) => format!("{arg}: {e}"),
+            },
             None => match win::chord(&arg) {
                 Ok(n) => format!("{arg}: sent {n} events, foreground {}", win::foreground()),
                 Err(e) => format!("{arg}: {e}"),
@@ -38,6 +51,7 @@ fn main() {}
 mod win {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+        KEYEVENTF_UNICODE,
         SendInput, VIRTUAL_KEY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow};
@@ -105,6 +119,35 @@ mod win {
         // SAFETY: a slice of initialized INPUT structs and their size.
         let n = unsafe { SendInput(&seq, size_of::<INPUT>() as i32) };
         if n as usize == seq.len() { Ok(n) } else { Err(format!("SendInput sent {n} of {}", seq.len())) }
+    }
+
+    /// Presses or releases one key.
+    pub fn one(name: &str, up: bool) -> Result<(), String> {
+        let k = vk(name)?;
+        // SAFETY: one initialized INPUT and its size.
+        let n = unsafe { SendInput(&[input(k, up)], size_of::<INPUT>() as i32) };
+        if n == 1 { Ok(()) } else { Err("SendInput refused".into()) }
+    }
+
+    /// Types `text` as Unicode characters, one down and up per UTF-16 unit, 40 ms apart.
+    pub fn text(text: &str) -> Result<u32, String> {
+        let mut sent = 0;
+        for u in text.encode_utf16() {
+            let ev = |up: bool| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wScan: u,
+                        dwFlags: if up { KEYEVENTF_UNICODE | KEYEVENTF_KEYUP } else { KEYEVENTF_UNICODE },
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: two initialized INPUT structs and their size.
+            sent += unsafe { SendInput(&[ev(false), ev(true)], size_of::<INPUT>() as i32) };
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        Ok(sent)
     }
 
     pub fn foreground() -> String {

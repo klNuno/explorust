@@ -25,9 +25,23 @@ pub fn log_panics() {
     }));
 }
 
+/// Parts left out of this run: one name per line in `%LOCALAPPDATA%\explorust\parts-off.txt`, so
+/// a part's dev exe can stand in for it in a test, or a broken part can be set aside.
+fn parts_off() -> Vec<String> {
+    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    std::fs::read_to_string(base.join("explorust").join("parts-off.txt"))
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
 pub fn spawn_all() {
+    let off = parts_off();
     for (owner, run) in PARTS {
         let name = owner.name();
+        if off.iter().any(|o| o == name) {
+            log::line(&format!("{name}: off (parts-off.txt)"));
+            continue;
+        }
         let spawned = std::thread::Builder::new().name(name.into()).spawn(move || supervise(name, run));
         if let Err(e) = spawned {
             log::line(&format!("{name}: thread not started: {e}"));
