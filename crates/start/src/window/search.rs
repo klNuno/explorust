@@ -54,6 +54,7 @@ pub fn settings_loaded(v: Vec<Setting>) {
     with(|s| {
         s.settings_index = v.iter().map(|x| search::Entry::new(&x.name, &x.keywords)).collect();
         s.settings = v;
+        s.warm();
     });
 }
 

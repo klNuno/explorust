@@ -336,10 +336,17 @@ fn hide(restore: bool, why: &str) {
     };
     let hwnd = menu_hwnd();
     cloak(hwnd, true);
-    // SAFETY: hands the foreground back to the window that had it, when we still hold it.
+    // SAFETY: hands the foreground back to the window that had it, when we still hold it. On a
+    // helper thread: in g1 the call never returned for a UWP frame (ApplicationFrameWindow) and
+    // hung Start's UI thread.
     unsafe {
         if restore && GetForegroundWindow() == hwnd && !prev.is_invalid() && prev != hwnd && IsWindow(Some(prev)).as_bool() {
-            let _ = SetForegroundWindow(prev);
+            let p = prev.0 as isize;
+            let _ = std::thread::Builder::new().name("start-restore".into()).spawn(move || {
+                let t = Instant::now();
+                let ok = SetForegroundWindow(HWND(p as _)).as_bool();
+                log::line(&format!("hide: foreground back to {} {ok} in {} ms", describe_window(HWND(p as _)), t.elapsed().as_millis()));
+            });
         }
     }
     log::line(&format!("hide: {why}"));
