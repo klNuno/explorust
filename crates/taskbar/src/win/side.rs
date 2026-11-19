@@ -18,7 +18,7 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_LWIN,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetCursorPos, GetWindowRect, KillTimer, SetForegroundWindow, SetTimer, ShowWindow, SW_SHOW};
+use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetCursorPos, GetWindowRect, GetWindowThreadProcessId, KillTimer, SetForegroundWindow, SetTimer, ShowWindow, SW_SHOW};
 
 pub const TIMER_TIP: usize = 3;
 const TIP_DELAY_MS: u32 = 500;
@@ -392,6 +392,17 @@ impl Side {
     }
 }
 
+/// Shell hosts whose full-monitor surfaces (search, Start, the touch keyboard) are part of the
+/// shell, not a fullscreen app, as explorer treats them.
+const SHELL_HOSTS: [&str; 6] = [
+    "searchhost.exe",
+    "startmenuexperiencehost.exe",
+    "shellexperiencehost.exe",
+    "shellhost.exe",
+    "textinputhost.exe",
+    "lockapp.exe",
+];
+
 fn is_fullscreen(fg: HWND, monitor: RECT, bar: HWND) -> bool {
     if fg.is_invalid() || fg == bar {
         return false;
@@ -405,7 +416,23 @@ fn is_fullscreen(fg: HWND, monitor: RECT, bar: HWND) -> bool {
     }
     let mut r = RECT::default();
     let _ = unsafe { GetWindowRect(fg, &mut r) };
-    to_rect(r).covers(&to_rect(monitor))
+    if !to_rect(r).covers(&to_rect(monitor)) {
+        return false;
+    }
+    let mut pid = 0u32;
+    // SAFETY: reads the owner process id of a window.
+    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
+    // Start, Task View, the desktop and Files are explorust's own windows: never an app.
+    if pid == std::process::id() {
+        return false;
+    }
+    let exe = shelldata::items::process_path(pid).unwrap_or_default();
+    let file = exe.rsplit(['\\', '/']).next().unwrap_or(&exe).to_lowercase();
+    if SHELL_HOSTS.contains(&file.as_str()) {
+        return false;
+    }
+    log::line(&format!("fullscreen window {:#x} {class} {file}", fg.0 as usize));
+    true
 }
 
 /// Opens Windows' quick settings: the notify part when it answers the bus, else Win+A, which

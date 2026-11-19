@@ -5,7 +5,8 @@
 //! Names: ctrl alt shift lwin tab esc enter space left right up down f1..f24 a..z 0..9 period,
 //! or `vk<hex>`. `down:<name>` and `up:<name>` press or release one key alone (hold Alt across a
 //! few Tabs), `type:<text>` types text as Unicode characters. The result goes to `keys.log` beside
-//! the exe.
+//! the exe. `--keep-front` first leaves the foreground console as it is (by default keys.exe
+//! minimizes it): the uiAccess test needs the elevated window in front while the keys go out.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -13,7 +14,15 @@
 fn main() {
     use std::io::Write;
     let mut out = Vec::new();
-    for arg in std::env::args().skip(1) {
+    // The elevated console of `os win run --desktop` is often in front, and a medium-integrity
+    // hook (explorust's) sees no key while an elevated window has the foreground: minimize it.
+    let keep_front = std::env::args().nth(1).as_deref() == Some("--keep-front");
+    if keep_front {
+        out.push(format!("--keep-front: foreground {}", win::foreground()));
+    } else if let Some(c) = win::minimize_console() {
+        out.push(format!("console {c} minimized, foreground {}", win::foreground()));
+    }
+    for arg in std::env::args().skip(if keep_front { 2 } else { 1 }) {
         let line = match arg.strip_prefix("wait:") {
             Some(s) => {
                 std::thread::sleep(std::time::Duration::from_secs_f32(s.parse().unwrap_or(1.0)));
@@ -148,6 +157,23 @@ mod win {
             std::thread::sleep(std::time::Duration::from_millis(40));
         }
         Ok(sent)
+    }
+
+    /// Minimizes the foreground window when it is a console, and returns its handle.
+    pub fn minimize_console() -> Option<String> {
+        use windows::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, ShowWindow};
+        // SAFETY: plain queries and a ShowWindow on a window this process may minimize.
+        unsafe {
+            let h = GetForegroundWindow();
+            let mut buf = [0u16; 64];
+            let n = GetClassNameW(h, &mut buf) as usize;
+            if String::from_utf16_lossy(&buf[..n]) != "ConsoleWindowClass" {
+                return None;
+            }
+            let _ = ShowWindow(h, SW_MINIMIZE);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Some(format!("{:?}", h.0))
+        }
     }
 
     pub fn foreground() -> String {
