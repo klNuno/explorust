@@ -25,6 +25,8 @@ const EVENT_OBJECT_SHOW: u32 = 0x8002;
 const WINEVENT_OUTOFCONTEXT: u32 = 0;
 const WINEVENT_SKIPOWNPROCESS: u32 = 2;
 const RETRY_TIMER: usize = 1;
+/// Re-applies file dialog captions for a second after their show (`dark::recaption`).
+const CAPTION_TIMER: usize = 2;
 /// bus::MSG_COMMAND with wParam = bus::Command::Shutdown (15): the shell's way to close a part.
 const BUS_COMMAND: u32 = 0x8000 + 0x100;
 const BUS_SHUTDOWN: usize = 15;
@@ -51,6 +53,8 @@ struct State {
     created: HashSet<isize>,
     /// Settings CoreWindows not yet inside their frame: retried on a timer.
     retry: Vec<(isize, u8)>,
+    /// File dialogs whose caption is checked again: (window, ticks left).
+    captions: Vec<(isize, u8)>,
     hwnd: HWND,
 }
 
@@ -110,6 +114,7 @@ pub fn run() {
             pending: HashMap::new(),
             created: HashSet::new(),
             retry: Vec::new(),
+            captions: Vec::new(),
             hwnd,
         };
         STATE.with(|s| *s.borrow_mut() = Some(state));
@@ -148,6 +153,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         match msg {
             WM_TIMER if wp.0 == RETRY_TIMER => {
                 retry();
+                true
+            }
+            WM_TIMER if wp.0 == CAPTION_TIMER => {
+                recaptions();
                 true
             }
             BUS_COMMAND if wp.0 == BUS_SHUTDOWN => {
@@ -298,6 +307,14 @@ fn consider(hwnd: HWND) {
                 "{} file dialog {:#x}: frame from outside hr={:#010x}, hooked {}",
                 target::exe_name(&h.exe), hwnd.0 as usize, hr.0, if early { "at creation" } else { "at show" }
             ));
+            STATE.with(|s| {
+                if let Some(st) = s.borrow_mut().as_mut() {
+                    st.captions.retain(|(w, _)| *w != hwnd.0 as isize);
+                    st.captions.push((hwnd.0 as isize, 4));
+                    // SAFETY: our own window.
+                    unsafe { SetTimer(Some(st.hwnd), CAPTION_TIMER, 250, None) };
+                }
+            });
             if early {
                 // The DLL styled it at WM_SHOWWINDOW already, or does now (it ignores a repeat).
                 request(hwnd, kind);
@@ -306,6 +323,32 @@ fn consider(hwnd: HWND) {
             }
         }
         Kind::Settings => settings(hwnd, t0, 0),
+    }
+}
+
+/// One tick of the caption checks: each file dialog gets its dark caption back if its host reset
+/// it, four times 250 ms apart; the timer stops with the list.
+fn recaptions() {
+    let due = STATE.with(|s| {
+        let mut b = s.borrow_mut();
+        let Some(st) = b.as_mut() else { return Vec::new() };
+        let due: Vec<isize> = st.captions.iter().map(|(w, _)| *w).collect();
+        st.captions.retain_mut(|(_, left)| {
+            *left -= 1;
+            *left > 0
+        });
+        if st.captions.is_empty() {
+            // SAFETY: our own window and timer.
+            unsafe { let _ = KillTimer(Some(st.hwnd), CAPTION_TIMER); }
+        }
+        due
+    });
+    for w in due {
+        let hwnd = HWND(w as _);
+        // SAFETY: plain query; the handle may be gone.
+        if unsafe { IsWindow(Some(hwnd)) }.as_bool() && !dark::recaption(hwnd, DWMSBT_MAINWINDOW) {
+            log::line(&format!("file dialog {w:#x}: caption still light after a reset"));
+        }
     }
 }
 

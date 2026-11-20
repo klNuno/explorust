@@ -54,6 +54,25 @@ pub fn allow_dark_window(hwnd: HWND) {
     }
 }
 
+/// The caption again, then a non-client repaint: a light-mode host (Notepad) sets its file dialog's
+/// caption back to light after it shows, or DWM keeps the light caption it drew, so the loader
+/// repeats this for a second after the show.
+/// Returns whether the caption attribute reads dark afterwards.
+pub fn recaption(hwnd: HWND, backdrop: DWM_SYSTEMBACKDROP_TYPE) -> bool {
+    use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    };
+    let mut now: i32 = 0;
+    let _ = frame(hwnd, backdrop);
+    // SAFETY: a frame-changed notice with no move, size, z-order or activation change.
+    unsafe {
+        let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
+        let _ = DwmGetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &mut now as *mut _ as _, 4);
+    }
+    now != 0
+}
+
 /// Dark caption and the given backdrop on a frame. Returns the backdrop call's result, so the
 /// loader can tell whether DWM takes it from another process.
 pub fn frame(hwnd: HWND, backdrop: DWM_SYSTEMBACKDROP_TYPE) -> HRESULT {
