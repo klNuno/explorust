@@ -184,7 +184,7 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
     }
     if WIN.load(Relaxed) {
         WIN_USED.store(true, Relaxed);
-        let (cmd, arg) = win_chord(vk, CTRL.load(Relaxed), SHIFT.load(Relaxed))?;
+        let (cmd, arg) = win_chord(vk, CTRL.load(Relaxed), SHIFT.load(Relaxed), alt || ALT.load(Relaxed))?;
         let handled = post(cmd, arg);
         if handled {
             WIN_ANSWERED.store(true, Relaxed);

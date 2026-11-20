@@ -25,9 +25,14 @@ pub const VK_LALT: u32 = 0xA4;
 pub const VK_RALT: u32 = 0xA5;
 
 /// The command a key sends while Win is held, with its argument. Shell actions (Win+R, Win+I and
-/// the like) go to explorust's own window as `Command::ShellAction`.
-pub fn win_chord(vk: u32, ctrl: bool, shift: bool) -> Option<(Command, isize)> {
+/// the like) go to explorust's own window as `Command::ShellAction`. Win+Alt chords are Windows'
+/// own (Game Bar, HDR, mic mute) except Win+Alt+D, the clock's flyout, which is the notification
+/// center with its calendar on Windows 11.
+pub fn win_chord(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<(Command, isize)> {
     let action = |a: ShellAction| (Command::ShellAction, a as isize);
+    if alt {
+        return (vk == 0x44 && !ctrl && !shift).then_some((Command::NotificationCenter, 0));
+    }
     if ctrl {
         return Some(match vk {
             0x44 => (Command::DesktopNew, 0),     // Ctrl+Win+D
@@ -92,12 +97,12 @@ mod tests {
 
     #[test]
     fn shell_actions_go_to_the_shell() {
-        assert_eq!(win_chord(0x52, false, false), Some((Command::ShellAction, ShellAction::RunDialog as isize)));
-        assert_eq!(win_chord(0x49, false, false), Some((Command::ShellAction, ShellAction::Settings as isize)));
-        assert_eq!(win_chord(0x53, false, true), Some((Command::ShellAction, ShellAction::ScreenClip as isize)));
+        assert_eq!(win_chord(0x52, false, false, false), Some((Command::ShellAction, ShellAction::RunDialog as isize)));
+        assert_eq!(win_chord(0x49, false, false, false), Some((Command::ShellAction, ShellAction::Settings as isize)));
+        assert_eq!(win_chord(0x53, false, true, false), Some((Command::ShellAction, ShellAction::ScreenClip as isize)));
         for vk in 0..=0xFF {
             for (ctrl, shift) in [(false, false), (true, false), (false, true)] {
-                if let Some((Command::ShellAction, a)) = win_chord(vk, ctrl, shift) {
+                if let Some((Command::ShellAction, a)) = win_chord(vk, ctrl, shift, false) {
                     assert!(ShellAction::from_isize(a).is_some(), "Win+{vk:#x} sends an unknown action {a}");
                 }
             }
@@ -106,12 +111,15 @@ mod tests {
 
     #[test]
     fn chords() {
-        assert_eq!(win_chord(0x53, false, false), Some((Command::Search, 0)));
-        assert_eq!(win_chord(0x45, false, false), Some((Command::FilesOpen, 0)));
-        assert_eq!(win_chord(0x35, false, false), Some((Command::TaskbarNth, 5)));
-        assert_eq!(win_chord(VK_LEFT, true, false), Some((Command::DesktopSwitch, -1)));
-        assert_eq!(win_chord(0x41, false, false), None, "Win+A stays with Windows");
-        assert_eq!(win_chord(0x45, false, true), None);
+        assert_eq!(win_chord(0x53, false, false, false), Some((Command::Search, 0)));
+        assert_eq!(win_chord(0x45, false, false, false), Some((Command::FilesOpen, 0)));
+        assert_eq!(win_chord(0x35, false, false, false), Some((Command::TaskbarNth, 5)));
+        assert_eq!(win_chord(VK_LEFT, true, false, false), Some((Command::DesktopSwitch, -1)));
+        assert_eq!(win_chord(0x41, false, false, false), None, "Win+A stays with Windows");
+        assert_eq!(win_chord(0x45, false, true, false), None);
+        assert_eq!(win_chord(0x44, false, false, true), Some((Command::NotificationCenter, 0)), "Win+Alt+D is the clock flyout");
+        assert_eq!(win_chord(0x44, false, false, false), Some((Command::ShowDesktop, 0)));
+        assert_eq!(win_chord(0x42, false, false, true), None, "Win+Alt+B stays with Windows");
         assert_eq!(switcher_key(VK_DELETE), Some((Command::SwitcherClose, 0)));
         assert_eq!(switcher_key(0x41), None);
     }
