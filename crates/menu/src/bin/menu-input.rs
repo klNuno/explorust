@@ -2,8 +2,13 @@
 //! window, so no console comes in front between the right-click and the keys (the menu closes when
 //! it loses the foreground). Each argument: `rclick|click|move:<x>,<y>` (screen pixels),
 //! `key:<chord>` (`+`-joined: ctrl alt shift esc enter space tab home end up down left right apps
-//! delete f1..f12 a..z 0..9 or vk<hex>), `type:<text>`, `down:<key>`, `up:<key>`, `wait:<s>`.
-//! Results go to `menu-input.log` beside the exe.
+//! delete f1..f12 a..z 0..9 or vk<hex>), `type:<text>`, `down:<key>`, `up:<key>`, `wait:<s>`,
+//! `shot:<file.bmp>` (the screen through GDI), `run:<exe>|<arg>|...` (started, not waited for),
+//! `ensure:<window class>:<chord>` (the chord pressed up to three times until the foreground
+//! window has that class), `close:<title part>` (WM_CLOSE to the visible top-level windows whose
+//! title contains it), `note:<text>`. `@<file>` reads one step per line from a file (`#` lines
+//! skipped), so one `os win run --desktop` call (about a minute each in g1) runs a whole session.
+//! Results go to `menu-input.log` beside the exe, one timestamped line per step, `done` last.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -16,8 +21,25 @@ fn main() {
     use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
     // SAFETY: process-wide DPI mode of this test tool before reading coordinates.
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    let mut out = vec![format!("consoles minimized: {}", win::minimize_consoles())];
+    let path = std::env::current_exe().unwrap_or_default().with_file_name("menu-input.log");
+    let t0 = std::time::Instant::now();
+    let log = |line: String| {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{:8.3} {line}\r", t0.elapsed().as_secs_f64());
+        }
+    };
+    log(format!("consoles minimized: {}", win::minimize_consoles()));
+    let mut steps = Vec::new();
     for arg in std::env::args().skip(1) {
+        match arg.strip_prefix('@') {
+            Some(file) => match std::fs::read_to_string(file) {
+                Ok(text) => steps.extend(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from)),
+                Err(e) => log(format!("{arg}: {e}")),
+            },
+            None => steps.push(arg),
+        }
+    }
+    for arg in steps {
         let (op, rest) = arg.split_once(':').unwrap_or((arg.as_str(), ""));
         let r = match op {
             "wait" => {
@@ -28,15 +50,34 @@ fn main() {
             "key" => win::chord(rest),
             "down" | "up" => win::key(rest, op == "up"),
             "type" => win::text(rest),
+            "shot" => win::shot(rest),
+            "note" => Ok(()),
+            "close" => win::close(rest),
+            "run" => {
+                let mut parts = rest.split('|');
+                let exe = parts.next().unwrap_or_default();
+                std::process::Command::new(exe).args(parts).spawn().map(|_| ()).map_err(|e| format!("{exe}: {e}"))
+            }
+            "ensure" => match rest.split_once(':') {
+                Some((class, chord)) => {
+                    let mut r = Ok(());
+                    for _ in 0..3 {
+                        if win::foreground() == class {
+                            break;
+                        }
+                        r = win::chord(chord);
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                    }
+                    if r.is_ok() && win::foreground() != class { Err(format!("foreground is not {class}")) } else { r }
+                }
+                None => Err("want class:chord".into()),
+            },
             _ => Err(format!("unknown step {arg}")),
         };
-        out.push(format!("{arg}: {} (foreground {})", r.err().unwrap_or_else(|| "ok".into()), win::foreground()));
+        log(format!("{arg}: {} (foreground {})", r.err().unwrap_or_else(|| "ok".into()), win::foreground()));
         std::thread::sleep(std::time::Duration::from_millis(120));
     }
-    let path = std::env::current_exe().unwrap_or_default().with_file_name("menu-input.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{}", out.join("\r\n"));
-    }
+    log("done".into());
 }
 
 #[cfg(target_os = "windows")]
@@ -154,6 +195,77 @@ mod win {
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
         n
+    }
+
+    /// The screen as DWM composes it, saved as a 32-bit bottom-up BMP.
+    pub fn shot(file: &str) -> Result<(), String> {
+        use windows::Win32::Graphics::Gdi::*;
+        // SAFETY: GDI objects made, used and released here; the buffer outlives GetDIBits.
+        unsafe {
+            let (w, h) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(mem, bmp.into());
+            let ok = BitBlt(mem, 0, 0, w, h, Some(screen), 0, 0, SRCCOPY | CAPTUREBLT);
+            SelectObject(mem, old);
+            let mut info = BITMAPINFO::default();
+            info.bmiHeader = BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            };
+            let mut px = vec![0u8; (w * h * 4) as usize];
+            let lines = GetDIBits(mem, bmp, 0, h as u32, Some(px.as_mut_ptr() as _), &mut info, DIB_RGB_COLORS);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            ok.map_err(|e| format!("BitBlt: {e}"))?;
+            if lines != h {
+                return Err(format!("GetDIBits gave {lines} of {h} lines"));
+            }
+            let mut out = Vec::with_capacity(54 + px.len());
+            out.extend_from_slice(b"BM");
+            out.extend_from_slice(&((54 + px.len()) as u32).to_le_bytes());
+            out.extend_from_slice(&[0u8; 4]);
+            out.extend_from_slice(&54u32.to_le_bytes());
+            out.extend_from_slice(&40u32.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&32u16.to_le_bytes());
+            out.extend_from_slice(&[0u8; 24]);
+            out.extend_from_slice(&px);
+            std::fs::write(file, out).map_err(|e| format!("{file}: {e}"))
+        }
+    }
+
+    unsafe extern "system" fn closer(h: HWND, lp: LPARAM) -> BOOL {
+        // SAFETY: the caller's (part, count) pair outlives EnumWindows.
+        unsafe {
+            let (part, n) = &mut *(lp.0 as *mut (&str, u32));
+            let mut b = [0u16; 256];
+            let len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(h, &mut b) as usize;
+            if IsWindowVisible(h).as_bool() && String::from_utf16_lossy(&b[..len]).contains(*part) {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(h), windows::Win32::UI::WindowsAndMessaging::WM_CLOSE, Default::default(), LPARAM(0));
+                *n += 1;
+            }
+        }
+        true.into()
+    }
+
+    /// Closes the visible top-level windows whose title contains `part`.
+    pub fn close(part: &str) -> Result<(), String> {
+        let mut st = (part, 0u32);
+        // SAFETY: enumerates top-level windows with state that outlives the call.
+        unsafe {
+            let _ = EnumWindows(Some(closer), LPARAM(&mut st as *mut _ as isize));
+        }
+        if st.1 > 0 { Ok(()) } else { Err(format!("no window titled *{part}*")) }
     }
 
     pub fn foreground() -> String {
