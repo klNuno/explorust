@@ -12,13 +12,13 @@ use crate::{apps, log, power};
 use std::cell::RefCell;
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmFlush, DwmGetCompositionTimingInfo};
+use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{SHOpenFolderAndSelectItems, SHParseDisplayName};
-use windows::Win32::UI::WindowsAndMessaging::{GetMessageTime, PostMessageW};
+use windows::Win32::UI::WindowsAndMessaging::{GetMessageTime, MSG, PM_REMOVE, PeekMessageW, PostMessageW};
 use windows_core::HSTRING;
 
 thread_local! {
@@ -26,6 +26,8 @@ thread_local! {
     static MFT: RefCell<Option<Mft>> = const { RefCell::new(None) };
     /// When the key of the current query was handled, for the file batches' timing.
     static KEY_AT: RefCell<Option<Instant>> = const { RefCell::new(None) };
+    /// The generation whose first MFT rows were timed, and the key to rows on screen times.
+    static MFT_TIMED: RefCell<(u64, Vec<f32>)> = const { RefCell::new((0, Vec::new())) };
 }
 
 const CALCULATOR: &str = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
@@ -104,6 +106,51 @@ fn next_vblank(at: i64) -> Option<(i64, i64)> {
     Some((v, period))
 }
 
+/// How long a key waits for explorust-index's rows before its frame is drawn without them: the
+/// pipe answers in 1 to 8 ms while apps rank, so most keys show their files in their own frame.
+const MFT_WAIT_MS: f32 = 6.0;
+
+fn to_entries(s: &crate::scene::Start, hits: Vec<crate::index::FileHit>) -> Vec<crate::scene::FileEntry> {
+    hits.into_iter()
+        .map(|h| crate::scene::FileEntry {
+            icon: h.icon.as_ref().and_then(|i| s.bitmap(i)),
+            name: h.name,
+            path: h.path,
+            type_text: h.type_text,
+            folder: h.folder,
+            rank: h.rank,
+        })
+        .collect()
+}
+
+/// Waits up to `MFT_WAIT_MS` after `t0` for the MFT rows of `generation` and adds them; other file
+/// batches that come meanwhile are handled as usual. True when the rows came.
+fn wait_mft_rows(hwnd: HWND, generation: u64, t0: Instant) -> bool {
+    let up = MFT.with(|m| m.borrow().as_ref().is_some_and(Mft::up));
+    if !up {
+        return false;
+    }
+    let mut msg = MSG::default();
+    while t0.elapsed().as_secs_f32() * 1000.0 < MFT_WAIT_MS {
+        // SAFETY: takes only the file batches posted to this window; the box is made by `index::post`.
+        if unsafe { PeekMessageW(&mut msg, Some(hwnd), crate::index::WM_FILES, crate::index::WM_FILES, PM_REMOVE) }.as_bool() {
+            // SAFETY: made by Box::into_raw in a worker and posted once.
+            let b = *unsafe { Box::from_raw(msg.lParam.0 as *mut Batch) };
+            if b.source == "mft" && b.generation == generation {
+                return with(|s| {
+                    let e = to_entries(s, b.hits);
+                    s.add_files(generation, e, false)
+                })
+                .unwrap_or(false);
+            }
+            files(b);
+        } else {
+            std::thread::yield_now();
+        }
+    }
+    false
+}
+
 fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
     let mut freq = 0;
     // SAFETY: writes the frequency into a local.
@@ -113,18 +160,8 @@ fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
     // SAFETY: the time of the key message being handled and the tick now, both in ms.
     let queued = unsafe { (GetTickCount() as i32).wrapping_sub(GetMessageTime()) };
     let t0 = Instant::now();
-    let Some((generation, q, ranked, apps, settings, calc)) = with(|s| {
-        if !s.shown {
-            return None;
-        }
-        let q = edit(&s.query);
-        let generation = s.set_query(q.clone());
-        s.search_focus = true;
-        let ranked = t0.elapsed().as_secs_f32() * 1000.0;
-        let _ = s.draw();
-        Some((generation, q, ranked, s.found.apps.len(), s.found.settings.len(), s.found.calc.is_some()))
-    })
-    .flatten() else {
+    // The pipe query goes out first, so the service answers while apps and settings rank.
+    let Some((q, generation, hwnd)) = with(|s| s.shown.then(|| (edit(&s.query), s.found.generation + 1, s.hwnd))).flatten() else {
         return;
     };
     MFT.with(|i| {
@@ -138,58 +175,99 @@ fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
         }
     });
     KEY_AT.with(|k| *k.borrow_mut() = Some(t0));
+    let Some(ranked) = with(|s| {
+        let g = s.set_query(q.clone());
+        debug_assert_eq!(g, generation);
+        s.search_focus = true;
+        t0.elapsed().as_secs_f32() * 1000.0
+    }) else {
+        return;
+    };
+    let rows = !q.trim().is_empty() && wait_mft_rows(hwnd, generation, t0);
+    let waited = t0.elapsed().as_secs_f32() * 1000.0;
+    let Some((apps, settings, calc, files_n)) = with(|s| {
+        if let Err(e) = s.draw() {
+            log::line(&format!("search key: draw failed: {e}"));
+        }
+        (s.found.apps.len(), s.found.settings.len(), s.found.calc.is_some(), s.found.files.len())
+    }) else {
+        return;
+    };
     let qp = qpc();
     let present = ms(q0, qp);
     let vblank = next_vblank(qp);
-    // SAFETY: waits for the composition that shows the frame just presented.
-    let _ = unsafe { DwmFlush() };
-    let flushed = t0.elapsed().as_secs_f32() * 1000.0;
     let queued = queued.max(0) as f32;
-    let (frame, refresh) = vblank.map_or((flushed, 0.0), |(v, p)| (ms(q0, v), ms(0, p)));
+    let (frame, refresh) = vblank.map_or((present, 0.0), |(v, p)| (ms(q0, v), ms(0, p)));
     let total = queued + frame;
     log::line(&format!(
-        "search key {key} \"{q}\": queue {queued} ms, ranked {ranked:.2} ms, presented {present:.1} ms, shown at the vblank {frame:.1} ms (refresh {refresh:.1} ms), DwmFlush back {flushed:.1} ms, key to frame {total:.1} ms{}; apps {apps}, settings {settings}{}",
+        "search key {key} \"{q}\": queue {queued} ms, ranked {ranked:.2} ms, mft rows {}, presented {present:.1} ms, shown at the vblank {frame:.1} ms (refresh {refresh:.1} ms), key to frame {total:.1} ms{}; apps {apps}, settings {settings}, files {files_n}{}",
+        if rows { format!("in this frame at {waited:.1} ms") } else { format!("not in this frame (waited {waited:.1} ms)") },
         if total <= 16.0 { "" } else { " (over 16)" },
         if calc { ", calculator" } else { "" }
     ));
+    if rows {
+        mft_timed(generation, &q, total, files_n, "in the key's frame");
+    }
 }
 
-/// A batch of files from the index worker.
+/// Records the key to MFT rows on screen time of `generation` once, with p50 and p95 every 30 keys.
+fn mft_timed(generation: u64, q: &str, on_screen: f32, n: usize, how: &str) {
+    MFT_TIMED.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.0 == generation {
+            return;
+        }
+        m.0 = generation;
+        m.1.push(on_screen);
+        log::line(&format!("search mft rows \"{q}\": {n} file rows on screen {on_screen:.1} ms after the key, {how}{}", if on_screen <= 16.0 { "" } else { " (over 16)" }));
+        if m.1.len() % 30 == 0 {
+            let v = &m.1[m.1.len() - 30..];
+            log::line(&format!("search mft rows: last 30 keys, key to rows on screen p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms", percentile(v, 0.5), percentile(v, 0.95), percentile(v, 1.0)));
+        }
+    });
+}
+
+/// A batch of files from the index worker. The MFT rows come first with no icon (timed from the
+/// key to the vblank that shows them, p50 and p95 every 30 keys), their icons in a second batch.
 pub fn files(b: Batch) {
     let after = KEY_AT.with(|k| k.borrow().map(|t| t.elapsed().as_secs_f32() * 1000.0)).unwrap_or(0.0);
     let n = b.hits.len();
     let t = Instant::now();
+    let icons = b.source == crate::mft::ICONS;
     let shown = with(|s| {
-        let entries = b
-            .hits
-            .into_iter()
-            .map(|h| crate::scene::FileEntry {
-                icon: h.icon.as_ref().and_then(|i| s.bitmap(i)),
-                name: h.name,
-                path: h.path,
-                type_text: h.type_text,
-                folder: h.folder,
-                rank: h.rank,
-            })
-            .collect();
-        let ok = s.add_files(b.generation, entries, b.done);
+        let entries = to_entries(s, b.hits);
+        let ok = if icons { s.update_files(b.generation, entries) } else { s.add_files(b.generation, entries, b.done) };
         if ok {
-            let _ = s.draw();
+            if let Err(e) = s.draw() {
+                log::line(&format!("search files: draw failed: {e}"));
+            }
         }
-        ok.then(|| s.query.clone())
+        ok.then(|| (s.query.clone(), s.found.generation))
     })
     .flatten();
-    if let Some(q) = shown {
-        if n > 0 || b.done {
-            log::line(&format!(
-                "search files \"{q}\": +{n} from {}{} at {after:.1} ms after the key (source {:.1} ms), drawn in {:.1} ms",
-                b.source,
-                if b.done { ", done" } else { "" },
-                b.ms,
-                t.elapsed().as_secs_f32() * 1000.0
-            ));
-        }
+    let Some((q, generation)) = shown else { return };
+    let drawn = t.elapsed().as_secs_f32() * 1000.0;
+    if b.source == "mft" && n > 0 {
+        let mut freq = 0;
+        // SAFETY: writes the frequency into a local.
+        let _ = unsafe { QueryPerformanceFrequency(&mut freq) };
+        let now = qpc();
+        let wait = next_vblank(now).map_or(0.0, |(v, _)| (v - now) as f32 * 1000.0 / freq.max(1) as f32);
+        mft_timed(generation, &q, after + drawn + wait, n, &format!("a later frame (batch at {after:.1} ms, drawn {drawn:.1} ms)"));
+    } else if n > 0 || b.done {
+        log::line(&format!(
+            "search files \"{q}\": +{n} from {}{} at {after:.1} ms after the key (source {:.1} ms), drawn in {drawn:.1} ms",
+            b.source,
+            if b.done { ", done" } else { "" },
+            b.ms,
+        ));
     }
+}
+
+fn percentile(v: &[f32], p: f32) -> f32 {
+    let mut s = v.to_vec();
+    s.sort_by(f32::total_cmp);
+    s[((s.len() - 1) as f32 * p).round() as usize]
 }
 
 /// What the selected result and one of its actions point at.

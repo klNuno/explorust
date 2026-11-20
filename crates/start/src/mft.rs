@@ -6,6 +6,8 @@
 use crate::index::{Batch, FileHit, post};
 use crate::{apps, log, search};
 use fsindex::client::Client;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 use windows::Win32::Foundation::HWND;
@@ -15,19 +17,29 @@ use windows::Win32::UI::Shell::{IShellItemImageFactory, SHFILEINFOW, SHGFI_TYPEN
 use windows_core::HSTRING;
 
 const MAX: u16 = 24;
+/// The source of the second batch of a query: icons and type names for rows already shown.
+pub const ICONS: &str = "mft-icons";
 /// Rows that can show: five per group, folders and files.
 const WITH_ICONS: usize = 10;
 
 pub struct Mft {
     tx: Sender<(u64, String)>,
+    /// The service answered the last query: a key waits for its rows only then.
+    up: Arc<AtomicBool>,
 }
 
 impl Mft {
     pub fn start(hwnd: HWND, icon_px: i32) -> Mft {
         let (tx, rx) = channel();
         let target = hwnd.0 as isize;
-        let _ = std::thread::Builder::new().name("start-mft".into()).spawn(move || worker(rx, HWND(target as _), icon_px));
-        Mft { tx }
+        let up = Arc::new(AtomicBool::new(false));
+        let u = up.clone();
+        let _ = std::thread::Builder::new().name("start-mft".into()).spawn(move || worker(rx, HWND(target as _), icon_px, u));
+        Mft { tx, up }
+    }
+
+    pub fn up(&self) -> bool {
+        self.up.load(Ordering::Relaxed)
     }
 
     pub fn query(&self, generation: u64, query: &str) {
@@ -53,13 +65,14 @@ fn percentile(v: &[f32], p: f32) -> f32 {
     s[((s.len() - 1) as f32 * p).round() as usize]
 }
 
-fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32) {
+fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32, up: Arc<AtomicBool>) {
     // SAFETY: COM for this worker thread (shell items for icons), for its whole life.
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     let mut client = Client::default();
     let mut trips: Vec<f32> = Vec::new();
     let mut down = false;
-    while let Ok(mut job) = rx.recv() {
+    let mut next: Option<(u64, String)> = None;
+    while let Some(mut job) = next.take().or_else(|| rx.recv().ok()) {
         while let Ok(j) = rx.try_recv() {
             job = j;
         }
@@ -71,6 +84,7 @@ fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32) {
         let reply = match client.query(&q, MAX) {
             Ok(r) => r,
             Err(e) => {
+                up.store(false, Ordering::Relaxed);
                 if !down {
                     log::line(&format!("mft: explorust-index not reachable: {e}"));
                     down = true;
@@ -78,35 +92,54 @@ fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32) {
                 continue;
             }
         };
+        up.store(true, Ordering::Relaxed);
         if down {
             log::line("mft: explorust-index reachable");
             down = false;
         }
         let trip = t.elapsed().as_secs_f32() * 1000.0;
         let n = reply.hits.len();
+        // The rows go out at once with no icon; icons and type names follow in a second batch.
         let hits: Vec<FileHit> = reply
             .hits
+            .iter()
+            .map(|h| {
+                let name = h.path.rsplit('\\').next().unwrap_or(&h.path).to_string();
+                let rank = search::file_rank(&name, &q) + if h.noisy { 4 } else { 0 };
+                FileHit { type_text: String::new(), name, path: h.path.clone(), folder: h.folder, icon: None, rank }
+            })
+            .collect();
+        let ms = t.elapsed().as_secs_f32() * 1000.0;
+        let rows: Vec<(String, bool, u8)> = hits.iter().map(|h| (h.path.clone(), h.folder, h.rank)).collect();
+        post(hwnd, Batch { source: "mft", generation, hits, done: false, ms });
+        // A newer key drops the icons of this one.
+        if let Ok(j) = rx.try_recv() {
+            next = Some(j);
+            log::line(&format!("mft \"{q}\": {n} hits, service {:.2} ms, pipe round trip {trip:.2} ms, rows posted at {ms:.2} ms, icons skipped (newer key)", reply.micros as f32 / 1000.0));
+            trips.push(trip);
+            continue;
+        }
+        let icons: Vec<FileHit> = rows
             .into_iter()
             .enumerate()
-            .map(|(i, h)| {
-                let name = h.path.rsplit('\\').next().unwrap_or(&h.path).to_string();
+            .map(|(i, (path, folder, rank))| {
                 let icon = if i < WITH_ICONS {
                     // SAFETY: a shell item for a path the service just listed.
-                    unsafe { SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(&HSTRING::from(h.path.as_str()), None) }
+                    unsafe { SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(&HSTRING::from(path.as_str()), None) }
                         .ok()
                         .and_then(|f| apps::image(&f, icon_px))
                 } else {
                     None
                 };
-                let rank = search::file_rank(&name, &q) + if h.noisy { 4 } else { 0 };
-                FileHit { type_text: type_text(&h.path, h.folder), name, path: h.path, folder: h.folder, icon, rank }
+                let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+                FileHit { type_text: type_text(&path, folder), name, path, folder, icon, rank }
             })
             .collect();
-        let ms = t.elapsed().as_secs_f32() * 1000.0;
-        post(hwnd, Batch { source: "mft", generation, hits, done: false, ms });
+        let with_icons = t.elapsed().as_secs_f32() * 1000.0;
+        post(hwnd, Batch { source: ICONS, generation, hits: icons, done: false, ms: with_icons });
         trips.push(trip);
         log::line(&format!(
-            "mft \"{q}\": {n} hits, service {:.2} ms, pipe round trip {trip:.2} ms, with icons {ms:.1} ms ({} names)",
+            "mft \"{q}\": {n} hits, service {:.2} ms, pipe round trip {trip:.2} ms, rows posted at {ms:.2} ms, icons at {with_icons:.1} ms ({} names)",
             reply.micros as f32 / 1000.0,
             reply.names
         ));

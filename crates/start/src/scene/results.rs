@@ -136,6 +136,16 @@ impl Start {
             self.found.files.clear();
             self.found.files_stale = false;
         }
+        // A row shown first without an icon (explorust-index's first batch) takes the icon of the
+        // same path from the other source.
+        for e in &files {
+            if let Some(o) = self.found.files.iter_mut().find(|o| o.icon.is_none() && o.path.eq_ignore_ascii_case(&e.path)) {
+                o.icon = e.icon.clone();
+                if o.type_text.is_empty() {
+                    o.type_text = e.type_text.clone();
+                }
+            }
+        }
         self.found.files.extend(files);
         // The Windows index and explorust's own index answer the same query: one row per path.
         search::merge_files(&mut self.found.files, |f| f.path.as_str(), |f| f.rank, |f, r| f.rank = r);
@@ -143,6 +153,31 @@ impl Start {
         self.rebuild_rows(keep);
         self.dirty = true;
         true
+    }
+
+    /// Icons and type names for rows already shown (the second batch of a source); false when the
+    /// batch belongs to an older query or no row took anything.
+    pub fn update_files(&mut self, generation: u64, files: Vec<FileEntry>) -> bool {
+        if generation != self.found.generation || self.view != View::Search {
+            return false;
+        }
+        let mut changed = false;
+        for u in files {
+            if let Some(e) = self.found.files.iter_mut().find(|e| e.path.eq_ignore_ascii_case(&u.path)) {
+                if e.icon.is_none() && u.icon.is_some() {
+                    e.icon = u.icon;
+                    changed = true;
+                }
+                if e.type_text.is_empty() && !u.type_text.is_empty() {
+                    e.type_text = u.type_text;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.dirty = true;
+        }
+        changed
     }
 
     fn rebuild_rows(&mut self, keep: Option<search::Hit>) {
