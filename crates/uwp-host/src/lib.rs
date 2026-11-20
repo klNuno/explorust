@@ -4,6 +4,8 @@
 mod log;
 
 #[cfg(target_os = "windows")]
+mod appframe_band;
+#[cfg(target_os = "windows")]
 mod auto_present;
 #[cfg(target_os = "windows")]
 mod controller;
@@ -15,6 +17,8 @@ mod frame_service_direct;
 mod host;
 #[cfg(target_os = "windows")]
 mod presentation_callbacks;
+#[cfg(target_os = "windows")]
+mod shell_hook;
 #[cfg(target_os = "windows")]
 mod shell_window;
 #[cfg(target_os = "windows")]

@@ -365,6 +365,7 @@ fn run_host_with_parent(
         return ExitCode::FAILURE;
     }
     let mut presenter = auto_present::AutoPresent::new();
+    let mut shell_hook = crate::shell_hook::ShellHookBridge::new();
     let Some(shell_window) = ShellWindowGuard::register() else {
         readiness.failed("host-shell-window", "shell window registration failed");
         return ExitCode::FAILURE;
@@ -385,6 +386,17 @@ fn run_host_with_parent(
         }
     };
     hlog!("phase=host-band-redirect result=installed");
+    // explorust: optional, Win+V and Win+. need it; the shell runs without it.
+    let appframe_redirect = match crate::appframe_band::AppFrameBandRedirect::install() {
+        Ok(redirect) => {
+            hlog!("phase=host-appframe-redirect result=installed");
+            Some(redirect)
+        }
+        Err(error) => {
+            hlog!("phase=host-appframe-redirect error={error}");
+            None
+        }
+    };
     let skip_touch_keyboard = skip_touch_keyboard();
     let controller = match start_immersive_shell_controller(false, false, skip_touch_keyboard) {
         Ok(controller) => controller,
@@ -497,9 +509,9 @@ fn run_host_with_parent(
         }
     }
     #[cfg(feature = "diagnostics")]
-    let keep_alive = (broker, controller, redirect);
+    let keep_alive = (broker, controller, redirect, appframe_redirect);
     #[cfg(not(feature = "diagnostics"))]
-    let keep_alive = (broker, controller, redirect);
+    let keep_alive = (broker, controller, redirect, appframe_redirect);
     if pump_messages {
         // SAFETY: This thread owns the HWND and consumes its timer messages.
         if unsafe { SetTimer(Some(shell_window.window), 0x71, 250, None) } == 0 {
@@ -556,6 +568,7 @@ fn run_host_with_parent(
                     hlog!("phase=view-event-one-shot result=timeout");
                     break;
                 }
+                shell_hook.tick();
                 if auto_present {
                     presenter.tick();
                 }
