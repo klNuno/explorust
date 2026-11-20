@@ -1,12 +1,15 @@
 //! The service: dispatcher entry, control handler, and the install and uninstall that
 //! `explorust-guard --install` and `--restore` run.
 
-use crate::{log, server};
+use crate::{log, pipe, server};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
+use windows::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, HANDLE, NO_ERROR};
+use windows::Win32::UI::WindowsAndMessaging::{DBT_DEVTYP_DEVICEINTERFACE, DEV_BROADCAST_DEVICEINTERFACE_W, DEVICE_NOTIFY_SERVICE_HANDLE, RegisterDeviceNotificationW};
+use windows_core::GUID;
 use windows::Win32::System::Services::{
-    ChangeServiceConfigW, CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
+    ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, SC_ACTION, SC_ACTION_RESTART, SERVICE_ACCEPT_SESSIONCHANGE, SERVICE_CONFIG_FAILURE_ACTIONS,
+    SERVICE_CONTROL_DEVICEEVENT, SERVICE_CONTROL_SESSIONCHANGE, SERVICE_FAILURE_ACTIONSW, ControlService, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
     RegisterServiceCtrlHandlerExW, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
     SERVICE_AUTO_START, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_RUNNING,
     SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
@@ -21,15 +24,37 @@ fn report(state: SERVICE_STATUS_CURRENT_STATE) {
     let s = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: state,
-        dwControlsAccepted: if state == SERVICE_RUNNING { SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN } else { 0 },
+        dwControlsAccepted: if state == SERVICE_RUNNING { SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE } else { 0 },
         ..Default::default()
     };
     // SAFETY: the handle came from RegisterServiceCtrlHandlerExW.
     let _ = unsafe { SetServiceStatus(SERVICE_STATUS_HANDLE(h as _), &s) };
 }
 
-unsafe extern "system" fn handler(ctrl: u32, _: u32, _: *mut core::ffi::c_void, _: *mut core::ffi::c_void) -> u32 {
+/// GUID_DEVINTERFACE_VOLUME: volume arrivals reach the handler as device events.
+const VOLUME_INTERFACE: GUID = GUID::from_u128(0x53f5630d_b6bf_11d0_94f2_00a0c91efb8b);
+const DBT_DEVICEARRIVAL: u32 = 0x8000;
+
+unsafe extern "system" fn handler(ctrl: u32, event: u32, _: *mut core::ffi::c_void, _: *mut core::ffi::c_void) -> u32 {
     match ctrl {
+        SERVICE_CONTROL_SESSIONCHANGE => {
+            let _ = std::thread::Builder::new().name("index-session".into()).spawn(pipe::refresh);
+            NO_ERROR.0
+        }
+        SERVICE_CONTROL_DEVICEEVENT => {
+            if event == DBT_DEVICEARRIVAL {
+                // The letter comes a moment after the volume interface.
+                let _ = std::thread::Builder::new().name("index-arrival".into()).spawn(|| {
+                    for _ in 0..5 {
+                        std::thread::sleep(Duration::from_secs(2));
+                        if server::rescan() > 0 {
+                            break;
+                        }
+                    }
+                });
+            }
+            NO_ERROR.0
+        }
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
             log::line("service: stop");
             report(SERVICE_STOPPED);
@@ -52,6 +77,19 @@ unsafe extern "system" fn service_main(_: u32, _: *mut PWSTR) {
         }
     }
     log::line("service: started");
+    let filter = DEV_BROADCAST_DEVICEINTERFACE_W {
+        dbcc_size: size_of::<DEV_BROADCAST_DEVICEINTERFACE_W>() as u32,
+        dbcc_devicetype: DBT_DEVTYP_DEVICEINTERFACE.0,
+        dbcc_classguid: VOLUME_INTERFACE,
+        ..Default::default()
+    };
+    if let Some(&h) = STATUS.get() {
+        // SAFETY: the filter is a local the call copies; the status handle stands in for a window.
+        match unsafe { RegisterDeviceNotificationW(HANDLE(h as _), &filter as *const _ as *const core::ffi::c_void, DEVICE_NOTIFY_SERVICE_HANDLE) } {
+            Ok(_) => log::line("service: volume arrivals registered"),
+            Err(e) => log::line(&format!("service: RegisterDeviceNotificationW: {e}")),
+        }
+    }
     server::run(Some(&|| report(SERVICE_RUNNING)));
 }
 
@@ -125,6 +163,14 @@ pub fn install() -> u32 {
                     "created",
                 ),
             };
+            // Restart on a crash: after 1 s, 5 s, then 30 s; the count resets after a day.
+            let mut actions = [
+                SC_ACTION { Type: SC_ACTION_RESTART, Delay: 1000 },
+                SC_ACTION { Type: SC_ACTION_RESTART, Delay: 5000 },
+                SC_ACTION { Type: SC_ACTION_RESTART, Delay: 30000 },
+            ];
+            let fa = SERVICE_FAILURE_ACTIONSW { dwResetPeriod: 86400, lpRebootMsg: PWSTR::null(), lpCommand: PWSTR::null(), cActions: actions.len() as u32, lpsaActions: actions.as_mut_ptr() };
+            ChangeServiceConfig2W(svc.0, SERVICE_CONFIG_FAILURE_ACTIONS, Some(&fa as *const _ as *const core::ffi::c_void))?;
             StartServiceW(svc.0, None)?;
             Ok(what)
         })()

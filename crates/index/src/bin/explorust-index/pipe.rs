@@ -7,7 +7,7 @@ use fsindex::client::ACCESS;
 use fsindex::proto::{self, Reply};
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows::Win32::Security::{GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser};
@@ -35,7 +35,8 @@ fn token_sid(token: HANDLE) -> Option<String> {
     }
 }
 
-/// The SID of the user at the console, else (console mode, not a service) this process's user.
+/// The SID of the user at the console, else this process's user unless that is LocalSystem (the
+/// service before anyone logged on: None, so interactive users get in until the logon refresh).
 fn user_sid() -> Option<String> {
     // SAFETY: token queries; the tokens are closed.
     unsafe {
@@ -51,8 +52,24 @@ fn user_sid() -> Option<String> {
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut t).ok()?;
         let s = token_sid(t);
         let _ = CloseHandle(t);
-        s
+        s.filter(|s| s != "S-1-5-18")
     }
+}
+
+/// The SDDL of the instance waiting for a client.
+static PENDING: Mutex<String> = Mutex::new(String::new());
+
+/// Called when a user logs on (and on any session change): when the waiting instance's ACL names
+/// someone else, the service connects to it once itself, so the next instance is made with the
+/// new user's SID.
+pub fn refresh() {
+    let now = sddl();
+    let old = PENDING.lock().map(|p| p.clone()).unwrap_or_default();
+    if old.is_empty() || old == now {
+        return;
+    }
+    let r = std::fs::OpenOptions::new().read(true).write(true).open(fsindex::PIPE);
+    log::line(&format!("pipe: session change, ACL {old} -> {now}, waiting instance recycled: {}", if r.is_ok() { "yes".to_string() } else { format!("{:?}", r.err()) }));
 }
 
 fn sddl() -> String {
@@ -89,6 +106,9 @@ fn create(first: bool) -> Option<HANDLE> {
         }
         if first {
             log::line(&format!("pipe: {} listening, {text}", fsindex::PIPE));
+        }
+        if let Ok(mut p) = PENDING.lock() {
+            *p = text;
         }
         Some(h)
     }

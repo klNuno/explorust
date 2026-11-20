@@ -130,8 +130,9 @@ impl Volume {
             med.StartFileReferenceNumber = u64::from_le_bytes(buf[..8].try_into().unwrap_or_default());
             usn::parse(&buf[8..got], |r| apply(&mut t, &r));
         }
-        t.settle();
+        let pruned = t.settle();
         t.shrink();
+        log::line(&format!("{}: {pruned} names inside WinSxS left out", self.letter));
         Ok(t)
     }
 

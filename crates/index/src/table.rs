@@ -27,6 +27,11 @@ struct Slot {
 }
 
 const FREE: Slot = Slot { parent: 0, name: NONE };
+/// A record inside a pruned tree: no name kept, and its children are pruned too.
+const PRUNED: Slot = Slot { parent: NONE, name: NONE };
+/// Folders whose contents are left out of the table: the component store holds a large share of a
+/// Windows volume's names (long ones), none of them anything a user opens.
+const PRUNE_NAMES: [&str; 1] = ["winsxs"];
 /// In `meta`: the name's record or a folder of it is noisy; the other bits are the last USN of
 /// the file shifted right 16 bits (larger is more recent).
 const META_NOISY: u32 = 1 << 31;
@@ -44,6 +49,8 @@ pub struct Table {
     meta: Vec<u32>,
     live: usize,
     dead: usize,
+    /// Records of the folders named in PRUNE_NAMES (their contents are not kept).
+    prune_roots: Vec<u32>,
 }
 
 /// A match before its path is built.
@@ -145,6 +152,14 @@ impl Table {
         if r >= self.slots.len() {
             self.slots.resize(r + 1, FREE);
         }
+        if self.prune_roots.contains(&parent) || self.slots.get(parent as usize).is_some_and(|p| p.parent == NONE && p.name == NONE) {
+            self.remove(rec);
+            self.slots[r] = PRUNED;
+            return;
+        }
+        if dir && PRUNE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) && !self.prune_roots.contains(&rec) {
+            self.prune_roots.push(rec);
+        }
         let usn = ((usn.max(0) as u64) >> 16).min((META_NOISY - 1) as u64) as u32;
         let noisy = attrs_noisy || name.starts_with('$') || NOISY_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name));
         let under = noisy || self.slots.get(parent as usize).is_some_and(|p| p.name != NONE && p.name & UNDER != 0);
@@ -226,8 +241,24 @@ impl Table {
         (self.case, self.fold, self.starts, self.recs, self.meta, self.dead) = (case, fold, starts, recs, meta, 0);
     }
 
-    /// Sets the inherited noisy bit of every record from its folders (after the MFT load).
-    pub fn settle(&mut self) {
+    /// Sets the inherited noisy bit of every record from its folders and drops the names inside
+    /// pruned folders (after the MFT load); returns how many names were dropped.
+    pub fn settle(&mut self) -> usize {
+        let mut pruned = 0;
+        if !self.prune_roots.is_empty() {
+            for r in 0..self.slots.len() as u32 {
+                if self.slots[r as usize].name != NONE && self.walk_pruned(r) {
+                    self.recs[(self.slots[r as usize].name & IDX) as usize] = NONE;
+                    self.slots[r as usize] = PRUNED;
+                    self.dead += 1;
+                    self.live -= 1;
+                    pruned += 1;
+                }
+            }
+            if pruned > 0 {
+                self.compact();
+            }
+        }
         for r in 0..self.slots.len() as u32 {
             if self.slots[r as usize].name == NONE {
                 continue;
@@ -238,6 +269,24 @@ impl Table {
             let m = &mut self.meta[(s.name & IDX) as usize];
             *m = if u { *m | META_NOISY } else { *m & !META_NOISY };
         }
+        pruned
+    }
+
+    /// True when a folder above the record is a prune root.
+    fn walk_pruned(&self, rec: u32) -> bool {
+        let mut r = rec;
+        for _ in 0..64 {
+            let Some(s) = self.slots.get(r as usize) else { return false };
+            if s.name == NONE || r == ROOT || s.parent == r {
+                return false;
+            }
+            let p = self.slots.get(s.parent as usize).copied().unwrap_or(FREE);
+            if self.prune_roots.contains(&s.parent) || (p.parent == NONE && p.name == NONE) {
+                return true;
+            }
+            r = s.parent;
+        }
+        false
     }
 
     /// True when the record or one of its folders is noisy, by walking up.
@@ -432,6 +481,30 @@ mod tests {
         assert_eq!(t.path(37, "C:\\").as_deref(), Some("C:\\Users\\agent\\Documents\\unfinalized.md"));
         assert_eq!(t.name(36).as_deref(), Some("final cache.bin"));
         assert_eq!(t.name(32).as_deref(), Some("Documents"));
+    }
+
+    #[test]
+    fn winsxs_contents_pruned() {
+        let mut t = sample();
+        t.upsert(40, ROOT, "Windows", true, false, 1);
+        // MFT order: a child can come before its folders.
+        t.upsert(43, 42, "final.manifest", false, false, 1);
+        t.upsert(42, 41, "amd64_final_31bf3856ad364e35", true, false, 1);
+        t.upsert(41, 40, "WinSxS", true, false, 1);
+        let before = t.len() - 2;
+        assert_eq!(t.settle(), 2);
+        assert_eq!(t.len(), before);
+        assert!(t.name(41).is_some(), "the folder itself stays");
+        assert!(t.query("amd64", 5).is_empty());
+        // Journal changes inside the pruned tree stay out.
+        t.upsert(44, 42, "final2.manifest", false, false, 2);
+        t.upsert(45, 41, "x86_final", true, false, 2);
+        t.upsert(46, 45, "final3.dll", false, false, 2);
+        assert_eq!(t.len(), before);
+        assert_eq!(t.query("final", 10).len(), 4);
+        // A record moved out of the tree comes back.
+        t.upsert(46, 32, "final3.dll", false, false, 3);
+        assert_eq!(t.path(46, "C:\\").as_deref(), Some("C:\\Users\\agent\\Documents\\final3.dll"));
     }
 
     #[test]

@@ -25,12 +25,15 @@ case "$mode" in installed|plain) ;; *) echo "g1-deploy: mode query answered neit
 echo "g1 mode: $mode"
 ua=0
 [ "$mode" = installed ] && ua=1
-os job run --wait -- env EXPLORUST_UIACCESS=$ua cargo build --release --target x86_64-pc-windows-gnu -p shell -p keys -p guard -p devkeys -p files -p inject -p notify -p viewer -p taskman
+# Plain cargo: it takes its tokens from the box's shared jobserver (MAKEFLAGS), so it stays fair
+# to other threads; os job admission can sit queued behind another thread's long job.
+nice -n 10 env EXPLORUST_UIACCESS=$ua cargo build --release --target x86_64-pc-windows-gnu -p shell -p keys -p guard -p devkeys -p files -p inject -p notify -p viewer -p taskman -p fsindex
 t=target/x86_64-pc-windows-gnu/release
 mkdir -p dist
-cp "$t/explorust.exe" "$t/explorust-guard.exe" "$t/keys.exe" "$t/explorust-keys.exe" "$t/explorust-open.exe" "$t/explorust_inject.dll" "$t/explorust-notify.exe" "$t/explorust-viewer.exe" "$t/explorust-taskman.exe" tools/g1-state.ps1 dist/
+cp "$t/explorust.exe" "$t/explorust-guard.exe" "$t/keys.exe" "$t/explorust-keys.exe" "$t/explorust-open.exe" "$t/explorust_inject.dll" "$t/explorust-notify.exe" "$t/explorust-viewer.exe" "$t/explorust-taskman.exe" "$t/explorust-index.exe" tools/g1-state.ps1 dist/
 python3 -I crates/notify/package/make-msix.py dist/explorust-notify.msix
 [ $ua = 1 ] && python3 -I tools/authenticode-sign.py sign dist/explorust-keys.exe
+# The index service runs as LocalSystem from Program Files: it needs no signature (no uiAccess).
 cp dist/explorust.exe dist/explorust.next.exe
 timeout 120 os win push g1 dist/explorust-open.exe 'C:\explorust' >/dev/null
 timeout 120 os win push g1 dist/explorust.next.exe 'C:\explorust' >/dev/null
@@ -63,6 +66,13 @@ if [ $ua = 1 ]; then
   hd=$pf
 else
   hd='C:\explorust'
+fi
+# The index service (explorust-index, LocalSystem): stop it, rename the exe aside, copy the new one
+# and run its --install (updates the service config and failure actions, starts it). Installed mode
+# only: plain mode has no service.
+if [ $ua = 1 ]; then
+  timeout 120 os win push g1 dist/explorust-index.exe 'C:\explorust' >/dev/null
+  timeout 90 os win run g1 --ps -- "\$d='$pf'; sc.exe stop explorust-index | Out-Null; \$n=0; while ((Get-Process explorust-index -EA SilentlyContinue) -and \$n -lt 50) { Start-Sleep -Milliseconds 100; \$n++ }; Get-ChildItem \"\$d\\explorust-index.old*.exe\" -EA SilentlyContinue | Remove-Item -EA SilentlyContinue; if (Test-Path \"\$d\\explorust-index.exe\") { Rename-Item \"\$d\\explorust-index.exe\" ('explorust-index.old' + (Get-Random) + '.exe') }; Copy-Item C:\\explorust\\explorust-index.exe \"\$d\\explorust-index.exe\"; Remove-Item C:\\explorust\\explorust-index.exe; & \"\$d\\explorust-index.exe\" --install" >/dev/null
 fi
 # The viewer registers itself for the logged-on user (--ps runs as SYSTEM): ProgID, OpenWithProgids,
 # RegisteredApplications under HKCU; no default changes.

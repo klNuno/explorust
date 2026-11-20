@@ -5,7 +5,7 @@ use crate::{log, pipe, volume};
 use fsindex::fold;
 use fsindex::proto::{Hit, Reply};
 use fsindex::table::Table;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
 use windows::Win32::System::Threading::GetCurrentProcess;
@@ -45,6 +45,14 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
             Ok(e) => log::line(&format!("{letter}: journal read stopped ({e}), reloading")),
             Err(e) => log::line(&format!("{letter}: {e}, retry in 30 s")),
         }
+        if !volume::fixed_ntfs().contains(&letter) {
+            log::line(&format!("{letter}: volume gone, no longer served"));
+            VOLS.write().unwrap_or_else(|p| p.into_inner()).retain(|(c, _)| *c != letter);
+            if first {
+                let _ = loaded.send(());
+            }
+            return;
+        }
         if first {
             let _ = loaded.send(());
             first = false;
@@ -73,36 +81,68 @@ fn answer(vols: &[Arc<Vol>], q: &str, max: u16) -> Reply {
     Reply { hits: all.into_iter().map(|(_, h)| h).collect(), micros: t.elapsed().as_micros() as u32, names: names as u32 }
 }
 
-/// Runs the index; `ready` is called once every volume's first load ended (the service reports
-/// running at once and answers from what is loaded).
+/// The volumes being served; a fixed volume that arrives later joins through `rescan`.
+static VOLS: RwLock<Vec<(char, Arc<Vol>)>> = RwLock::new(Vec::new());
+/// Reports each new volume's first load (the startup summary counts them).
+static LOADED: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
+
+fn add(c: char) -> Arc<Vol> {
+    let v = Arc::new(Vol { root: format!("{c}:\\"), table: RwLock::new(Table::new()) });
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let tx = LOADED.lock().ok().and_then(|l| l.clone()).unwrap_or(tx);
+    let v2 = v.clone();
+    let _ = std::thread::Builder::new().name(format!("index-{c}")).spawn(move || keep(c, v2, tx));
+    VOLS.write().unwrap_or_else(|p| p.into_inner()).push((c, v.clone()));
+    v
+}
+
+/// Starts following the fixed NTFS volumes not served yet (a disk attached after start); returns
+/// how many were added.
+pub fn rescan() -> usize {
+    let have: Vec<char> = VOLS.read().map(|v| v.iter().map(|(c, _)| *c).collect()).unwrap_or_default();
+    let new: Vec<char> = volume::fixed_ntfs().into_iter().filter(|c| !have.contains(c)).collect();
+    for &c in &new {
+        log::line(&format!("index: new fixed NTFS volume {c}:"));
+        add(c);
+    }
+    new.len()
+}
+
+/// Runs the index; `ready` is called at once (the service reports running and answers from what
+/// is loaded); the startup summary is logged when every volume's first load ended.
 pub fn run(ready: Option<&dyn Fn()>) {
     let letters = volume::fixed_ntfs();
     log::line(&format!("index: fixed NTFS volumes {letters:?}"));
     let t0 = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
-    let vols: Vec<Arc<Vol>> = letters
-        .iter()
-        .map(|&c| {
-            let v = Arc::new(Vol { root: format!("{c}:\\"), table: RwLock::new(Table::new()) });
-            let (v2, tx) = (v.clone(), tx.clone());
-            let _ = std::thread::Builder::new().name(format!("index-{c}")).spawn(move || keep(c, v2, tx));
-            v
-        })
-        .collect();
-    let vols = Arc::new(vols);
-    let v2 = vols.clone();
+    if let Ok(mut l) = LOADED.lock() {
+        *l = Some(tx);
+    }
+    for &c in &letters {
+        add(c);
+    }
     let n = letters.len();
     let _ = std::thread::Builder::new().name("index-ready".into()).spawn(move || {
         for _ in 0..n {
             let _ = rx.recv();
         }
         let (private, ws) = memory();
-        let names: usize = v2.iter().map(|v| v.table.read().map(|t| t.len()).unwrap_or(0)).sum();
+        let names: usize = VOLS.read().map(|v| v.iter().map(|(_, v)| v.table.read().map(|t| t.len()).unwrap_or(0)).sum()).unwrap_or(0);
         log::line(&format!("index: ready, {names} names on {n} volumes in {:.0} ms, process private {private:.1} MB, working set {ws:.1} MB", t0.elapsed().as_secs_f64() * 1000.0));
+        // Later arrivals log their own MFT read line.
+        loop {
+            if rx.recv().is_err() {
+                break;
+            }
+            let (private, ws) = memory();
+            log::line(&format!("index: volume added, process private {private:.1} MB, working set {ws:.1} MB"));
+        }
     });
     if let Some(f) = ready {
         f();
     }
-    let v3 = vols.clone();
-    pipe::serve(Arc::new(move |q: &str, max: u16| answer(&v3, q, max)));
+    pipe::serve(Arc::new(move |q: &str, max: u16| {
+        let vols: Vec<Arc<Vol>> = VOLS.read().map(|v| v.iter().map(|(_, v)| v.clone()).collect()).unwrap_or_default();
+        answer(&vols, q, max)
+    }));
 }
