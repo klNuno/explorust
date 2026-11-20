@@ -2214,6 +2214,7 @@ dependencies = [
 name = "uwp-host"
 version = "0.2.0"
 dependencies = [
+ "bus",
  "libloading",
  "object",
  "pdb",

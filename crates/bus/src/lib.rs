@@ -254,6 +254,27 @@ mod win {
     }
 }
 
+/// twinui's shell hook window inside explorust (published by uwp-host once it registered it, 0 when
+/// none). Under explorer, Windows sends the taskman window (the taskbar) codes it sends no other
+/// shell hook window (0x24 and 0x26 presentation readiness among them) and explorer hands them on
+/// to twinui; explorust's taskbar does the same through this slot.
+pub mod shell_hook_sink {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    static SINK: AtomicIsize = AtomicIsize::new(0);
+    pub fn set(hwnd: isize) {
+        SINK.store(hwnd, Ordering::Release);
+    }
+    pub fn get() -> Option<isize> {
+        Some(SINK.load(Ordering::Acquire)).filter(|h| *h != 0)
+    }
+    /// Codes Windows already broadcasts to every shell hook window (seen on twinui's window under
+    /// explorust, 2026-11-20): they must not reach twinui twice. GETMINRECT (5) is a sent message
+    /// with a pointer, never posted on.
+    pub fn taskman_only(code: usize) -> bool {
+        !matches!(code, 0x1 | 0x2 | 0x3 | 0x4 | 0x5 | 0x6 | 0x10 | 0x35 | 0x8004 | 0x8006)
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub use win::*;
 

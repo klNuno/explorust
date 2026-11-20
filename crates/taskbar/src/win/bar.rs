@@ -845,6 +845,15 @@ impl Bar {
         if code as u32 != HSHELL_REDRAW {
             log::line(&format!("shell hook {code:#x} {:#x}", lp.0));
         }
+        if bus::shell_hook_sink::taskman_only(code)
+            && let Some(sink) = bus::shell_hook_sink::get()
+        {
+            // SAFETY: a posted copy of this message to twinui's window in this process; lParam is
+            // a window handle or a plain value for these codes, never a pointer.
+            unsafe {
+                let _ = PostMessageW(Some(HWND(sink as _)), self.shellhook, WPARAM(code), lp);
+            }
+        }
         match code as u32 {
             HSHELL_WINDOWCREATED | HSHELL_REDRAW | HSHELL_WINDOWREPLACED => self.refresh(h),
             HSHELL_WINDOWDESTROYED => {

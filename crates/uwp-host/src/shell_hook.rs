@@ -103,6 +103,7 @@ impl ShellHookBridge {
                 );
                 if ok {
                     self.window = Some(hwnd);
+                    bus::shell_hook_sink::set(hwnd as isize);
                     watch(HWND(hwnd as *mut c_void));
                 }
             }

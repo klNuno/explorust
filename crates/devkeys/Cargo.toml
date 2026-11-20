@@ -8,5 +8,9 @@ publish.workspace = true
 name = "keys"
 path = "src/main.rs"
 
+[[bin]]
+name = "shellhook-log"
+path = "src/shellhook_log.rs"
+
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading", "Win32_Graphics_Gdi"] }
