@@ -6,6 +6,7 @@ pub mod helper;
 mod listen;
 mod popup;
 mod system;
+mod stale;
 mod twinui;
 pub mod wnf;
 
@@ -41,6 +42,7 @@ pub fn run() {
     // SAFETY: COM for this thread only (STA, the UI thread).
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
     log::line("notify: run");
+    log::line(&format!("notify: {}", stale::end_stale_host()));
     // Without explorer nobody says the shell is up, and Windows' notification center refuses to open.
     log::line(&format!("notify: {}", wnf::ensure_shell_ready()));
     match create() {
