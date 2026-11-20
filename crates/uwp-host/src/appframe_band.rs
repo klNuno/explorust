@@ -133,7 +133,7 @@ impl Drop for AppFrameBandRedirect {
     }
 }
 
-unsafe fn write_slot(slot: *mut usize, value: usize) -> Result<(), String> {
+pub(crate) unsafe fn write_slot(slot: *mut usize, value: usize) -> Result<(), String> {
     let mut old = 0_u32;
     // SAFETY: the caller passes a validated IAT slot of this process.
     if unsafe { VirtualProtect(slot.cast(), size_of::<usize>(), PAGE_READWRITE, &mut old) } == 0 {

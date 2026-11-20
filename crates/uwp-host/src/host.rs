@@ -402,6 +402,17 @@ fn run_host_with_parent(
             None
         }
     };
+    // explorust: optional, the notification center stays open with it; the shell runs without it.
+    let lightdismiss_redirect = match crate::lightdismiss_band::LightDismissBandRedirect::install() {
+        Ok(redirect) => {
+            hlog!("phase=host-lightdismiss-redirect result=installed");
+            Some(redirect)
+        }
+        Err(error) => {
+            hlog!("phase=host-lightdismiss-redirect error={error}");
+            None
+        }
+    };
     let skip_touch_keyboard = skip_touch_keyboard();
     let controller = match start_immersive_shell_controller(false, false, skip_touch_keyboard) {
         Ok(controller) => controller,
@@ -413,6 +424,9 @@ fn run_host_with_parent(
             return ExitCode::FAILURE;
         }
     };
+    // explorust dev probe: no effect without %LOCALAPPDATA%\explorust\bp.txt.
+    #[cfg(target_arch = "x86_64")]
+    crate::breakpoints::arm_from_file();
     #[cfg(feature = "diagnostics")]
     let frame_pool = if trace_view_events.is_some() {
         const IMMERSIVE_APPLICATION_MANAGER: windows_core::GUID =
@@ -514,9 +528,9 @@ fn run_host_with_parent(
         }
     }
     #[cfg(feature = "diagnostics")]
-    let keep_alive = (broker, controller, redirect, appframe_redirect);
+    let keep_alive = (broker, controller, redirect, appframe_redirect, lightdismiss_redirect);
     #[cfg(not(feature = "diagnostics"))]
-    let keep_alive = (broker, controller, redirect, appframe_redirect);
+    let keep_alive = (broker, controller, redirect, appframe_redirect, lightdismiss_redirect);
     if pump_messages {
         // SAFETY: This thread owns the HWND and consumes its timer messages.
         if unsafe { SetTimer(Some(shell_window.window), 0x71, 250, None) } == 0 {

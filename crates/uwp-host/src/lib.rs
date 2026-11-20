@@ -5,8 +5,12 @@ mod log;
 
 #[cfg(target_os = "windows")]
 mod appframe_band;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod breakpoints;
 #[cfg(target_os = "windows")]
 mod auto_present;
+#[cfg(target_os = "windows")]
+mod lightdismiss_band;
 #[cfg(target_os = "windows")]
 mod controller;
 #[cfg(target_os = "windows")]
