@@ -170,6 +170,38 @@ pub fn hidden(verb: &str) -> bool {
     )
 }
 
+/// Where a keyboard menu opens for the focused item `item` of a view `view` (screen rects, left,
+/// top, right, bottom): inside the item, near its icon and label. `None` when the rect is not an
+/// item of the view (outside it, empty, or the whole list), so the caller uses its fallback.
+pub fn keyboard_anchor(item: (i32, i32, i32, i32), view: (i32, i32, i32, i32)) -> Option<(i32, i32)> {
+    let (w, h) = (item.2 - item.0, item.3 - item.1);
+    let (vw, vh) = (view.2 - view.0, view.3 - view.1);
+    if w <= 0 || h <= 0 || vw <= 0 || vh <= 0 {
+        return None;
+    }
+    let inside = item.0 >= view.0 - 2 && item.1 >= view.1 - 2 && item.2 <= view.2 + 2 && item.3 <= view.3 + 2;
+    let whole = (w as i64) * (h as i64) * 2 > (vw as i64) * (vh as i64);
+    if !inside || whole {
+        return None;
+    }
+    Some((item.0 + (w / 2).min(120), item.1 + h / 2))
+}
+
+/// Submenus of legacy handlers that Windows 11 leaves to `Show more options`: Send to, Give access
+/// to, Include in library. Known by verb when the handler gives one, else by label (English,
+/// French): these submenus come from shell32 and ntshrui, which give no verb on some builds.
+pub fn hidden_submenu(verb: &str, label: &str) -> bool {
+    if matches!(verb.to_ascii_lowercase().as_str(), "sendto" | "sharing" | "sharewith" | "giveaccessto" | "includeinlibrary" | "library") {
+        return true;
+    }
+    let l = label.to_lowercase().replace('\u{2019}', "'");
+    matches!(
+        l.as_str(),
+        "send to" | "envoyer vers" | "give access to" | "share with" | "donner l'accès à" | "partager avec" | "include in library"
+            | "inclure dans la bibliothèque"
+    )
+}
+
 /// The Windows 11 menu built from the classic entries: the top-row commands (verb, id, enabled)
 /// and the list, with hidden verbs dropped, separators tidied and `Show more options` last.
 pub fn arrange(entries: &[Entry], top_row: bool, more_label: &str) -> (Vec<(String, u32)>, Vec<Entry>) {
@@ -187,6 +219,9 @@ pub fn arrange(entries: &[Entry], top_row: bool, more_label: &str) -> (Vec<(Stri
             continue;
         }
         if e.kind == Kind::Command && e.label.is_empty() && !e.owner_draw {
+            continue;
+        }
+        if e.kind == Kind::Submenu && hidden_submenu(&e.verb, &e.label) {
             continue;
         }
         let mut e = e.clone();
@@ -477,6 +512,25 @@ mod tests {
         assert_eq!(list[0].shortcut, "Enter");
         assert_eq!(list[2].shortcut, "Alt+Enter");
         assert_eq!(list[4].kind, Kind::More);
+    }
+
+    #[test]
+    fn keyboard_anchor_in_the_item() {
+        let view = (100, 100, 900, 700);
+        assert_eq!(keyboard_anchor((110, 130, 710, 152), view), Some((230, 141)));
+        assert_eq!(keyboard_anchor((110, 130, 150, 190), view), Some((130, 160)));
+        assert_eq!(keyboard_anchor((100, 100, 900, 700), view), None);
+        assert_eq!(keyboard_anchor((0, 0, 50, 20), view), None);
+        assert_eq!(keyboard_anchor((0, 0, 0, 0), view), None);
+    }
+
+    #[test]
+    fn legacy_submenus_hidden() {
+        let sub = |label: &str, verb: &str| Entry { kind: Kind::Submenu, label: label.into(), verb: verb.into(), enabled: true, ..Default::default() };
+        let entries = vec![cmd(1, "&Open", "open"), sub("Open with", ""), sub("Send to", ""), sub("Give access to", "Sharing"), sub("Envoyer vers", ""), sub("New", "")];
+        let (_, list) = arrange(&entries, true, "Show more options");
+        let labels: Vec<&str> = list.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, ["Open", "Open with", "New", "", "Show more options"]);
     }
 
     #[test]

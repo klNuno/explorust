@@ -6,6 +6,7 @@ mod paint;
 mod popup;
 mod read;
 mod tip;
+mod uia;
 mod worker;
 
 use crate::model;
@@ -99,7 +100,7 @@ fn show_local(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: b
                 classic::invoke(cm, owner, id, FIRST, at);
             }
         }
-        None => log::line("dismissed"),
+        Some(popup::Pick::Fallback) | None => log::line("dismissed"),
     }
     let _ = unsafe { DestroyMenu(menu) };
 }
@@ -110,7 +111,7 @@ fn log_entries(items: bool, tq: f64, hr: windows_core::HRESULT, entries: &[model
         .iter()
         .map(|e| match e.kind {
             model::Kind::Separator => "-".into(),
-            model::Kind::Submenu => format!("{}>", e.label),
+            model::Kind::Submenu => format!("{}>[{}]", e.label, e.verb),
             _ => format!("{}[{}]", e.label, e.verb),
         })
         .collect();
@@ -222,6 +223,7 @@ thread_local! {
 fn prewarm_view(defview: HWND, view: &IShellView) {
     popup::prewarm();
     worker::start();
+    uia::start();
     let Some(reply) = popup::reply_window() else { return };
     let Ok(fv) = view.cast::<IFolderView2>() else { return };
     let first = WARMED.with(|w| {
@@ -290,6 +292,10 @@ fn show_worker(defview: HWND, view: &IShellView, fv: &IFolderView2, at: POINT, t
         }
         Some(popup::Pick::More) => {
             worker::send(worker::Job::Classic { gn, owner: defview.0 as isize, at: (at.x, at.y) });
+        }
+        Some(popup::Pick::Fallback) => {
+            log::line("worker fill failed: the view's own menu fills here");
+            return false;
         }
         None => log::line("dismissed"),
     }
@@ -440,12 +446,17 @@ fn on_context(defview: HWND, view: &IShellView, lp: LPARAM, t0: Instant) -> bool
         let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
         let (mut x, mut y) = ((lp.0 & 0xFFFF) as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as i16 as i32);
         if x == -1 && y == -1 {
-            // Keyboard: at the pointer when it is over the view, else at the view's corner.
+            // Keyboard: at the focused item (UI Automation), else at the pointer when it is over
+            // the view, else at the view's corner.
             let mut r = RECT::default();
             let _ = GetWindowRect(defview, &mut r);
             let mut p = POINT::default();
             let _ = GetCursorPos(&mut p);
-            if p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom {
+            let item = uia::focused_rect(150)
+                .and_then(|f| model::keyboard_anchor((f.left, f.top, f.right, f.bottom), (r.left, r.top, r.right, r.bottom)));
+            if let Some((ix, iy)) = item {
+                (x, y) = (ix, iy);
+            } else if p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom {
                 (x, y) = (p.x, p.y);
             } else {
                 (x, y) = (r.left + 16, r.top + 16);

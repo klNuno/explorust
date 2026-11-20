@@ -613,6 +613,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
+name = "fsindex"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -830,6 +839,13 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown",
+]
+
+[[package]]
+name = "inject"
+version = "0.1.0"
+dependencies = [
+ "windows",
 ]
 
 [[package]]
@@ -1824,6 +1840,7 @@ dependencies = [
  "bus",
  "desktop",
  "files",
+ "inject",
  "keys",
  "notify",
  "start",
@@ -1914,6 +1931,7 @@ name = "start"
 version = "0.1.0"
 dependencies = [
  "bus",
+ "fsindex",
  "render",
  "shelldata",
  "windows",
@@ -1999,6 +2017,17 @@ dependencies = [
  "shelldata",
  "windows",
  "windows-core",
+]
+
+[[package]]
+name = "taskman"
+version = "0.1.0"
+dependencies = [
+ "render",
+ "shelldata",
+ "windows",
+ "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]
@@ -2225,6 +2254,16 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "viewer"
+version = "0.1.0"
+dependencies = [
+ "render",
+ "windows",
+ "windows-core",
+ "windows-numerics",
+]
 
 [[package]]
 name = "walkdir"

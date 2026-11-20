@@ -65,7 +65,8 @@ pub fn entries(cm: &IContextMenu, menu: HMENU, first: u32) -> Vec<Entry> {
             let (label, mnemonic, shortcut) = parse_label(&raw);
             let sub = !mii.hSubMenu.is_invalid();
             let id = if sub { 0 } else { mii.wID };
-            let verb = if !sub && id >= first { verb(cm, id - first) } else { String::new() };
+            // A submenu's own id gives the verb of a handler's submenu (Send to, Give access to).
+            let verb = if mii.wID >= first && mii.wID <= first + 0x7FFE { verb(cm, mii.wID - first) } else { String::new() };
             let bitmap = bitmap(mii.hbmpItem);
             out.push(Entry {
                 id,

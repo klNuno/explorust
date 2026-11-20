@@ -6,6 +6,8 @@ use super::{log, read, tip::Tip, worker};
 use crate::model::{self, Entry, Hit, Kind, Layout, Recent};
 use render::Surface;
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
@@ -34,6 +36,8 @@ const TINT: u32 = 0xE62C_2C2C;
 pub enum Pick {
     Command(u32, String),
     More,
+    /// The worker could not build the selection's menu: the caller shows the view's own.
+    Fallback,
 }
 
 /// Where the menu's rows come from.
@@ -49,6 +53,39 @@ struct Win {
     hwnd: HWND,
     surface: Surface,
     size: (u32, u32),
+    /// Handler icons as D2D bitmaps of this window's device, by hash of their pixels: made once,
+    /// kept across opens.
+    icons: HashMap<u64, ID2D1Bitmap1>,
+}
+
+/// Icon cache use of one level: (bitmaps reused, bitmaps made).
+type IconUse = (u32, u32);
+
+impl Win {
+    /// The D2D bitmap of a handler icon, from the cache when the same pixels were seen before.
+    fn icon(&mut self, b: &Option<(u32, u32, Vec<u8>)>, used: &mut IconUse) -> Option<ID2D1Bitmap1> {
+        let (w, h, px) = b.as_ref()?;
+        let mut hs = DefaultHasher::new();
+        (w, h, px).hash(&mut hs);
+        let k = hs.finish();
+        if let Some(b) = self.icons.get(&k) {
+            used.0 += 1;
+            return Some(b.clone());
+        }
+        let b = self.surface.bitmap(*w, *h, px).ok()?;
+        if self.icons.len() >= 256 {
+            self.icons.clear();
+        }
+        self.icons.insert(k, b.clone());
+        used.1 += 1;
+        Some(b)
+    }
+
+    fn icons_of(&mut self, entries: &[Entry]) -> (Vec<Option<ID2D1Bitmap1>>, IconUse) {
+        let mut used = (0, 0);
+        let v = entries.iter().map(|e| self.icon(&e.bitmap, &mut used)).collect();
+        (v, used)
+    }
 }
 
 struct Level {
@@ -114,7 +151,7 @@ fn new_window(root: bool) -> windows_core::Result<Win> {
         let dark = 1u32;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
         let surface = Surface::new(hwnd, 64, 64)?;
-        Ok(Win { hwnd, surface, size: (64, 64) })
+        Ok(Win { hwnd, surface, size: (64, 64), icons: HashMap::new() })
     }
 }
 
@@ -214,10 +251,7 @@ impl Ui {
             win.surface.resize(w as u32, h as u32)?;
             win.size = (w as u32, h as u32);
         }
-        let bitmaps = entries
-            .iter()
-            .map(|e| e.bitmap.as_ref().and_then(|(bw, bh, px)| win.surface.bitmap(*bw, *bh, px).ok()))
-            .collect();
+        let (bitmaps, _) = win.icons_of(&entries);
         let level = Level { win: depth, entries, top, layout, hover: None, open: None, bitmaps, origin: (x, y) };
         self.levels.push(level);
         self.draw(depth);
@@ -396,7 +430,7 @@ impl Ui {
             }
             win.size = (w as u32, h as u32);
         }
-        let bitmaps = list.iter().map(|e| e.bitmap.as_ref().and_then(|(bw, bh, px)| win.surface.bitmap(*bw, *bh, px).ok())).collect();
+        let (bitmaps, icons) = win.icons_of(&list);
         let hover = match (hover, hover_verb) {
             (Some(Hit::Top(i)), _) if i < top.len() => Some(Hit::Top(i)),
             (_, Some((v, l))) => list.iter().position(|e| e.kind != Kind::Separator && e.verb == v && e.label == l).map(Hit::Row),
@@ -410,9 +444,11 @@ impl Ui {
         }
         self.draw(0);
         log::line(&format!(
-            "handlers' rows merged {:.1} ms after the right-click ({n} rows, merge {:.1} ms)",
+            "handlers' rows merged {:.1} ms after the right-click ({n} rows, merge {:.1} ms, icons {} cached {} made)",
             self.t0.elapsed().as_secs_f64() * 1000.0,
-            t.elapsed().as_secs_f64() * 1000.0
+            t.elapsed().as_secs_f64() * 1000.0,
+            icons.0,
+            icons.1
         ));
         if let Some((verb, label)) = self.pending.take() {
             let l = &self.levels[0];
@@ -459,9 +495,10 @@ impl Ui {
                     return;
                 }
                 if !ok {
-                    log::line("worker fill failed: the menu keeps its static part");
+                    log::line("worker fill failed: the view's own menu replaces it");
                     self.ready = true;
                     self.pending = None;
+                    self.finish(Some(Pick::Fallback));
                     return;
                 }
                 log::line(&format!("worker filled {gn} in {fill_ms:.1} ms ({} entries)", entries.len()));
