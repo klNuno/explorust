@@ -269,7 +269,8 @@ pub mod shell_hook_sink {
     }
     /// Codes Windows already broadcasts to every shell hook window (seen on twinui's window under
     /// explorust, 2026-11-20): they must not reach twinui twice. GETMINRECT (5) is a sent message
-    /// with a pointer, never posted on.
+    /// with a pointer, never posted on. Handing on only 0x24 and 0x26 is not enough: the center
+    /// then never shows (g1, 2026-11-20).
     pub fn taskman_only(code: usize) -> bool {
         !matches!(code, 0x1 | 0x2 | 0x3 | 0x4 | 0x5 | 0x6 | 0x10 | 0x35 | 0x8004 | 0x8006)
     }
