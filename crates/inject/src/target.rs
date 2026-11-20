@@ -69,6 +69,46 @@ pub fn dark_theme_of(class: &str) -> Option<&'static str> {
     }
 }
 
+/// Why the DLL must not enter a host: 32-bit (`wow64`), token unreadable (protected or another
+/// user), elevated, or above explorust's own integrity. `theirs` = (elevated, integrity RID).
+pub fn refusal(wow64: bool, theirs: Option<(bool, u32)>, ours: Option<u32>) -> Option<&'static str> {
+    if wow64 {
+        return Some("32-bit host");
+    }
+    let Some((elevated, rid)) = theirs else { return Some("token not readable (protected or another user)") };
+    if elevated {
+        return Some("elevated host");
+    }
+    if rid > ours.unwrap_or(0x2000) {
+        return Some("higher integrity than explorust");
+    }
+    None
+}
+
+/// Styling phases the DLL times on the host's thread, reported one message each
+/// (wParam = phase << 32 | microseconds); `Total` comes last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Phase {
+    Total = 0,
+    DarkApp = 1,
+    Frame = 2,
+    Children = 3,
+    SettingChange = 4,
+    Redraw = 5,
+}
+
+pub const PHASES: [Phase; 6] = [Phase::Total, Phase::DarkApp, Phase::Frame, Phase::Children, Phase::SettingChange, Phase::Redraw];
+
+pub fn pack(phase: Phase, us: u64) -> u64 {
+    ((phase as u64) << 32) | us.min(u32::MAX as u64)
+}
+
+pub fn unpack(v: u64) -> (Option<Phase>, u64) {
+    let p = (v >> 32) as usize;
+    (PHASES.iter().copied().find(|x| *x as usize == p), v & u32::MAX as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +154,23 @@ mod tests {
         assert_eq!(dark_theme_of("Edit"), Some("DarkMode_CFD"));
         assert_eq!(dark_theme_of("SysTreeView32"), Some("DarkMode_Explorer"));
         assert_eq!(dark_theme_of("Static"), None);
+    }
+
+    #[test]
+    fn refusals() {
+        assert_eq!(refusal(true, Some((false, 0x2000)), Some(0x2000)), Some("32-bit host"));
+        assert!(refusal(false, None, Some(0x2000)).is_some());
+        assert_eq!(refusal(false, Some((true, 0x3000)), Some(0x2000)), Some("elevated host"));
+        assert_eq!(refusal(false, Some((false, 0x3000)), Some(0x2000)), Some("higher integrity than explorust"));
+        assert_eq!(refusal(false, Some((false, 0x2000)), Some(0x2000)), None);
+        assert_eq!(refusal(false, Some((false, 0x1000)), Some(0x2000)), None);
+    }
+
+    #[test]
+    fn phases_round_trip() {
+        for p in PHASES {
+            assert_eq!(unpack(pack(p, 1234)), (Some(p), 1234));
+        }
+        assert_eq!(unpack(pack(Phase::Redraw, u64::MAX)).1, u32::MAX as u64);
     }
 }

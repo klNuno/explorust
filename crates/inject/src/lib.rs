@@ -15,6 +15,8 @@ pub mod target;
 #[cfg(target_os = "windows")]
 mod dark;
 #[cfg(target_os = "windows")]
+mod host;
+#[cfg(target_os = "windows")]
 mod hook;
 #[cfg(target_os = "windows")]
 mod loader;

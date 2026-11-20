@@ -5,21 +5,21 @@
 
 use crate::dark;
 use crate::log;
-use crate::target::{self, Kind};
+use crate::target::{self, Kind, Phase};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Instant;
-use windows::Win32::Foundation::{CloseHandle, FreeLibrary, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+use crate::host;
+use std::collections::HashSet;
+use windows::Win32::Foundation::{FreeLibrary, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMSBT_MAINWINDOW, DWMSBT_TRANSIENTWINDOW};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Threading::{
-    GetCurrentProcessId, IsWow64Process, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
-};
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
+use windows::core::{BOOL, HSTRING, PCWSTR};
 
+const EVENT_OBJECT_CREATE: u32 = 0x8000;
 const EVENT_OBJECT_DESTROY: u32 = 0x8001;
 const EVENT_OBJECT_SHOW: u32 = 0x8002;
 const WINEVENT_OUTOFCONTEXT: u32 = 0;
@@ -43,8 +43,12 @@ struct State {
     threads: HashMap<u32, Hooked>,
     /// Windows already handled, so a second show does nothing.
     seen: HashMap<isize, Kind>,
-    /// When the show event of a host's target arrived, for the latency log.
-    pending: HashMap<u32, (Instant, Kind)>,
+    /// When the first event of a host's target arrived, for the latency log, and the phases the
+    /// DLL reported so far.
+    pending: HashMap<u32, (Instant, Kind, Vec<(Phase, u64)>)>,
+    /// Dialogs hooked at their creation, not shown yet: at the show they are kept (a file dialog)
+    /// or let go.
+    created: HashSet<isize>,
     /// Settings CoreWindows not yet inside their frame: retried on a timer.
     retry: Vec<(isize, u8)>,
     hwnd: HWND,
@@ -104,12 +108,13 @@ pub fn run() {
             threads: HashMap::new(),
             seen: HashMap::new(),
             pending: HashMap::new(),
+            created: HashSet::new(),
             retry: Vec::new(),
             hwnd,
         };
         STATE.with(|s| *s.borrow_mut() = Some(state));
         let ev = SetWinEventHook(
-            EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW, None, Some(on_event), 0, 0,
+            EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, None, Some(on_event), 0, 0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
         log::line(&format!("watching (dll {}, {} bytes)", path.display(), std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)));
@@ -137,7 +142,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     let handled = std::panic::catch_unwind(|| {
         let done = STATE.with(|s| s.borrow().as_ref().map(|st| st.done_msg)).unwrap_or(0);
         if msg != 0 && msg == done {
-            on_done(wp.0, lp.0 as u32);
+            on_done(wp.0 as u64, lp.0 as u32);
             return true;
         }
         match msg {
@@ -172,6 +177,7 @@ unsafe extern "system" fn on_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, obj
         return;
     }
     let _ = std::panic::catch_unwind(|| match event {
+        EVENT_OBJECT_CREATE => created(hwnd),
         EVENT_OBJECT_SHOW => consider(hwnd),
         EVENT_OBJECT_DESTROY => forget(hwnd),
         _ => {}
@@ -190,25 +196,6 @@ fn pid_tid(h: HWND) -> (u32, u32) {
     // SAFETY: writes the pid only.
     let tid = unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
     (pid, tid)
-}
-
-/// Image path of a process and whether it runs under WOW64 (a 32-bit host the x64 DLL cannot enter).
-fn process_info(pid: u32) -> (String, bool) {
-    // SAFETY: a limited query handle, closed before returning.
-    unsafe {
-        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return (String::new(), false) };
-        let mut buf = [0u16; 520];
-        let mut len = buf.len() as u32;
-        let path = if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok() {
-            String::from_utf16_lossy(&buf[..len as usize])
-        } else {
-            String::new()
-        };
-        let mut wow = BOOL(0);
-        let _ = IsWow64Process(h, &mut wow);
-        let _ = CloseHandle(h);
-        (path, wow.as_bool())
-    }
 }
 
 fn has_descendant(root: HWND, class: &str) -> bool {
@@ -230,13 +217,54 @@ fn has_descendant(root: HWND, class: &str) -> bool {
     f.1
 }
 
+/// A top-level `#32770` of another eligible process was just created: hook its thread now, so the
+/// DLL sees the dialog being built and shown. Most dialogs are not file dialogs; their hook goes at
+/// their show.
+fn created(hwnd: HWND) {
+    if class_of(hwnd) != target::DIALOG_CLASS {
+        return;
+    }
+    // SAFETY: plain query.
+    if unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd {
+        return;
+    }
+    let (pid, _) = pid_tid(hwnd);
+    // SAFETY: no arguments.
+    if pid == unsafe { GetCurrentProcessId() } || crate::switched_off() {
+        return;
+    }
+    if STATE.with(|s| s.borrow().as_ref().is_none_or(|st| st.seen.contains_key(&(hwnd.0 as isize)))) {
+        return;
+    }
+    let t0 = Instant::now();
+    let h = host::host(pid);
+    if let Some(why) = h.refused {
+        log::line(&format!("{} dialog {:#x}: {why}, skipped", target::exe_name(&h.exe), hwnd.0 as usize));
+        STATE.with(|s| {
+            if let Some(st) = s.borrow_mut().as_mut() {
+                st.seen.insert(hwnd.0 as isize, Kind::FileDialog);
+            }
+        });
+        return;
+    }
+    if hook(hwnd, Kind::FileDialog, t0) {
+        STATE.with(|s| {
+            if let Some(st) = s.borrow_mut().as_mut() {
+                st.created.insert(hwnd.0 as isize);
+            }
+        });
+    }
+}
+
 fn consider(hwnd: HWND) {
     let class = class_of(hwnd);
     let interesting = class == target::DIALOG_CLASS || class == target::CORE_WINDOW;
     if !interesting {
         return;
     }
-    if STATE.with(|s| s.borrow().as_ref().is_none_or(|st| st.seen.contains_key(&(hwnd.0 as isize)))) {
+    let key = hwnd.0 as isize;
+    let early = STATE.with(|s| s.borrow_mut().as_mut().is_some_and(|st| st.created.remove(&key)));
+    if !early && STATE.with(|s| s.borrow().as_ref().is_none_or(|st| st.seen.contains_key(&key))) {
         return;
     }
     let (pid, _) = pid_tid(hwnd);
@@ -244,24 +272,38 @@ fn consider(hwnd: HWND) {
     if pid == unsafe { GetCurrentProcessId() } {
         return;
     }
-    let (exe, wow) = process_info(pid);
     // SAFETY: plain query.
     let top = unsafe { GetAncestor(hwnd, GA_ROOT) } == hwnd;
     let mark = class == target::DIALOG_CLASS && top && has_descendant(hwnd, target::DIALOG_MARK);
-    let Some(kind) = target::classify(&class, &exe, mark, false) else { return };
+    let h = host::host(pid);
+    let kind = target::classify(&class, &h.exe, mark, false);
+    if early && kind != Some(Kind::FileDialog) {
+        // Hooked at creation, but not a file dialog: let it go.
+        forget(hwnd);
+        return;
+    }
+    let Some(kind) = kind else { return };
     if crate::switched_off() {
         return;
     }
     let t0 = Instant::now();
     match kind {
         Kind::FileDialog => {
-            if wow {
-                log::line(&format!("{} file dialog: 32-bit host, skipped", target::exe_name(&exe)));
+            if let Some(why) = h.refused {
+                log::line(&format!("{} file dialog: {why}, skipped", target::exe_name(&h.exe)));
                 return;
             }
             let hr = dark::frame(hwnd, DWMSBT_MAINWINDOW);
-            log::line(&format!("{} file dialog {:#x}: frame from outside hr={:#010x}", target::exe_name(&exe), hwnd.0 as usize, hr.0));
-            inject(hwnd, kind, t0);
+            log::line(&format!(
+                "{} file dialog {:#x}: frame from outside hr={:#010x}, hooked {}",
+                target::exe_name(&h.exe), hwnd.0 as usize, hr.0, if early { "at creation" } else { "at show" }
+            ));
+            if early {
+                // The DLL styled it at WM_SHOWWINDOW already, or does now (it ignores a repeat).
+                request(hwnd, kind);
+            } else {
+                inject(hwnd, kind, t0);
+            }
         }
         Kind::Settings => settings(hwnd, t0, 0),
     }
@@ -286,7 +328,7 @@ fn settings(core: HWND, t0: Instant, tries: u8) {
     let fclass = class_of(frame);
     let hr = dark::frame(frame, DWMSBT_TRANSIENTWINDOW);
     let (fpid, _) = pid_tid(frame);
-    let fexe = target::exe_name(&process_info(fpid).0);
+    let fexe = target::exe_name(&host::host(fpid).exe);
     log::line(&format!("settings frame {:#x} ({fclass}, {fexe}): acrylic and dark caption from outside hr={:#010x}", frame.0 as usize, hr.0));
     STATE.with(|s| {
         if let Some(st) = s.borrow_mut().as_mut() {
@@ -318,44 +360,70 @@ fn retry() {
     }
 }
 
-/// Puts the DLL's hook on the window's thread (once per thread) and asks it to style the window.
-fn inject(hwnd: HWND, kind: Kind, t0: Instant) {
+/// Puts the DLL's hook on the window's thread (once per thread). False when it was refused.
+fn hook(hwnd: HWND, kind: Kind, t0: Instant) -> bool {
     let (pid, tid) = pid_tid(hwnd);
     STATE.with(|s| {
         let mut b = s.borrow_mut();
-        let Some(st) = b.as_mut() else { return };
+        let Some(st) = b.as_mut() else { return false };
         st.seen.insert(hwnd.0 as isize, kind);
         if !st.threads.contains_key(&tid) {
             // SAFETY: the hook procedure lives in the DLL, which this process keeps loaded.
-            match unsafe { SetWindowsHookExW(WH_GETMESSAGE, st.proc, Some(st.dll.into()), tid) } {
+            match unsafe { SetWindowsHookExW(WH_CALLWNDPROC, st.proc, Some(st.dll.into()), tid) } {
                 Ok(hook) => {
                     st.threads.insert(tid, Hooked { hook, windows: Vec::new() });
                 }
                 Err(e) => {
                     log::line(&format!("pid {pid}: hook refused: {e}"));
-                    return;
+                    return false;
                 }
             }
         }
         if let Some(h) = st.threads.get_mut(&tid) {
             h.windows.push(hwnd.0 as isize);
         }
-        st.pending.insert(pid, (t0, kind));
-        // SAFETY: a registered message the host ignores unless the DLL's hook takes it.
-        unsafe {
-            let _ = PostMessageW(Some(hwnd), st.style_msg, WPARAM(kind as usize), LPARAM(0));
-        }
-    });
+        st.pending.entry(pid).or_insert((t0, kind, Vec::new()));
+        true
+    })
 }
 
-fn on_done(us: usize, pid: u32) {
-    let p = STATE.with(|s| s.borrow_mut().as_mut().and_then(|st| st.pending.remove(&pid)));
-    match p {
-        Some((t0, kind)) => log::line(&format!(
-            "pid {pid} {kind:?}: styled in the host in {us} us, {} us from the show event",
+/// Asks the DLL to style the window: a sent (not posted) message, so the `WH_CALLWNDPROC` hook sees
+/// it; `SendNotifyMessageW` does not wait for the host.
+fn request(hwnd: HWND, kind: Kind) {
+    let m = STATE.with(|s| s.borrow().as_ref().map(|st| st.style_msg)).unwrap_or(0);
+    // SAFETY: a registered message the host ignores unless the DLL's hook takes it.
+    unsafe {
+        let _ = SendNotifyMessageW(hwnd, m, WPARAM(kind as usize), LPARAM(0));
+    }
+}
+
+fn inject(hwnd: HWND, kind: Kind, t0: Instant) {
+    if hook(hwnd, kind, t0) {
+        request(hwnd, kind);
+    }
+}
+
+fn on_done(v: u64, pid: u32) {
+    let (phase, us) = target::unpack(v);
+    let Some(phase) = phase else { return };
+    let line = STATE.with(|s| {
+        let mut b = s.borrow_mut();
+        let st = b.as_mut()?;
+        let e = st.pending.entry(pid).or_insert((Instant::now(), Kind::FileDialog, Vec::new()));
+        if phase != Phase::Total {
+            e.2.push((phase, us));
+            return None;
+        }
+        let (t0, kind, phases) = st.pending.remove(&pid)?;
+        let list: Vec<String> = phases.iter().map(|(p, u)| format!("{p:?} {u}")).collect();
+        Some(format!(
+            "pid {pid} {kind:?}: styled in the host in {us} us ({}), {} us from the first event",
+            list.join(", "),
             t0.elapsed().as_micros()
-        )),
-        None => log::line(&format!("pid {pid}: styled in the host in {us} us")),
+        ))
+    });
+    if let Some(l) = line {
+        log::line(&l);
     }
 }
 
@@ -365,6 +433,7 @@ fn forget(hwnd: HWND) {
     STATE.with(|s| {
         let mut b = s.borrow_mut();
         let Some(st) = b.as_mut() else { return };
+        st.created.remove(&key);
         if st.seen.remove(&key).is_none() {
             return;
         }
