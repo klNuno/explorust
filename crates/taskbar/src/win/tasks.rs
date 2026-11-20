@@ -55,7 +55,11 @@ pub fn task_of(hwnd: HWND) -> Option<Task> {
         return None;
     }
     let class = class_name(hwnd);
-    if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+    // A top-level CoreWindow is a shell experience (the notification center, Start, search, the
+    // touch keyboard): visible, unowned and not a tool window, yet explorer gives it no button; an
+    // app's CoreWindow sits inside its ApplicationFrameWindow. (The notification center got a
+    // button with each open, g1, 2026-11-20.)
+    if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Windows.UI.Core.CoreWindow") {
         return None;
     }
     let pid = pid_of(hwnd);
