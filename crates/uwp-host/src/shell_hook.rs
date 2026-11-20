@@ -13,14 +13,58 @@
 //! `CImmersiveWindowMessageService` vtable and QueryInterface on 26300.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         System::Com::{CLSCTX_LOCAL_SERVER, CoCreateInstance, IServiceProvider},
-        UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow, RegisterShellHookWindow},
+        UI::WindowsAndMessaging::{
+            CallWindowProcW, GWLP_WNDPROC, GetWindowThreadProcessId, IsWindow,
+            RegisterShellHookWindow, RegisterWindowMessageW, SetWindowLongPtrW, WNDPROC,
+        },
     },
-    core::{GUID, HRESULT, IUnknown, Interface},
+    core::{GUID, HRESULT, IUnknown, Interface, w},
 };
+
+/// twinui's own window procedure, called after the code is logged.
+static PREVIOUS: AtomicIsize = AtomicIsize::new(0);
+static SHELLHOOK: AtomicU32 = AtomicU32::new(0);
+static SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// Logs the shell hook codes the service window gets (the first 60, then only the presentation
+/// readiness codes 0x24 and 0x26 that frameless CoreWindows wait on), then hands every message to
+/// twinui unchanged.
+unsafe extern "system" fn observe(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg != 0 && msg == SHELLHOOK.load(Ordering::Relaxed) {
+        let code = wparam.0 & 0x7fff;
+        let seen = SEEN.fetch_add(1, Ordering::Relaxed);
+        if seen < 60 || code == 0x24 || code == 0x26 {
+            hlog!("phase=shell-hook-message code={:#x} lparam={:#x} n={seen}", wparam.0, lparam.0);
+        }
+    }
+    // SAFETY: PREVIOUS holds the window procedure SetWindowLongPtrW returned for this window.
+    let previous: WNDPROC = unsafe { std::mem::transmute(PREVIOUS.load(Ordering::Relaxed)) };
+    unsafe { CallWindowProcW(previous, hwnd, msg, wparam, lparam) }
+}
+
+fn watch(hwnd: HWND) {
+    // SAFETY: the window belongs to this process; the previous procedure is stored before any
+    // message can reach `observe` on twinui's thread (SetWindowLongPtrW returns it atomically,
+    // and a 0 previous is never installed over).
+    unsafe {
+        SHELLHOOK.store(RegisterWindowMessageW(w!("SHELLHOOK")), Ordering::Relaxed);
+        let previous = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+        if previous == 0 {
+            return;
+        }
+        PREVIOUS.store(previous, Ordering::Relaxed);
+        let replaced = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, observe as *const () as isize);
+        if replaced != 0 && replaced != previous {
+            PREVIOUS.store(replaced, Ordering::Relaxed);
+        }
+        hlog!("phase=shell-hook-watch window={:#x} installed={}", hwnd.0 as usize, replaced != 0);
+    }
+}
 
 const IMMERSIVE_SHELL: GUID = GUID::from_u128(0xc2f03a33_21f5_47fa_b4bb_156362a2f239);
 /// `IID_IImmersiveWindowMessageService`, also its service id.
@@ -59,6 +103,7 @@ impl ShellHookBridge {
                 );
                 if ok {
                     self.window = Some(hwnd);
+                    watch(HWND(hwnd as *mut c_void));
                 }
             }
             Err(error) => {

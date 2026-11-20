@@ -14,6 +14,8 @@ mod fallback_band1;
 #[cfg(all(target_os = "windows", feature = "diagnostics"))]
 mod frame_service_direct;
 #[cfg(target_os = "windows")]
+mod frameless_present;
+#[cfg(target_os = "windows")]
 mod host;
 #[cfg(target_os = "windows")]
 mod presentation_callbacks;

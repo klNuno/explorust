@@ -366,6 +366,11 @@ fn run_host_with_parent(
     }
     let mut presenter = auto_present::AutoPresent::new();
     let mut shell_hook = crate::shell_hook::ShellHookBridge::new();
+    // Off by default: no wrapper is keyed by ShellExperienceHost's CoreWindows on 26300 (notify-11),
+    // so every try is a 50 MB scan. EXPLORUST_FRAMELESS=1 turns it on for the next trace.
+    let mut frameless = std::env::var_os("EXPLORUST_FRAMELESS")
+        .is_some_and(|v| v == "1")
+        .then(crate::frameless_present::FramelessPresent::default);
     let Some(shell_window) = ShellWindowGuard::register() else {
         readiness.failed("host-shell-window", "shell window registration failed");
         return ExitCode::FAILURE;
@@ -571,6 +576,9 @@ fn run_host_with_parent(
                 shell_hook.tick();
                 if auto_present {
                     presenter.tick();
+                    if let Some(frameless) = frameless.as_mut() {
+                        frameless.tick();
+                    }
                 }
                 #[cfg(feature = "diagnostics")]
                 if let Some(frame) = view_event_trace
