@@ -16,9 +16,13 @@
 set -eu
 cd /home/boite/projects/explorust
 pf='C:\Program Files\explorust'
-mode=$(timeout 90 os win run g1 --ps -- "if (Test-Path '$pf\\explorust.exe') { 'MODE=installed' } else { 'MODE=plain' }" 2>&1)
-mode=$(cat "$(echo "$mode" | grep '^log:' | awk '{print $2}')" | grep -o 'MODE=[a-z]*' | cut -d= -f2)
-echo "g1 mode: ${mode:-unknown}"
+# The mode query: a failure stops the deploy with what os win said (set -e alone exits silently here).
+q=$(timeout 90 os win run g1 --ps -- "if (Test-Path '$pf\\explorust.exe') { 'MODE=installed' } else { 'MODE=plain' }" 2>&1) || { echo "g1-deploy: mode query failed (os win run exit $?): $q" >&2; exit 1; }
+qlog=$(echo "$q" | grep '^log:' | awk '{print $2}' || true)
+[ -n "$qlog" ] && [ -f "$qlog" ] || { echo "g1-deploy: mode query gave no log file: $q" >&2; exit 1; }
+mode=$(grep -o 'MODE=[a-z]*' "$qlog" | cut -d= -f2 || true)
+case "$mode" in installed|plain) ;; *) echo "g1-deploy: mode query answered neither installed nor plain: $(head -c 400 "$qlog")" >&2; exit 1 ;; esac
+echo "g1 mode: $mode"
 ua=0
 [ "$mode" = installed ] && ua=1
 os job run --wait -- env EXPLORUST_UIACCESS=$ua cargo build --release --target x86_64-pc-windows-gnu -p shell -p keys -p guard -p devkeys -p files -p inject -p notify -p viewer -p taskman
