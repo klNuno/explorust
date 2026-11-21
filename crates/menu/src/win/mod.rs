@@ -16,9 +16,10 @@ use std::time::Instant;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::Common::{ITEMIDLIST, STRRET};
 use windows::Win32::UI::Shell::{IPersistFolder2, IShellFolder, SHGDNF, SHGDN_FORPARSING, SHGDN_INFOLDER, SVGIO_ALLVIEW, StrRetToBufW};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::Ole::IObjectWithSite;
+use windows::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT};
 use windows::Win32::UI::Shell::{
     DefSubclassProc, IContextMenu, IFolderView2, IShellView, RemoveWindowSubclass, SVGIO_BACKGROUND,
@@ -40,25 +41,37 @@ thread_local! {
 }
 
 /// Shows the context menu of `cm` at a screen point and runs the command picked. `items` is the
-/// selection's menu (top row, rename), not the background's; `classic` goes straight to the classic
-/// menu with the extended verbs (Shift held).
+/// selection's menu (top row, rename), not the background's; `classic` requests the extended
+/// classic menu explicitly (Shift held).
 pub fn show(owner: HWND, cm: &IContextMenu, x: i32, y: i32, items: bool, classic: bool) {
-    show_at(owner, cm, POINT { x, y }, items, classic, Instant::now());
+    let prefer_classic = classic || classic_preferred();
+    show_at(owner, cm, POINT { x, y }, items, prefer_classic, classic, Instant::now());
 }
 
-fn show_at(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool, t0: Instant) {
-    let key = if items { "items:local".to_string() } else { background_key(owner) };
-    show_local(owner, cm, at, items, classic, t0, key);
+fn classic_preferred() -> bool {
+    let path = windows_core::w!(r"Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32");
+    [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].into_iter().any(|root| {
+        let mut key = HKEY::default();
+        unsafe {
+            if RegOpenKeyExW(root, path, None, KEY_QUERY_VALUE, &mut key) != ERROR_SUCCESS {
+                return false;
+            }
+            let _ = RegCloseKey(key);
+        }
+        true
+    })
 }
 
 /// The menu of `cm`, filled on this thread (after the first frame when a menu of its kind was
 /// shown before).
-fn show_local(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool, t0: Instant, key: String) {
+fn show_at(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool, extended: bool, t0: Instant) {
     // SAFETY: a menu this thread creates, fills through the handler and destroys.
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else { return };
     let mut flags = if items { CMF_CANRENAME } else { 0 };
     if classic {
-        flags |= CMF_EXTENDEDVERBS;
+        if extended {
+            flags |= CMF_EXTENDEDVERBS;
+        }
         let hr = unsafe { cm.QueryContextMenu(menu, 0, FIRST, LAST, flags) };
         let tq = t0.elapsed().as_secs_f64() * 1000.0;
         log::line(&format!("classic menu ({}), handlers filled it in {tq:.1} ms ({hr:?})", if items { "items" } else { "background" }));
@@ -70,6 +83,7 @@ fn show_local(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: b
         let _ = unsafe { DestroyMenu(menu) };
         return;
     }
+    let key = if items { "items:local".to_string() } else { background_key(owner) };
     let mut fill = || {
         let t = Instant::now();
         // SAFETY: the handlers fill our menu on this thread.
@@ -464,7 +478,8 @@ fn on_context(defview: HWND, view: &IShellView, lp: LPARAM, t0: Instant) -> bool
         }
         let fv = view.cast::<IFolderView2>().ok();
         let items = fv.as_ref().and_then(|f| f.ItemCount(SVGIO_SELECTION).ok()).unwrap_or(0) > 0;
-        if items && !shift {
+        let classic = shift || classic_preferred();
+        if items && !classic {
             if let Some(fv) = &fv {
                 if show_worker(defview, view, fv, POINT { x, y }, t0) {
                     return true;
@@ -481,7 +496,7 @@ fn on_context(defview: HWND, view: &IShellView, lp: LPARAM, t0: Instant) -> bool
         if let Some(s) = &site {
             let _ = s.SetSite(view);
         }
-        show_at(defview, &cm, POINT { x, y }, items, shift, t0);
+        show_at(defview, &cm, POINT { x, y }, items, classic, shift, t0);
         if let Some(s) = &site {
             let _ = s.SetSite(None);
         }
