@@ -18,8 +18,8 @@ use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_
 use windows::core::{HSTRING, PCWSTR};
 
 const EXE: &str = "explorust-keys.exe";
-/// More deaths than this within `DEATH_WINDOW` and the hook moves into this process.
-const MAX_DEATHS: usize = 5;
+/// This many deaths within `DEATH_WINDOW` is a problem (`problem`): explorer takes the session.
+const MAX_DEATHS: usize = 3;
 const DEATH_WINDOW: Duration = Duration::from_secs(60);
 
 /// The quit event and the running exe, as raw handle values (handles are not Send).
@@ -114,8 +114,11 @@ fn supervise(exe: &Path) {
         deaths.retain(|t| now.duration_since(*t) < DEATH_WINDOW);
         deaths.push(now);
         if deaths.len() >= MAX_DEATHS {
-            log::line(&format!("explorust-keys ended {MAX_DEATHS} times in a minute (last code {code:#x}): hotkeys in-process instead"));
-            return in_process();
+            // Installed, the in-process hook would lose keys over elevated windows: a problem, so
+            // the guard hands the session to explorer.
+            log::line(&format!("explorust-keys ended {MAX_DEATHS} times in a minute (last code {code:#x})"));
+            crate::problem::report(format!("the keyboard helper explorust-keys.exe stopped {MAX_DEATHS} times in a minute"));
+            return;
         }
         log::line(&format!("explorust-keys ended (code {code:#x}): starting it again"));
         std::thread::sleep(Duration::from_secs(1));

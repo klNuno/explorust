@@ -10,18 +10,25 @@
 //! - `--fallback`: ask a running guard to kill explorust and start explorer (same as Ctrl+Alt+Shift+F12).
 //! - `--status`: print the Shell value, the Windows build and the last good build.
 //! - `--adopt <pid>`: started by explorust when its guard died; supervises that explorust.
+//! - `--setup`: the installer's run (`setup`): question, `--install`, Apps entry, sign-out offer.
+//! - `--uninstall [--yes|--quiet]`: the user's way back (`uninstall`), asks Windows for rights.
 
 #![windows_subsystem = "windows"]
 
+mod apps;
 mod folders;
 mod hotkey;
 mod install;
-mod package;
 mod log;
+mod notice;
+mod package;
 mod policy;
 mod proc;
 mod reg;
+mod setup;
 mod supervise;
+mod ui;
+mod uninstall;
 
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::System::Threading::CreateMutexW;
@@ -46,8 +53,26 @@ fn main() {
                 2
             }
         },
-        "--install" => install(),
-        "--restore" => restore(),
+        "--install" => {
+            let code = install();
+            if code == 0 && install::elevated() {
+                say(&format!("install: {}", apps::register(&install::dir().join("explorust-guard.exe"))));
+            }
+            code
+        }
+        "--restore" => {
+            let code = restore();
+            if install::elevated() {
+                say(&format!("restore: {}", apps::unregister()));
+            }
+            reg::set_problem_streak(0);
+            code
+        }
+        "--setup" => setup::run(),
+        "--uninstall" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            uninstall::run(rest.iter().any(|a| a == "--yes"), rest.iter().any(|a| a == "--quiet"))
+        }
         "--fallback" => match proc::Event::set_existing(supervise::FALLBACK_EVENT) {
             Ok(()) => {
                 say("fallback requested");
@@ -60,17 +85,19 @@ fn main() {
         },
         "--status" => {
             say(&format!(
-                "Shell={:?} build={} last_good={:?} installed={} certificate_trusted={}",
+                "Shell={:?} build={} last_good={:?} installed={} certificate_trusted={} apps_entry={} problem_streak={}",
                 reg::shell(),
                 reg::windows_build(),
                 reg::last_good_build(),
                 install::dir().join("explorust.exe").exists(),
-                install::trusted()
+                install::trusted(),
+                reg::has_uninstall_entry(),
+                reg::problem_streak()
             ));
             0
         }
         other => {
-            say(&format!("unknown argument {other}; use --install, --restore, --fallback or --status"));
+            say(&format!("unknown argument {other}; use --setup, --install, --uninstall, --restore, --fallback or --status"));
             2
         }
     };
@@ -87,7 +114,7 @@ fn run_shell(adopt: Option<u32>) -> u32 {
     supervise::run(adopt)
 }
 
-fn install() -> u32 {
+pub(crate) fn install() -> u32 {
     let me = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -133,7 +160,7 @@ fn install() -> u32 {
     }
 }
 
-fn restore() -> u32 {
+pub(crate) fn restore() -> u32 {
     let code = match reg::delete_shell() {
         Ok(true) => {
             say("restored: the per-user Shell value is gone, next logon is plain Windows");

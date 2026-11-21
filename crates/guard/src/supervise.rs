@@ -1,7 +1,9 @@
-//! The logon loop: start explorust, wait for its ready signal, restart it once, and fall back to
-//! explorer.exe on the second failure, on the hotkey, on Shift held at logon or when it is missing.
+//! The logon loop: start explorust, wait for its ready signal, watch it, and at the first problem
+//! start explorer.exe for the rest of the session and tell the user once (`notice`). Also falls
+//! back on the hotkey, on Shift held at logon or when explorust.exe is missing, without a word.
 
-use crate::policy::{Next, Policy, ready_timeout};
+use crate::notice::{self, Notice};
+use crate::policy::{AtLogon, HEALTHY_AFTER, PROBE, Probe, Watchdog, at_logon, ready_timeout};
 use crate::proc::{Child, Event, wait_any};
 use crate::{folders, hotkey, log, reg};
 use std::path::{Path, PathBuf};
@@ -10,7 +12,9 @@ use std::time::{Duration, Instant};
 pub const FALLBACK_EVENT: &str = r"Local\explorust-guard-fallback";
 
 enum End {
-    Failed(String),
+    /// Something went wrong: explorer takes over and the user is told.
+    Problem(String),
+    /// Asked for (hotkey, `--fallback`, `--restore`, a clean exit): explorer, no message.
     Fallback(String),
     /// explorust exited with code 5 (`explorust --reload`).
     Reload,
@@ -18,6 +22,9 @@ enum End {
 
 /// The exit code of `explorust --reload`.
 const RELOAD: u32 = 5;
+/// explorust's exit code when it found a problem itself (a part that crashed twice or hangs, the
+/// keyboard helper dying): its reason is in `problem.txt`.
+const PROBLEM: u32 = 6;
 
 /// `adopt`: the pid of a running explorust whose guard died; it is watched instead of starting one.
 pub fn run(adopt: Option<u32>) -> u32 {
@@ -25,13 +32,12 @@ pub fn run(adopt: Option<u32>) -> u32 {
         Ok(e) => e,
         Err(e) => {
             log::line(&format!("guard: {e}; starting explorer"));
-            return explorer_forever();
+            return explorer_forever(None);
         }
     };
     hotkey::spawn(fallback.0);
     let exe = shell_exe();
     let build = reg::windows_build();
-    let mut policy = Policy::new(Duration::from_secs(300));
     let mut attempt = 0u32;
     let mut adopted = None;
     if let Some(pid) = adopt {
@@ -44,12 +50,19 @@ pub fn run(adopt: Option<u32>) -> u32 {
         log::line(&format!("guard start: windows {build}, shell {}", exe.display()));
         if hotkey::shift_held() {
             log::line("Shift held at logon: plain explorer");
-            return explorer_forever();
+            return explorer_forever(None);
+        }
+        let streak = reg::problem_streak();
+        if at_logon(streak) == AtLogon::TurnOff {
+            let gone = reg::delete_shell();
+            log::line(&format!("{streak} logons in a row ended in a problem: explorust turned off (Shell value deleted: {gone:?})"));
+            reg::set_problem_streak(0);
+            return explorer_forever(Some(Notice::TurnedOff));
         }
     }
     if !exe.exists() {
         log::line("explorust.exe missing: plain explorer");
-        return explorer_forever();
+        return explorer_forever(None);
     }
     loop {
         let end = match adopted.take() {
@@ -64,15 +77,14 @@ pub fn run(adopt: Option<u32>) -> u32 {
             End::Reload => swap_next(&exe),
             End::Fallback(why) => {
                 log::line(&format!("fallback: {why}"));
-                return explorer_forever();
+                return explorer_forever(None);
             }
-            End::Failed(why) => match policy.failed(Instant::now()) {
-                Next::Restart => log::line(&format!("explorust failed ({why}): restarting once")),
-                Next::Fallback => {
-                    log::line(&format!("explorust failed again ({why}): plain explorer"));
-                    return explorer_forever();
-                }
-            },
+            End::Problem(why) => {
+                let streak = reg::problem_streak() + 1;
+                reg::set_problem_streak(streak);
+                log::line(&format!("problem: {why}; plain explorer for this session (problem logons in a row: {streak})"));
+                return explorer_forever(Some(Notice::Problem(why)));
+            }
         }
     }
 }
@@ -89,12 +101,19 @@ fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &E
     }
     let child = match Child::spawn(exe, &args) {
         Ok(c) => c,
-        Err(e) => return End::Failed(e),
+        Err(e) => return End::Problem(format!("explorust did not start: {e}")),
     };
+    let _ = std::fs::remove_file(problem_file());
     log::line(&format!("started explorust pid {} ({args})", child.pid));
     let timeout = ready_timeout(self_test);
     match wait_any(&[child.handle, ready.0, fallback.0], Some(timeout.as_millis() as u32)) {
-        Some(0) => return End::Failed(format!("exited before ready, code {}", child.exit_code())),
+        Some(0) => {
+            let code = child.exit_code();
+            return End::Problem(match problem_reason(code) {
+                Some(r) => format!("explorust stopped while starting: {r}"),
+                None => format!("explorust stopped while starting (code {code:#x})"),
+            });
+        }
         Some(1) => {
             log::line(&format!("explorust ready (self-test: {self_test})"));
             folders::handler(true);
@@ -108,25 +127,102 @@ fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &E
         }
         None => {
             child.kill();
-            return End::Failed(format!("not ready after {} s", timeout.as_secs()));
+            return End::Problem(format!("explorust was not ready after {} s", timeout.as_secs()));
         }
     }
     watch(&child, fallback)
 }
 
-/// Waits for a ready explorust to end or for the escape hatch.
+/// Watches a ready explorust until it ends, its taskbar stops answering, or the escape hatch.
+/// After `HEALTHY_AFTER` without a problem the streak of problem logons goes back to zero.
 fn watch(child: &Child, fallback: &Event) -> End {
-    match wait_any(&[child.handle, fallback.0], None) {
-        Some(0) => match child.exit_code() {
-            0 => End::Fallback("explorust exited cleanly".into()),
-            RELOAD => End::Reload,
-            code => End::Failed(format!("crashed after ready, code {code:#x}")),
-        },
-        _ => {
+    let since = Instant::now();
+    let mut healthy = false;
+    let mut dog = Watchdog::default();
+    let taskbar_off = parts_off().iter().any(|p| p == "taskbar");
+    loop {
+        match wait_any(&[child.handle, fallback.0], Some(PROBE.as_millis() as u32)) {
+            Some(0) => {
+                return match child.exit_code() {
+                    0 => End::Fallback("explorust exited cleanly".into()),
+                    RELOAD => End::Reload,
+                    code => End::Problem(match problem_reason(code) {
+                        Some(r) => r,
+                        None => format!("explorust crashed (code {code:#x})"),
+                    }),
+                };
+            }
+            Some(_) => {
+                child.kill();
+                return End::Fallback("hotkey or --fallback".into());
+            }
+            None => {}
+        }
+        if !healthy && since.elapsed() >= HEALTHY_AFTER {
+            healthy = true;
+            if reg::problem_streak() != 0 {
+                reg::set_problem_streak(0);
+                log::line(&format!("explorust healthy for {} s: problem streak reset", HEALTHY_AFTER.as_secs()));
+            }
+        }
+        if taskbar_off {
+            continue;
+        }
+        if let Some(why) = dog.probe(taskbar_probe(child.pid)) {
+            // A hung process may also ignore its quit event: kill waits up to 10 s, then the
+            // fallback goes on anyway.
             child.kill();
-            End::Fallback("hotkey or --fallback".into())
+            return End::Problem(why);
         }
     }
+}
+
+/// Asks explorust's taskbar window for an answer within 2 s.
+fn taskbar_probe(pid: u32) -> Probe {
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowExW, GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL,
+    };
+    use windows::core::w;
+    // SAFETY: window lookups and a bounded send; a stale handle only fails them.
+    unsafe {
+        let mut after: Option<HWND> = None;
+        loop {
+            let Ok(h) = FindWindowExW(None, after, w!("Shell_TrayWnd"), None) else { return Probe::Missing };
+            if h.is_invalid() {
+                return Probe::Missing;
+            }
+            let mut owner = 0u32;
+            GetWindowThreadProcessId(h, Some(&mut owner));
+            if owner == pid {
+                let mut out = 0usize;
+                let r = SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000, Some(&mut out));
+                return if r.0 != 0 { Probe::Answered } else { Probe::NoAnswer };
+            }
+            after = Some(h);
+        }
+    }
+}
+
+/// Where explorust writes why it stopped with `PROBLEM` (same folder as the logs).
+fn problem_file() -> PathBuf {
+    log::dir().join("problem.txt")
+}
+
+fn problem_reason(code: u32) -> Option<String> {
+    if code != PROBLEM {
+        return None;
+    }
+    let text = std::fs::read_to_string(problem_file()).ok()?;
+    let _ = std::fs::remove_file(problem_file());
+    Some(text.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+/// Parts set aside in `parts-off.txt` (the shell reads the same file).
+fn parts_off() -> Vec<String> {
+    std::fs::read_to_string(log::dir().join("parts-off.txt"))
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
 }
 
 /// A reload: `explorust.next.exe` beside explorust.exe, if present, replaces it before the restart.
@@ -162,9 +258,10 @@ pub fn explorer_path() -> PathBuf {
 }
 
 /// Keeps a plain explorer.exe running as the shell for the rest of the session, restarting it when it
-/// ends (at most 5 times in 5 minutes).
-fn explorer_forever() -> u32 {
+/// ends (at most 5 times in 5 minutes). `notice`, once explorer runs, tells the user why.
+fn explorer_forever(notice: Option<Notice>) -> u32 {
     folders::handler(false);
+    let mut notice = notice;
     let path = explorer_path();
     let mut starts: Vec<Instant> = Vec::new();
     loop {
@@ -183,6 +280,9 @@ fn explorer_forever() -> u32 {
             }
         };
         log::line(&format!("started explorer pid {}", child.pid));
+        if let Some(n) = notice.take() {
+            notice::show_later(n);
+        }
         wait_any(&[child.handle], None);
         log::line(&format!("explorer pid {} ended, code {:#x}", child.pid, child.exit_code()));
         std::thread::sleep(Duration::from_secs(2));

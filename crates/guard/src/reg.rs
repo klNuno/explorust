@@ -2,8 +2,8 @@
 
 use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegDeleteKeyValueW,
-    RegGetValueW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegDeleteKeyValueW,
+    RegDeleteTreeW, RegGetValueW, RegSetKeyValueW,
 };
 use windows::core::HSTRING;
 
@@ -48,6 +48,14 @@ fn set_sz(root: HKEY, key: &str, name: &str, value: &str) -> Result<(), String> 
     .map_err(|e| format!("set {name}: {e}"))
 }
 
+fn set_dword(root: HKEY, key: &str, name: &str, value: u32) -> Result<(), String> {
+    let (key, name) = (HSTRING::from(key), HSTRING::from(name));
+    // SAFETY: a 4-byte DWORD.
+    unsafe { RegSetKeyValueW(root, &key, &name, REG_DWORD.0, Some((&value as *const u32).cast()), 4) }
+        .ok()
+        .map_err(|e| format!("set {name}: {e}"))
+}
+
 fn delete(root: HKEY, key: &str, name: &str) -> Result<bool, String> {
     let (key, name) = (HSTRING::from(key), HSTRING::from(name));
     // SAFETY: plain value deletion.
@@ -84,4 +92,42 @@ pub fn last_good_build() -> Option<String> {
 
 pub fn set_last_good_build(build: &str) -> Result<(), String> {
     set_sz(HKEY_CURRENT_USER, STATE, "LastGoodBuild", build)
+}
+
+/// Logons in a row that ended in a problem (`policy::MAX_STREAK` turns explorust off).
+pub fn problem_streak() -> u32 {
+    get_dword(HKEY_CURRENT_USER, STATE, "ProblemStreak").unwrap_or(0)
+}
+
+pub fn set_problem_streak(n: u32) {
+    if let Err(e) = set_dword(HKEY_CURRENT_USER, STATE, "ProblemStreak", n) {
+        crate::log::line(&format!("problem streak: {e}"));
+    }
+}
+
+/// The Apps & features entry, under HKLM (elevated only).
+const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\explorust";
+
+pub fn set_uninstall_entry(values: &[(&str, &str)], dwords: &[(&str, u32)]) -> Result<(), String> {
+    for (n, v) in values {
+        set_sz(HKEY_LOCAL_MACHINE, UNINSTALL, n, v)?;
+    }
+    for (n, v) in dwords {
+        set_dword(HKEY_LOCAL_MACHINE, UNINSTALL, n, *v)?;
+    }
+    Ok(())
+}
+
+pub fn delete_uninstall_entry() -> Result<bool, String> {
+    let key = HSTRING::from(UNINSTALL);
+    // SAFETY: deletes a key this program created.
+    let rc = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, &key) };
+    if rc == ERROR_FILE_NOT_FOUND {
+        return Ok(false);
+    }
+    rc.ok().map(|_| true).map_err(|e| format!("delete the uninstall entry: {e}"))
+}
+
+pub fn has_uninstall_entry() -> bool {
+    get_sz(HKEY_LOCAL_MACHINE, UNINSTALL, "UninstallString").is_some()
 }

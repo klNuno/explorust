@@ -4,9 +4,13 @@ use std::io::Write;
 use std::path::PathBuf;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
-pub fn line(msg: &str) {
+pub fn dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("explorust");
+    base.join("explorust")
+}
+
+pub fn line(msg: &str) {
+    let dir = dir();
     let _ = std::fs::create_dir_all(&dir);
     // SAFETY: GetLocalTime only writes the returned struct.
     let t = unsafe { GetLocalTime() };

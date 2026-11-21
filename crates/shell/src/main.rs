@@ -33,6 +33,7 @@ mod keyhost;
 mod log;
 #[cfg(target_os = "windows")]
 mod minimized;
+mod problem;
 #[cfg(target_os = "windows")]
 mod run;
 #[cfg(target_os = "windows")]

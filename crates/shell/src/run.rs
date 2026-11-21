@@ -1,7 +1,7 @@
 //! Argument parsing and the process lifetime: host thread up, optional self-test, ready signal,
 //! then wait for a quit request or the host's end.
 
-use crate::{actions, components, events, guardwatch, keyhost, log, minimized, selftest};
+use crate::{actions, components, events, guardwatch, keyhost, log, minimized, problem, selftest};
 use std::sync::mpsc;
 use std::time::Duration;
 use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
@@ -12,6 +12,8 @@ pub const OTHER_SHELL: i32 = 3;
 pub const SELF_TEST_FAILED: i32 = 4;
 /// `--reload`: the guard swaps in `explorust.next.exe` if present and starts explorust again.
 pub const RELOAD: i32 = 5;
+/// A problem found inside (`problem`): the guard starts explorer.exe and tells the user.
+pub const PROBLEM: i32 = 6;
 
 /// How long the host gets to publish the shell window and start the controller. A first run on a
 /// new Windows build downloads twinui's PDB (tens of MB) before it is ready.
@@ -117,6 +119,7 @@ fn shell(args: &Args) -> i32 {
     actions::spawn();
     keyhost::start();
     components::spawn_all();
+    components::spawn_watchdog();
     if let Some(pid) = args.guard {
         guardwatch::spawn(pid);
     }
@@ -138,6 +141,13 @@ fn shell(args: &Args) -> i32 {
             keyhost::stop();
             components::shutdown_all();
             return RELOAD;
+        }
+        if let Some(why) = problem::take() {
+            log::line(&format!("stopping on a problem: {why}"));
+            keyhost::stop();
+            components::shutdown_all();
+            minimized::restore();
+            return PROBLEM;
         }
         if done_rx.try_recv().is_ok() {
             return HOST_FAILED;
