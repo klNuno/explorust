@@ -1,0 +1,12 @@
+[package]
+name = "setup"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "explorust-setup"
+path = "src/main.rs"
+
+[dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }

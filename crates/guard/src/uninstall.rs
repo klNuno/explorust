@@ -90,7 +90,15 @@ pub fn run(yes: bool, quiet: bool) -> u32 {
         log::line("uninstall: cancelled by the user");
         return 1;
     }
-    let code = crate::restore();
+    let code = if quiet {
+        crate::restore()
+    } else {
+        ui::working(
+            tr("Retour à Windows", "Going back to Windows"),
+            tr("explorust se désinstalle, cela peut prendre une minute.", "explorust is being uninstalled, this can take a minute."),
+            crate::restore,
+        )
+    };
     let apps = apps::unregister();
     log::line(&format!("uninstall: {apps}"));
     reg::set_problem_streak(0);

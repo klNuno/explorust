@@ -35,7 +35,11 @@ pub fn run() -> u32 {
         log::line("setup: cancelled by the user");
         return 1;
     }
-    let code = crate::install();
+    let code = ui::working(
+        tr("Installation d'explorust", "Installing explorust"),
+        tr("Cela peut prendre une ou deux minutes.", "This can take a minute or two."),
+        crate::install,
+    );
     if code != 0 {
         ui::tell(
             Icon::Warning,
