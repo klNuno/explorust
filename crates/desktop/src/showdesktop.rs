@@ -84,16 +84,27 @@ pub fn press(progman: Option<HWND>) {
     });
     match action {
         Action::Minimize(ws) => {
+            let mut keys = 0;
             for &id in &ws {
+                // An elevated window ignores this process (UIPI): the keys host minimizes it.
+                if bus::above_me(hwnd(id)) && bus::post(bus::Command::Minimize, id) {
+                    keys += 1;
+                    continue;
+                }
                 // SAFETY: async show requests do not wait on a hung window.
                 let _ = unsafe { ShowWindowAsync(hwnd(id), SW_SHOWMINNOACTIVE) };
             }
             let fg = progman.map(|p| unsafe { SetForegroundWindow(p) }.as_bool());
-            log::line(&format!("show desktop: minimized {} windows, desktop focused {fg:?}", ws.len()));
+            log::line(&format!("show desktop: minimized {} windows ({keys} through explorust-keys), desktop focused {fg:?}", ws.len()));
         }
         Action::Restore(ws) => {
+            let mut keys = 0;
             for &id in &ws {
                 let h = hwnd(id);
+                if bus::above_me(h) && bus::post(bus::Command::Restore, id) {
+                    keys += 1;
+                    continue;
+                }
                 // SAFETY: restore without activation, then raise it above the ones restored before.
                 unsafe {
                     let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
@@ -107,8 +118,9 @@ pub fn press(progman: Option<HWND>) {
                 }
             }
             let top = ws.last().copied();
-            let fg = top.map(|t| unsafe { SetForegroundWindow(hwnd(t)) }.as_bool());
-            log::line(&format!("show desktop: restored {} windows, top focused {fg:?}", ws.len()));
+            // The keys host can give the foreground to an elevated window; this process cannot.
+            let fg = top.map(|t| if bus::above_me(hwnd(t)) && bus::post(bus::Command::Activate, t) { true } else { unsafe { SetForegroundWindow(hwnd(t)) }.as_bool() });
+            log::line(&format!("show desktop: restored {} windows ({keys} through explorust-keys), top focused {fg:?}", ws.len()));
         }
         Action::Nothing => log::line("show desktop: nothing to do"),
     }

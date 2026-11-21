@@ -28,6 +28,9 @@ static SWITCHING: AtomicBool = AtomicBool::new(false);
 /// Alt+Tab took a Tab since Alt went down: the app in front saw Alt down alone, so its Alt up is
 /// masked or the app would show its menu or its key tips (Windows' own Alt+Tab leaves none).
 static ALT_MASK: AtomicBool = AtomicBool::new(false);
+/// A line `altmask` in `%LOCALAPPDATA%\explorust\parts-off.txt` leaves Alt up unmasked after
+/// Alt+Tab (the before case of the key tips check).
+static ALT_MASK_OFF: AtomicBool = AtomicBool::new(false);
 /// The key whose down was swallowed, so its up is swallowed too.
 static SWALLOWED: AtomicU32 = AtomicU32::new(0);
 /// A part answered a chord (or the tap) since Win went down: Win up is masked.
@@ -60,6 +63,11 @@ fn log(msg: &str) {
 /// `log` writes one line to the host's log.
 pub fn spawn(log_line: fn(&str)) -> Result<(), String> {
     let _ = LOG.set(log_line);
+    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    if std::fs::read_to_string(base.join("explorust").join("parts-off.txt")).is_ok_and(|s| s.lines().any(|l| l.trim() == "altmask")) {
+        ALT_MASK_OFF.store(true, Relaxed);
+        log("altmask: off (parts-off.txt), Alt up after Alt+Tab reaches the app");
+    }
     if let Err(e) = crate::activate::spawn() {
         log(&e);
     }
@@ -195,7 +203,7 @@ fn key(vk: u32, down: bool, alt: bool) -> Option<LRESULT> {
     }
     if vk == VK_TAB && alt && post(Command::SwitcherNext, SHIFT.load(Relaxed) as isize) {
         SWITCHING.store(true, Relaxed);
-        ALT_MASK.store(true, Relaxed);
+        ALT_MASK.store(!ALT_MASK_OFF.load(Relaxed), Relaxed);
         return Some(swallow(vk));
     }
     if !SWITCHING.load(Relaxed) {

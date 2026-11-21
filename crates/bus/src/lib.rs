@@ -65,6 +65,12 @@ pub enum Command {
     /// Bring a window to the foreground (lParam = its HWND). Answered by explorust-keys.exe, whose UI
     /// access lets it activate any window, a UWP frame included, over an elevated foreground window.
     Activate = 25,
+    /// Minimize a window without activating it (lParam = its HWND), for Win+D over a window
+    /// of a process above explorust's integrity. Answered by explorust-keys.exe (UI access).
+    Minimize = 26,
+    /// Restore a window without activating it and raise it to the top (lParam = its HWND), the
+    /// second Win+D press for the same windows.
+    Restore = 27,
 }
 
 impl Command {
@@ -96,6 +102,8 @@ impl Command {
             23 => SwitcherClose,
             24 => ShellAction,
             25 => Activate,
+            26 => Minimize,
+            27 => Restore,
             _ => return None,
         })
     }
@@ -112,7 +120,7 @@ impl Command {
             FilesOpen => Owner::Files,
             ShowDesktop => Owner::Desktop,
             ShellAction => Owner::Shell,
-            Activate => Owner::Keys,
+            Activate | Minimize | Restore => Owner::Keys,
             // Sent to each owner with `post_to`.
             Shutdown => Owner::Taskbar,
         }
@@ -248,6 +256,55 @@ mod win {
         let _ = unsafe { ChangeWindowMessageFilterEx(hwnd, MSG_COMMAND, MSGFLT_ALLOW, None) };
     }
 
+    /// The mandatory integrity level of a process token (its label's last sub-authority).
+    fn integrity(process: windows::Win32::Foundation::HANDLE) -> Option<u32> {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::Security::{
+            GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel,
+        };
+        use windows::Win32::System::Threading::OpenProcessToken;
+        // SAFETY: queries a token into a local buffer and closes it; the label's SID points into it.
+        unsafe {
+            let mut token = HANDLE::default();
+            OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+            let mut buf = [0u64; 16];
+            let mut len = 0u32;
+            let ok = GetTokenInformation(token, TokenIntegrityLevel, Some(buf.as_mut_ptr().cast()), 128, &mut len).is_ok();
+            let _ = CloseHandle(token);
+            if !ok {
+                return None;
+            }
+            let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+            let sid = label.Label.Sid;
+            let n = *GetSidSubAuthorityCount(sid);
+            Some(*GetSidSubAuthority(sid, n.saturating_sub(1) as u32))
+        }
+    }
+
+    /// True when `h` belongs to a process above this one's integrity level, or one whose level
+    /// cannot be read: Windows (UIPI) drops what this process sends it, so only the keys host,
+    /// which has UI access, can move it.
+    pub fn above_me(h: HWND) -> bool {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+        let mut pid = 0u32;
+        // SAFETY: plain queries; the process handle is closed.
+        unsafe {
+            GetWindowThreadProcessId(h, Some(&mut pid));
+            if pid == 0 || pid == std::process::id() {
+                return false;
+            }
+            let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return true };
+            let theirs = integrity(p);
+            let _ = CloseHandle(p);
+            match (theirs, integrity(GetCurrentProcess())) {
+                (Some(t), Some(m)) => t > m,
+                _ => true,
+            }
+        }
+    }
+
     /// Decodes a `MSG_COMMAND` message: `(command, argument)`.
     pub fn decode(wparam: WPARAM, lparam: LPARAM) -> Option<(Command, isize)> {
         Command::from_u32(wparam.0 as u32).map(|c| (c, lparam.0))
@@ -285,13 +342,15 @@ mod tests {
 
     #[test]
     fn every_command_round_trips() {
-        for v in 1..=25 {
+        for v in 1..=27 {
             let c = Command::from_u32(v).unwrap();
             assert_eq!(c as u32, v);
         }
         assert!(Command::from_u32(0).is_none());
-        assert!(Command::from_u32(26).is_none());
+        assert!(Command::from_u32(28).is_none());
         assert_eq!(Command::Activate.owner(), Owner::Keys);
+        assert_eq!(Command::Minimize.owner(), Owner::Keys);
+        assert_eq!(Command::Restore.owner(), Owner::Keys);
         assert_eq!(class_of(Owner::Keys), "explorust.keys");
     }
 

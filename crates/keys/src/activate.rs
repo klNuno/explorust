@@ -12,8 +12,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_MOUSE, SendInput,
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowExW, GA_ROOT,
     GetAncestor, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindowTextW, GetWindowThreadProcessId, HWND_MESSAGE,
-    IsIconic, IsWindow, MSG, RegisterClassW, SW_RESTORE, SetForegroundWindow, ShowWindow, SwitchToThisWindow, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WNDCLASSW,
+    HWND_TOP, IsIconic, IsWindow, MSG, RegisterClassW, SW_RESTORE, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos, ShowWindow, ShowWindowAsync, SwitchToThisWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -70,6 +71,19 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 class(frame),
                 t.elapsed().as_secs_f32() * 1000.0
             ));
+        } else if let Some((cmd @ (bus::Command::Minimize | bus::Command::Restore), h)) = bus::decode(wp, lp) {
+            let target = HWND(h as _);
+            let min = cmd == bus::Command::Minimize;
+            // SAFETY: async requests on a handle from the shell; a stale one only fails them, a
+            // hung target never stalls this thread.
+            let ok = unsafe {
+                let ok = ShowWindowAsync(target, if min { SW_SHOWMINNOACTIVE } else { SW_SHOWNOACTIVATE }).as_bool();
+                if !min {
+                    let _ = SetWindowPos(target, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                }
+                ok
+            };
+            crate::hook::log_line(&format!("{} {:?} ({}) for show desktop: {ok}", if min { "minimize" } else { "restore" }, title(target), class(target)));
         }
         return LRESULT(0);
     }
