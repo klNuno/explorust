@@ -15,5 +15,9 @@ mod activate;
 mod hook;
 #[cfg(target_os = "windows")]
 mod pipe;
+#[cfg(any(target_os = "windows", test))]
+mod restore;
 #[cfg(target_os = "windows")]
 pub use hook::{spawn, spawn_for_shell};
+#[cfg(target_os = "windows")]
+pub use restore::restore_desktop;

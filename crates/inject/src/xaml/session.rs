@@ -3,15 +3,17 @@
 
 use super::abi::*;
 use super::config::{self, Changes};
+use super::owner::{self, Loader};
 use super::report;
 use super::rules::Rules;
-use super::state::{DispatchProgress, SiteChange, SiteQueue};
+use super::state::{DispatchProgress, SiteChange, SiteQueue, StyleOwner};
 use super::watch::{Tree, Watch};
+use std::os::windows::io::OwnedHandle;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use windows::UI::Core::{CoreDispatcher, CoreDispatcherPriority, DispatchedHandler};
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, E_INVALIDARG, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
 use windows_core::{IInspectable, IUnknown, Interface, PCWSTR};
@@ -107,14 +109,26 @@ fn run_sessions(rx: &mpsc::Receiver<SiteChange<Site>>, wake: &Arc<Wake>) {
             continue;
         }
 
-        let (events, len) = match active.as_ref().and_then(|s| s.changes.as_ref()) {
-            Some(changes) => ([wake.0, changes.0], 2),
-            None => ([wake.0, HANDLE::default()], 1),
-        };
-        // SAFETY: the worker holds both handles until the wait returns.
+        let mut events = [wake.0, HANDLE::default(), HANDLE::default(), HANDLE::default()];
+        let mut len = 1;
+        let mut directory_event = None;
+        if let Some(s) = &active {
+            events[len] = owner::handle(&s.owner_wake);
+            len += 1;
+            if let Some(process) = &s.owner.process {
+                events[len] = process.handle();
+                len += 1;
+            }
+            if let Some(changes) = &s.changes {
+                directory_event = Some(WAIT_OBJECT_0.0 + len as u32);
+                events[len] = changes.0;
+                len += 1;
+            }
+        }
+        // SAFETY: the worker holds each handle until the wait returns.
         let event = unsafe { WaitForMultipleObjects(&events[..len], false, timeout) };
         if let Some(s) = active.as_mut() {
-            if event.0 == WAIT_OBJECT_0.0 + 1 {
+            if Some(event.0) == directory_event {
                 s.changed();
             } else if event == WAIT_FAILED {
                 s.changes = None;
@@ -137,6 +151,9 @@ struct Session {
     cb: IVisualTreeServiceCallback2,
     tree: Arc<Tree>,
     dir: PathBuf,
+    image: String,
+    owner: StyleOwner<Arc<Loader>>,
+    owner_wake: OwnedHandle,
     changes: Option<Changes>,
     desired: Arc<Rules>,
     committed: Option<Arc<Rules>>,
@@ -153,27 +170,18 @@ impl Session {
         let diag: IXamlDiagnostics = site.cast()?;
         let mut data = std::ptr::null_mut();
         // SAFETY: initialization data is an owned BSTR returned through this pointer.
-        let dir = unsafe {
+        let data = unsafe {
             let hr = diag.GetInitializationData(&mut data);
-            let dir = PathBuf::from(bstr(data));
+            let text = bstr(data);
             SysFreeString(data);
             hr.ok()?;
-            dir
+            text
         };
+        let (dir, image) = data.split_once('\n').ok_or(E_INVALIDARG)?;
+        let dir = PathBuf::from(dir);
+        let owner_wake = owner::tap_wake()?;
         let changes = Changes::new(&dir);
-        let desired = Arc::new(match config::live_rules(&dir) {
-            Ok(r) => r,
-            Err(e) => {
-                report::line(format!("tap: cannot read style: {e}"));
-                Rules::default()
-            }
-        });
-        report::line(format!(
-            "tap: site set in pid {}, {} rules, dump {}",
-            std::process::id(),
-            desired.len(),
-            desired.dump
-        ));
+        report::line(format!("tap: site set in pid {}", std::process::id()));
         let tree = Arc::new(Tree::new(svc.clone(), diag.clone(), start));
         let cb: IVisualTreeServiceCallback2 = Watch::new(tree.clone()).into();
         // SAFETY: MTA initialized by the worker. The session retains the service and callback.
@@ -187,8 +195,11 @@ impl Session {
             cb,
             tree,
             dir,
+            image: image.into(),
+            owner: StyleOwner::default(),
+            owner_wake,
             changes,
-            desired,
+            desired: Arc::new(Rules::default()),
             committed: None,
             refresh: true,
             advised: true,
@@ -204,7 +215,22 @@ impl Session {
         self.refresh = true;
     }
 
+    fn refresh_owner(&mut self) {
+        let rolled_back = self.pending.is_none() && self.committed.as_ref().is_some_and(|r| r.idle());
+        if self.owner.refresh(|p| p.alive(), || Loader::connect(&self.image).map(Arc::new), rolled_back) {
+            self.refresh = true;
+            if self.owner.process.is_some() {
+                report::line("tap: shell owner connected".into());
+            } else {
+                self.tree.pause();
+                self.desired = Arc::new(Rules::default());
+                report::line("tap: shell owner exited, rolling back".into());
+            }
+        }
+    }
+
     fn advance(&mut self, retiring: bool, wake: &Arc<Wake>) -> Step {
+        self.refresh_owner();
         if let Some(at) = self.retry_at {
             if Instant::now() < at {
                 return Step::Wait(wait_until(at));
@@ -222,6 +248,8 @@ impl Session {
                     }
                     let Some(rules) = job.rules else { return Step::Retired };
                     self.committed = Some(rules);
+                    // A replacement loader may have announced itself before this rollback finished.
+                    self.refresh_owner();
                 }
             }
         }
@@ -244,7 +272,7 @@ impl Session {
             self.changes = Changes::new(&self.dir);
             self.refresh = true;
         }
-        if self.refresh {
+        if self.refresh && self.owner.process.is_some() {
             match config::live_rules(&self.dir) {
                 Ok(rules) => {
                     if rules != *self.desired {
@@ -252,7 +280,10 @@ impl Session {
                     }
                     self.refresh = false;
                 }
-                Err(_) => return self.retry(),
+                Err(e) => {
+                    report::line(format!("tap: cannot read style: {e}"));
+                    return self.retry();
+                }
             }
         }
         if self.committed.as_ref() != Some(&self.desired) {
@@ -282,7 +313,8 @@ impl Session {
             // SAFETY: GetDispatcher returned this owned IInspectable reference.
             unsafe { IInspectable::from_raw(raw) }.cast::<CoreDispatcher>()
         });
-        match dispatcher.and_then(|d| Operation::dispatch(&d, self.tree.clone(), rules, wake.clone())) {
+        let owner = self.owner.process.clone();
+        match dispatcher.and_then(|d| Operation::dispatch(&d, self.tree.clone(), rules, owner, wake.clone())) {
             Ok(job) => {
                 let wait = Step::Wait(job.wait_ms());
                 self.pending = Some(job);
@@ -303,7 +335,13 @@ struct Operation {
 }
 
 impl Operation {
-    fn dispatch(d: &CoreDispatcher, tree: Arc<Tree>, rules: Option<Arc<Rules>>, wake: Arc<Wake>) -> windows_core::Result<Self> {
+    fn dispatch(
+        d: &CoreDispatcher,
+        tree: Arc<Tree>,
+        rules: Option<Arc<Rules>>,
+        owner: Option<Arc<Loader>>,
+        wake: Arc<Wake>,
+    ) -> windows_core::Result<Self> {
         let progress = Arc::new(Mutex::new(DispatchProgress::Queued));
         let queued = progress.clone();
         let desired = rules.clone();
@@ -316,7 +354,9 @@ impl Operation {
                         return Ok(());
                     }
                 }
-                let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tree.update(desired.as_ref()))).unwrap_or(false);
+                let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tree.update(desired.as_ref(), || owner.as_ref().is_some_and(|p| p.alive()))
+                })).unwrap_or(false);
                 *queued.lock().unwrap_or_else(|e| e.into_inner()) = DispatchProgress::Done(done);
                 wake.signal();
                 Ok(())

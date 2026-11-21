@@ -11,8 +11,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowExW, GA_ROOT,
     GWL_EXSTYLE, GetAncestor, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId,
     HWND_MESSAGE, ISMEX_NOSEND, InSendMessageEx, IsHungAppWindow, IsWindowVisible, WS_EX_TOOLWINDOW,
-    HWND_TOP, IsIconic, IsWindow, MSG, RegisterClassW, SW_RESTORE, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos, ShowWindow, ShowWindowAsync, SwitchToThisWindow,
+    IsIconic, IsWindow, MSG, RegisterClassW, SW_RESTORE, SW_SHOWMINNOACTIVE,
+    SetForegroundWindow, ShowWindow, ShowWindowAsync, SwitchToThisWindow,
     WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
@@ -99,7 +99,7 @@ pub(crate) fn run(command: bus::Command, window: isize) {
                 // SAFETY: an async minimize on a checked window.
                 unsafe { ShowWindowAsync(h, SW_SHOWMINNOACTIVE) }.as_bool()
             } else {
-                restore(h)
+                crate::restore::restore(h)
             };
             crate::hook::log_line(&format!(
                 "{action} {:?} ({}) for show desktop: {ok}", title(h), class(h)
@@ -109,25 +109,9 @@ pub(crate) fn run(command: bus::Command, window: isize) {
     }
 }
 
-fn restore(h: HWND) -> bool {
-    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-    // SAFETY: the caller checked this top-level window. Responsive targets are raised before
-    // the next command, preserving Z-order across their independent input queues.
-    unsafe {
-        if IsHungAppWindow(h).as_bool() {
-            let queued = ShowWindowAsync(h, SW_SHOWNOACTIVATE).as_bool();
-            let raised = SetWindowPos(h, Some(HWND_TOP), 0, 0, 0, 0, flags | SWP_ASYNCWINDOWPOS);
-            return queued && raised.is_ok();
-        }
-        let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
-        let raised = SetWindowPos(h, Some(HWND_TOP), 0, 0, 0, 0, flags);
-        raised.is_ok() && !IsIconic(h).as_bool()
-    }
-}
-
 /// A window show desktop may minimize or restore: a visible top-level window, not a tool window,
 /// minimized when it is to be restored.
-fn show_desktop_target(h: HWND, min: bool) -> Result<(), &'static str> {
+pub(crate) fn show_desktop_target(h: HWND, min: bool) -> Result<(), &'static str> {
     // SAFETY: plain queries on a handle that may be stale.
     unsafe {
         if !IsWindow(Some(h)).as_bool() {
@@ -188,6 +172,21 @@ fn in_front(h: HWND) -> bool {
     }
 }
 
+pub(crate) fn grant_foreground(frame: HWND, target: HWND) {
+    // An empty mouse input makes this process the last to send input (lifts the foreground lock).
+    let input = INPUT { r#type: INPUT_MOUSE, ..Default::default() };
+    // SAFETY: input and PID buffers live through the calls. Window handles may be stale.
+    unsafe {
+        SendInput(&[input], size_of::<INPUT>() as i32);
+        // Lets the target hand the foreground on (a frame to its CoreWindow, an app to a dialog).
+        for w in [frame, target] {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(w, Some(&mut pid));
+            let _ = AllowSetForegroundWindow(pid);
+        }
+    }
+}
+
 /// Restores the window when minimized and makes it the foreground window. Returns the window
 /// used (the frame of a CoreWindow) and the way that worked.
 pub fn activate(target: HWND) -> (HWND, &'static str) {
@@ -197,15 +196,7 @@ pub fn activate(target: HWND) -> (HWND, &'static str) {
             return (target, "gone");
         }
         let h = frame_of(target);
-        // An empty mouse input makes this process the last to send input (lifts the foreground lock).
-        let input = INPUT { r#type: INPUT_MOUSE, ..Default::default() };
-        SendInput(&[input], size_of::<INPUT>() as i32);
-        // Lets the target hand the foreground on (a frame to its CoreWindow, an app to a dialog).
-        for w in [h, target] {
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(w, Some(&mut pid));
-            let _ = AllowSetForegroundWindow(pid);
-        }
+        grant_foreground(h, target);
         if IsIconic(h).as_bool() {
             if IsHungAppWindow(h).as_bool() {
                 let _ = ShowWindowAsync(h, SW_RESTORE);

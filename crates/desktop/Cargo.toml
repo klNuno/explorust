@@ -18,6 +18,7 @@ path = "src/bin/desktop-lively.rs"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 bus = { path = "../bus" }
+keys = { path = "../keys" }
 menu = { path = "../menu" }
 windows-core.workspace = true
 windows = { workspace = true, features = [

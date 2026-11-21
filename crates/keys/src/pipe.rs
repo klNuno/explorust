@@ -175,14 +175,29 @@ fn read_commands(pipe: HANDLE, message: &mut [u8]) {
         let commands: Option<Vec<_>> = records.iter().map(keys_pipe::decode).collect();
         match commands {
             Some(commands) if !commands.is_empty() && tail.is_empty() => {
-                for (command, window) in commands {
-                    crate::activate::run(command, window);
-                }
+                run_commands(commands);
             }
             _ => {
                 crate::hook::log_line("keys pipe: refused malformed command message");
                 return;
             }
         }
+    }
+}
+
+fn run_commands(commands: Vec<(bus::Command, isize)>) {
+    use bus::Command::{Activate, Restore};
+    if let Some((&(Activate, top), restores)) = commands.split_last()
+        && restores.last() == Some(&(Restore, top))
+        && restores.iter().all(|&(command, _)| command == Restore)
+    {
+        let focus = crate::restore_desktop(restores.iter().map(|&(_, id)| id), true, |id, ok| {
+            crate::hook::log_line(&format!("show desktop batch: restore {id:#x} completed {ok}"));
+        });
+        crate::hook::log_line(&format!("show desktop batch: {} restores, foreground request {focus:?}", restores.len()));
+        return;
+    }
+    for (command, window) in commands {
+        crate::activate::run(command, window);
     }
 }

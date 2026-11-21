@@ -19,6 +19,8 @@ mod backdrop;
 #[cfg(target_os = "windows")]
 mod config;
 #[cfg(target_os = "windows")]
+mod owner;
+#[cfg(target_os = "windows")]
 mod property;
 #[cfg(target_os = "windows")]
 pub mod report;

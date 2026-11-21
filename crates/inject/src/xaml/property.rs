@@ -22,7 +22,12 @@ pub struct Property {
     pub ownership: BackgroundOwnership,
 }
 
-pub fn get(svc: &IVisualTreeService, element: InstanceHandle, name: &str, owned: Option<InstanceHandle>) -> Result<Option<Property>, HRESULT> {
+pub fn get(
+    svc: &IVisualTreeService,
+    element: InstanceHandle,
+    name: &str,
+    is_owned: Option<&dyn Fn(InstanceHandle) -> Result<bool, HRESULT>>,
+) -> Result<Option<Property>, HRESULT> {
     let (mut ns, mut np) = (0u32, 0u32);
     let mut sources: *mut PropertyChainSource = std::ptr::null_mut();
     let mut values: *mut PropertyChainValue = std::ptr::null_mut();
@@ -36,6 +41,7 @@ pub fn get(svc: &IVisualTreeService, element: InstanceHandle, name: &str, owned:
     }
     let mut selected: Option<(bool, Value)> = None;
     let mut ownership = BackgroundOwnership::default();
+    let mut ownership_error = None;
     // SAFETY: the two arrays and their BSTRs are returned by the service and owned by us.
     unsafe {
         for i in 0..np as usize {
@@ -47,7 +53,17 @@ pub fn get(svc: &IVisualTreeService, element: InstanceHandle, name: &str, owned:
                 let null = v.MetadataBits & IS_VALUE_NULL != 0;
                 let handle = !null && v.MetadataBits & IS_VALUE_HANDLE != 0;
                 let text = if null { "null".into() } else { bstr(v.Value) };
-                ownership.observe(local, binding, if handle { text.parse().ok() } else { None }, owned);
+                let mut ours = false;
+                if local && handle
+                    && let Some(owns) = is_owned
+                    && let Ok(handle) = text.parse()
+                {
+                    match owns(handle) {
+                        Ok(same) => ours = same,
+                        Err(hr) => ownership_error = Some(hr),
+                    }
+                }
+                ownership.observe(local, binding, ours);
                 let effective = v.Overridden == 0;
                 if selected.as_ref().is_none_or(|(current, _)| !current && effective) {
                     selected = Some((
@@ -74,6 +90,9 @@ pub fn get(svc: &IVisualTreeService, element: InstanceHandle, name: &str, owned:
         }
         CoTaskMemFree(values as *const _);
         CoTaskMemFree(sources as *const _);
+    }
+    if let Some(hr) = ownership_error {
+        return Err(hr);
     }
     Ok(selected.map(|(_, value)| Property { value, ownership }))
 }

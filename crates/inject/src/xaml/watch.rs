@@ -6,10 +6,12 @@ use super::backdrop;
 use super::property;
 use super::report;
 use super::rules::Rules;
+use super::state::{Background, Backgrounds};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
-use windows_core::{HRESULT, implement};
+use windows::Win32::Foundation::{E_FAIL, ERROR_NOT_FOUND};
+use windows_core::{HRESULT, IInspectable, IUnknown, Interface, Weak, implement};
 
 const DUMP_MAX: usize = 6000;
 const BATCH: usize = 60;
@@ -43,8 +45,8 @@ struct State {
     sequence: usize,
     dumped: usize,
     buf: Vec<String>,
-    brushes: HashMap<String, InstanceHandle>,
-    backgrounds: HashMap<InstanceHandle, Background>,
+    brushes: HashMap<String, (InstanceHandle, Weak<IInspectable>)>,
+    backgrounds: Backgrounds<Weak<IInspectable>>,
     windows: HashMap<InstanceHandle, backdrop::Kept>,
 }
 
@@ -68,12 +70,6 @@ impl Node {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Background {
-    index: u32,
-    brush: InstanceHandle,
-}
-
 impl Tree {
     pub fn new(svc: IVisualTreeService, diag: IXamlDiagnostics, t0: Instant) -> Self {
         Self {
@@ -87,7 +83,7 @@ impl Tree {
                 dumped: 0,
                 buf: Vec::new(),
                 brushes: HashMap::new(),
-                backgrounds: HashMap::new(),
+                backgrounds: Backgrounds(HashMap::new()),
                 windows: HashMap::new(),
             }),
         }
@@ -112,7 +108,7 @@ impl Tree {
 
     /// Called on the UI thread. Keep any values whose restoration failed so the worker can retry.
     /// Without a desired style this is the final rollback of an unadvised watch.
-    pub fn update(&self, rules: Option<&Arc<Rules>>) -> bool {
+    pub fn update(&self, rules: Option<&Arc<Rules>>, owner_alive: impl FnOnce() -> bool) -> bool {
         self.pause();
         if !self.restore() {
             return false;
@@ -121,13 +117,20 @@ impl Tree {
         if let Some(rules) = rules {
             let mut nodes = {
                 let mut state = self.state();
+                if !rules.idle() && !owner_alive() {
+                    return true;
+                }
                 state.dumped = 0;
                 state.rules = Some(rules.clone());
                 state.nodes.iter().map(|(&h, n)| (h, n.clone())).collect::<Vec<_>>()
             };
             nodes.sort_unstable_by_key(|(_, node)| node.sequence);
             for (h, node) in nodes {
-                if self.state().nodes.get(&h).is_some_and(|n| n.sequence == node.sequence) {
+                let current = self.state();
+                let apply = current.rules.as_ref().is_some_and(|active| Arc::ptr_eq(active, rules))
+                    && current.nodes.get(&h).is_some_and(|n| n.sequence == node.sequence);
+                drop(current);
+                if apply {
                     self.apply(h, &node, rules);
                 }
             }
@@ -138,13 +141,13 @@ impl Tree {
     }
 
     fn restore(&self) -> bool {
-        let backgrounds = self.state().backgrounds.clone();
+        let backgrounds = self.state().backgrounds.0.clone();
         let mut cleared = 0;
-        for (h, owned) in backgrounds {
-            match self.clear_background(h, owned) {
+        for (identity, owned) in backgrounds {
+            match self.clear_background(&owned) {
                 Ok(did_clear) => {
                     cleared += usize::from(did_clear);
-                    self.state().backgrounds.remove(&h);
+                    self.state().backgrounds.0.remove(&identity);
                 }
                 Err(e) => report::line(format!("tap: Background restore failed {:#010x}, will retry", e.0)),
             }
@@ -161,22 +164,47 @@ impl Tree {
             }
         }
         let state = self.state();
-        let complete = state.backgrounds.is_empty() && state.windows.is_empty();
+        let complete = state.backgrounds.0.is_empty() && state.windows.is_empty();
         drop(state);
         report::line(format!("tap: {cleared} backgrounds cleared, rollback complete {complete}"));
         complete
     }
 
-    fn clear_background(&self, h: InstanceHandle, owned: Background) -> Result<bool, HRESULT> {
-        let Some(bg) = property::get(&self.svc, h, "Background", Some(owned.brush))? else {
+    fn clear_background(&self, owned: &Background<Weak<IInspectable>>) -> Result<bool, HRESULT> {
+        let Some(element) = owned.element.upgrade() else {
             return Ok(false);
         };
+        let mut handle = 0;
+        // SAFETY: the live object and its out handle remain valid through both calls.
+        unsafe {
+            if self.diag.GetHandleFromIInspectable(element.as_raw(), &mut handle).is_ok()
+                && handle != 0
+                && let Some(cleared) = self.clear_at(handle, owned)?
+            {
+                return Ok(cleared);
+            }
+            // Detached elements can be missing from the diagnostics cache while still alive.
+            self.diag.RegisterInstance(element.as_raw(), &mut handle).ok().map_err(|e| e.code())?;
+        }
+        self.clear_at(handle, owned)?.ok_or(ERROR_NOT_FOUND.to_hresult())
+    }
+
+    fn clear_at(&self, h: InstanceHandle, owned: &Background<Weak<IInspectable>>) -> Result<Option<bool>, HRESULT> {
+        let brush = owned.brush.upgrade();
+        let owns = |value| self.same_brush(value, brush.as_ref());
+        let Some(bg) = property::get(&self.svc, h, "Background", Some(&owns))? else {
+            return Ok(None);
+        };
         if bg.value.index != owned.index || !bg.ownership.can_clear() {
-            return Ok(false);
+            return Ok(Some(false));
         }
         // SAFETY: the property chain still contains the local brush we set.
-        unsafe { self.svc.ClearProperty(h, owned.index) }.ok()?;
-        Ok(true)
+        let hr = unsafe { self.svc.ClearProperty(h, owned.index) };
+        if hr == ERROR_NOT_FOUND.to_hresult() {
+            return Ok(None);
+        }
+        hr.ok().map_err(|e| e.code())?;
+        Ok(Some(true))
     }
 
     fn added(&self, rel: &ParentChildRelation, el: &VisualElement) {
@@ -233,8 +261,9 @@ impl Tree {
         }
         if let Some(color) = rules.color(&node.ty, &node.name) {
             match self.set_background(h, color) {
-                Ok(i) => report::line(format!(
-                    "{label}: Background {color} (property {i}) {} ms after advise",
+                Ok((i, reused)) => report::line(format!(
+                    "{label}: Background {color} (property {i}{}) {} ms after advise",
+                    if reused { ", recycled element kept our brush" } else { "" },
                     self.t0.elapsed().as_millis()
                 )),
                 Err(e) => report::line(format!("{label}: Background not set: {e}")),
@@ -243,33 +272,66 @@ impl Tree {
     }
 
     fn removed(&self, el: &VisualElement) {
-        let mut state = self.state();
-        state.nodes.remove(&el.Handle);
-        state.backgrounds.remove(&el.Handle);
+        // Detach can be temporary. Keep ownership by the live object's identity.
+        self.state().nodes.remove(&el.Handle);
     }
 
-    fn set_background(&self, h: InstanceHandle, color: &str) -> Result<u32, String> {
-        let bg = property::get(&self.svc, h, "Background", None)
+    fn set_background(&self, h: InstanceHandle, color: &str) -> Result<(u32, bool), String> {
+        let element = self.inspectable(h).map_err(|hr| format!("GetIInspectableFromHandle {:#010x}", hr.0))?;
+        let unknown = element.cast::<IUnknown>().map_err(|e| format!("element identity: {e}"))?;
+        let identity = unknown.as_raw() as usize;
+        let owned = self.state().backgrounds.0.get(&identity).cloned()
+            .filter(|owned| owned.element.upgrade().is_some());
+        let owned_brush = owned.as_ref().and_then(|owned| owned.brush.upgrade());
+        let owns = |value| self.same_brush(value, owned_brush.as_ref());
+        let bg = property::get(&self.svc, h, "Background", Some(&owns))
             .map_err(|hr| format!("GetPropertyValuesChain {:#010x}", hr.0))?
             .ok_or("no Background property")?;
+        if let Some(owned) = owned
+            && bg.value.index == owned.index
+            && bg.ownership.can_clear()
+        {
+            return Ok((owned.index, true));
+        }
         if !bg.ownership.can_set() {
             return Err("local value or binding left alone".into());
         }
-        let brush = self.brush(color)?;
+        let element = element.downgrade().map_err(|e| format!("element weak reference: {e}"))?;
+        if element.upgrade().is_none() {
+            return Err("element weak reference expired".into());
+        }
+        let (brush_handle, brush) = self.brush(color)?;
         // SAFETY: handles from this service; the index is from the element's property chain.
-        let hr = unsafe { self.svc.SetProperty(h, brush, bg.value.index) };
+        let hr = unsafe { self.svc.SetProperty(h, brush_handle, bg.value.index) };
         if hr.is_err() {
             return Err(format!("SetProperty {:#010x}", hr.0));
         }
         let mut state = self.state();
-        if state.nodes.contains_key(&h) {
-            state.backgrounds.insert(h, Background { index: bg.value.index, brush });
+        let backgrounds = &mut state.backgrounds;
+        let count = backgrounds.0.len();
+        if count > 0 && count.is_multiple_of(64) {
+            backgrounds.prune(|weak| weak.upgrade().is_some());
         }
-        Ok(bg.value.index)
+        backgrounds.0.insert(identity, Background { element, index: bg.value.index, brush });
+        Ok((bg.value.index, false))
     }
 
-    fn brush(&self, color: &str) -> Result<InstanceHandle, String> {
-        if let Some(&b) = self.state().brushes.get(color) {
+    fn inspectable(&self, handle: InstanceHandle) -> Result<IInspectable, HRESULT> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: the out pointer receives an owned IInspectable reference on success.
+        unsafe {
+            self.diag.GetIInspectableFromHandle(handle, &mut raw).ok().map_err(|e| e.code())?;
+            if raw.is_null() { Err(E_FAIL) } else { Ok(IInspectable::from_raw(raw)) }
+        }
+    }
+
+    fn same_brush(&self, handle: InstanceHandle, owned: Option<&IInspectable>) -> Result<bool, HRESULT> {
+        let Some(owned) = owned else { return Ok(false) };
+        Ok(self.inspectable(handle)? == *owned)
+    }
+
+    fn brush(&self, color: &str) -> Result<(InstanceHandle, Weak<IInspectable>), String> {
+        if let Some(b) = self.state().brushes.get(color).cloned() {
             return Ok(b);
         }
         let ty = Bstr::new("Windows.UI.Xaml.Media.SolidColorBrush");
@@ -280,8 +342,14 @@ impl Tree {
         if hr.is_err() || b == 0 {
             return Err(format!("CreateInstance(SolidColorBrush {color}) {:#010x}", hr.0));
         }
-        self.state().brushes.insert(color.into(), b);
-        Ok(b)
+        let brush = self.inspectable(b).map_err(|hr| format!("brush instance {:#010x}", hr.0))?;
+        let weak = brush.downgrade().map_err(|e| format!("brush weak reference: {e}"))?;
+        if weak.upgrade().is_none() {
+            return Err("brush weak reference expired".into());
+        }
+        let cached = (b, weak);
+        self.state().brushes.insert(color.into(), cached.clone());
+        Ok(cached)
     }
 }
 

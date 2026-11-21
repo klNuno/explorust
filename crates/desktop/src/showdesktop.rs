@@ -7,9 +7,8 @@ use std::cell::RefCell;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowRect, HWND_TOP,
-    IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos, ShowWindow, ShowWindowAsync,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    IsIconic, IsWindow, IsWindowVisible, SW_SHOWMINNOACTIVE, SetForegroundWindow, ShowWindowAsync,
     WS_EX_TOOLWINDOW,
 };
 use windows_core::BOOL;
@@ -108,22 +107,14 @@ pub fn press(progman: Option<HWND>) {
             if via_keys {
                 log::line("show desktop: keys batch unavailable, restoring locally");
             }
-            for &id in &ws {
-                let h = hwnd(id);
-                // SAFETY: restore without activation, then raise it above the ones restored before.
-                unsafe {
-                    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-                    if IsHungAppWindow(h).as_bool() {
-                        let _ = ShowWindowAsync(h, SW_SHOWNOACTIVATE);
-                        let _ = SetWindowPos(h, Some(HWND_TOP), 0, 0, 0, 0, flags | SWP_ASYNCWINDOWPOS);
-                    } else {
-                        let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
-                        let _ = SetWindowPos(h, Some(HWND_TOP), 0, 0, 0, 0, flags);
-                    }
+            let mut restored = 0;
+            let focus = keys::restore_desktop(ws.iter().copied(), false, |id, ok| {
+                restored += usize::from(ok);
+                if !ok {
+                    log::line(&format!("show desktop: skipped restore {id:#x}"));
                 }
-            }
-            let fg = ws.last().map(|&t| unsafe { SetForegroundWindow(hwnd(t)) }.as_bool());
-            log::line(&format!("show desktop: restored {} windows locally, top focused {fg:?}", ws.len()));
+            });
+            log::line(&format!("show desktop: restored {restored}/{} windows locally, foreground request {focus:?}", ws.len()));
         }
         Action::Nothing => log::line("show desktop: nothing to do"),
     }

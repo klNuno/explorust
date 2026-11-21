@@ -2,7 +2,7 @@
 //! (`InitializeXamlDiagnosticsEx`, exported by Windows.UI.Xaml.dll) waits for the target to answer,
 //! so it runs on a thread of its own; each Settings process gets it once.
 
-use super::config;
+use super::{config, owner};
 use crate::log;
 use std::path::Path;
 use std::sync::Mutex;
@@ -58,14 +58,13 @@ pub fn loaded_in(pid: u32, dll: &Path) -> bool {
     }
 }
 
-/// A live TAP sees the off switch directly, including when no loader is running.
-pub fn undo_everywhere(dll: &Path) {
+fn settings_pids() -> Vec<u32> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
     let mut pids = Vec::new();
     // SAFETY: a process snapshot walked into a local entry and closed.
     unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return };
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return pids };
         let mut e = PROCESSENTRY32W {
             dwSize: size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
@@ -80,8 +79,20 @@ pub fn undo_everywhere(dll: &Path) {
         }
         let _ = CloseHandle(snap);
     }
-    for pid in pids.into_iter().filter(|&p| loaded_in(p, dll)) {
+    pids
+}
+
+/// A live TAP sees the off switch directly, including when no loader is running.
+pub fn undo_everywhere(dll: &Path) {
+    for pid in settings_pids().into_iter().filter(|&p| loaded_in(p, dll)) {
         log::line(&format!("settings xaml: the live TAP in pid {pid} watches the injector off switch"));
+    }
+}
+
+/// Wake a TAP left inside an open or minimized Settings after a shell restart.
+pub fn resume_existing() {
+    for pid in settings_pids() {
+        let _ = owner::notify_tap(pid);
     }
 }
 
@@ -95,9 +106,12 @@ pub fn attach(pid: u32, dll: &Path, rules: String) {
     let _ = std::thread::Builder::new().name("inject-xaml".into()).spawn(move || {
         static ATTACH: Mutex<()> = Mutex::new(());
         let _guard = ATTACH.lock().unwrap_or_else(|e| e.into_inner());
-        if loaded_in(pid, &dll) {
+        if owner::notify_tap(pid) || loaded_in(pid, &dll) {
             return;
         }
+        let Ok(image) = std::env::current_exe() else {
+            return;
+        };
         let t0 = Instant::now();
         // SAFETY: a system DLL; the export has the documented signature (xamlom.h).
         let f = unsafe {
@@ -114,7 +128,7 @@ pub fn attach(pid: u32, dll: &Path, rules: String) {
             }
         };
         let path = HSTRING::from(dll.as_os_str());
-        let dir = HSTRING::from(config::directory().as_os_str());
+        let data = HSTRING::from(format!("{}\n{}", config::directory().display(), image.display()));
         let mut hr = NOT_FOUND;
         let mut n = 0;
         for i in 1..=10 {
@@ -128,7 +142,7 @@ pub fn attach(pid: u32, dll: &Path, rules: String) {
                     w!(""),
                     PCWSTR(path.as_ptr()),
                     super::CLSID_TAP,
-                    PCWSTR(dir.as_ptr()),
+                    PCWSTR(data.as_ptr()),
                 )
             };
             if hr != NOT_FOUND {

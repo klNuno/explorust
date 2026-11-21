@@ -133,6 +133,7 @@ pub fn run() {
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
         log::line(&format!("watching (dll {}, {} bytes)", path.display(), std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)));
+        crate::xaml::attach::resume_existing();
         scan_existing();
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -450,12 +451,6 @@ fn settings(core: HWND, t0: Instant, tries: u8) {
         let rules = if attach::switched_off() { None } else { attach::rules_text() };
         match rules {
             Some(rules) => attach::attach(pid, &dll, rules),
-            // A TAP an earlier explorust loaded keeps styling a live Settings: an empty set of
-            // rules makes it undo that.
-            None if attach::loaded_in(pid, &dll) => {
-                log::line("settings xaml: off or no settings-style.txt, the TAP loaded before undoes its styling");
-                attach::attach(pid, &dll, String::new());
-            }
             None if attach::switched_off() => log::line("settings xaml: off (parts-off.txt)"),
             None => log::line("settings xaml: no settings-style.txt, Settings left as Windows draws it"),
         }
