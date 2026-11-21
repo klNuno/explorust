@@ -20,13 +20,12 @@ pub struct Surface {
     _visual: IDCompositionVisual,
 }
 
-/// The device half of a `Surface`: D3D11 device, DXGI and D2D factories, D2D device and the
-/// DirectWrite factory with its system font collection loaded. Made on a worker thread while
+/// The device half of a `Surface`: the D3D11 device (through its DXGI interface), DXGI and D2D
+/// factories, D2D device and DirectWrite's shared factory (a process singleton). Made on a worker thread while
 /// the UI thread creates its window (the viewer's and taskman's first frame), then handed to
 /// `Surface::on`. Nothing in it is used by two threads at once: the worker drops it after the
 /// send.
 pub struct Device {
-    d3d: ID3D11Device,
     dxgi: IDXGIDevice,
     dxgi_factory: IDXGIFactory2,
     factory: ID2D1Factory1,
@@ -60,7 +59,7 @@ impl Device {
             let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let d2d = factory.CreateDevice(&dxgi)?;
             let text = crate::text::Text::new()?;
-            Ok(Self { d3d, dxgi, dxgi_factory, factory, d2d, text })
+            Ok(Self { dxgi, dxgi_factory, factory, d2d, text })
         }
     }
 
@@ -78,10 +77,6 @@ impl Device {
             let _ = tx.send(d);
         });
         rx
-    }
-
-    pub fn d3d(&self) -> &ID3D11Device {
-        &self.d3d
     }
 }
 

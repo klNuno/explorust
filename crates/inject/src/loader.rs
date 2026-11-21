@@ -200,14 +200,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 unsafe fn tap_lines(lp: LPARAM) {
     // SAFETY: the caller's contract.
     let cds = unsafe { &*(lp.0 as *const windows::Win32::System::DataExchange::COPYDATASTRUCT) };
-    if cds.dwData != crate::xaml::report::COPYDATA_TAG || cds.lpData.is_null() {
+    if cds.dwData != crate::xaml::report::COPYDATA_TAG || cds.lpData.is_null() || cds.cbData as usize > crate::xaml::report::MAX_MESSAGE {
         return;
     }
     // SAFETY: cbData bytes at lpData, valid during the send.
     let bytes = unsafe { std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize) };
-    for l in String::from_utf8_lossy(bytes).lines() {
-        log::line(&format!("settings xaml: {l}"));
-    }
+    log::lines("settings xaml: ", String::from_utf8_lossy(bytes).lines());
 }
 
 unsafe extern "system" fn on_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, obj: i32, child: i32, _: u32, _: u32) {
@@ -447,12 +445,18 @@ fn settings(core: HWND, t0: Instant, tries: u8) {
         st.xaml_pids.insert(pid).then(|| st.dll_path.clone())
     });
     if let Some(dll) = dll {
-        if crate::xaml::attach::switched_off() {
-            log::line("settings xaml: off (parts-off.txt)");
-        } else if let Some(rules) = crate::xaml::attach::rules_text() {
-            crate::xaml::attach::attach(pid, &dll, rules);
-        } else {
-            log::line("settings xaml: no settings-style.txt, Settings left as Windows draws it");
+        use crate::xaml::attach;
+        let rules = if attach::switched_off() { None } else { attach::rules_text() };
+        match rules {
+            Some(rules) => attach::attach(pid, &dll, rules),
+            // A TAP an earlier explorust loaded keeps styling a live Settings: an empty set of
+            // rules makes it undo that.
+            None if attach::loaded_in(pid, &dll) => {
+                log::line("settings xaml: off or no settings-style.txt, the TAP loaded before undoes its styling");
+                attach::attach(pid, &dll, String::new());
+            }
+            None if attach::switched_off() => log::line("settings xaml: off (parts-off.txt)"),
+            None => log::line("settings xaml: no settings-style.txt, Settings left as Windows draws it"),
         }
     }
 }

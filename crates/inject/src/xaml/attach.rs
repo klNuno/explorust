@@ -40,8 +40,35 @@ pub fn rules_text() -> Option<String> {
     Some(text)
 }
 
+/// The TAP is loaded in `pid` (`dll`'s file name among its modules): a previous explorust
+/// attached it, so turning the TAP off still needs a call to undo its styling.
+pub fn loaded_in(pid: u32, dll: &Path) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
+    };
+    let Some(want) = dll.file_name().map(|n| n.to_string_lossy().to_lowercase()) else { return false };
+    // SAFETY: a module snapshot of the process, walked into a local entry and closed.
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) else { return false };
+        let mut e = MODULEENTRY32W { dwSize: size_of::<MODULEENTRY32W>() as u32, ..Default::default() };
+        let mut ok = Module32FirstW(snap, &mut e).is_ok();
+        let mut found = false;
+        while ok {
+            let n = e.szModule.iter().position(|&c| c == 0).unwrap_or(e.szModule.len());
+            if String::from_utf16_lossy(&e.szModule[..n]).to_lowercase() == want {
+                found = true;
+                break;
+            }
+            ok = Module32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+        found
+    }
+}
+
 /// Loads the TAP into the Settings process `pid`, from `dll` (explorust_inject.dll beside
-/// explorust), with these rules.
+/// explorust), with these rules; empty rules undo what a TAP loaded before set.
 pub fn attach(pid: u32, dll: &Path, rules: String) {
     let dll = dll.to_path_buf();
     let _ = std::thread::Builder::new().name("inject-xaml".into()).spawn(move || {

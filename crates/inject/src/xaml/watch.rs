@@ -36,6 +36,10 @@ pub struct State {
     dumped: usize,
     cleared: usize,
     buf: Vec<String>,
+    /// Backgrounds this watch set (element, property index), cleared by [`undo`].
+    set: Vec<(InstanceHandle, u32)>,
+    /// The window's own backdrop, put back by [`undo`].
+    kept: Option<super::backdrop::Kept>,
 }
 
 /// An effective property value: its index in the property chain, its value as text (a
@@ -67,6 +71,24 @@ pub fn flush(st: &Mutex<State>, t0: Instant) {
     };
     report::send(&lines);
     report::line(format!("tree so far: {seen} elements seen, {cleared} backgrounds set, {} ms after advise", t0.elapsed().as_millis()));
+}
+
+/// On Settings' UI thread, once the watch is unadvised: clears the Backgrounds it set and gives
+/// the window its own backdrop back; a line for the log.
+pub fn undo(st: &Mutex<State>, svc: &IVisualTreeService) -> String {
+    let (set, kept) = {
+        let mut st = lock(st);
+        (std::mem::take(&mut st.set), st.kept.take())
+    };
+    let mut cleared = 0;
+    for (h, i) in &set {
+        // SAFETY: handles and indexes this service gave; a gone element only fails the call.
+        if unsafe { svc.ClearProperty(*h, *i) }.is_ok() {
+            cleared += 1;
+        }
+    }
+    let backdrop = kept.map_or("system backdrop untouched".to_string(), super::backdrop::restore);
+    format!("{cleared} of {} backgrounds cleared, {backdrop}", set.len())
 }
 
 impl Watch_Impl {
@@ -104,7 +126,10 @@ impl Watch_Impl {
             let r = super::backdrop::apply(&self.diag, el.Handle, what);
             let us = t.elapsed().as_micros();
             match r {
-                Ok(s) => report::line(format!("{label}: system backdrop {s} in {us} us, {} ms after advise", self.t0.elapsed().as_millis())),
+                Ok((s, k)) => {
+                    lock(&self.st).kept.get_or_insert(k);
+                    report::line(format!("{label}: system backdrop {s} in {us} us, {} ms after advise", self.t0.elapsed().as_millis()));
+                }
                 Err(e) => report::line(format!("{label}: system backdrop not set: {e}")),
             }
         }
@@ -130,17 +155,25 @@ impl Watch_Impl {
     }
 
     fn removed(&self, el: &VisualElement) {
-        lock(&self.st).depth.remove(&el.Handle);
+        let mut st = lock(&self.st);
+        st.depth.remove(&el.Handle);
+        st.set.retain(|(h, _)| *h != el.Handle);
     }
 
     /// Sets the element's local `Background` to a shared brush of that color; the property's index.
     fn set_background(&self, h: InstanceHandle, color: &str) -> Result<u32, String> {
-        let brush = self.brush(color)?;
         let bg = self.background(h)?.ok_or("no Background property")?;
+        let brush = self.brush(color)?;
         // SAFETY: handles from this service; the index came from the element's own chain.
         let hr = unsafe { self.svc.SetProperty(h, brush, bg.index) };
         if hr.is_err() {
+            // A TAP loaded again into a Settings process that already had one gets 0x80070490
+            // here although the element and a fresh brush resolve (xaml-2); a new process does not.
             return Err(format!("SetProperty {:#010x}", hr.0));
+        }
+        let mut st = lock(&self.st);
+        if !st.set.contains(&(h, bg.index)) {
+            st.set.push((h, bg.index));
         }
         Ok(bg.index)
     }

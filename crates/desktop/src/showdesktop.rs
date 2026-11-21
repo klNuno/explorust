@@ -99,9 +99,12 @@ pub fn press(progman: Option<HWND>) {
         }
         Action::Restore(ws) => {
             let mut keys = 0;
+            // One coordinator keeps the order: with an elevated window in the batch, every window
+            // goes through the keys host's queue, bottom first, so each lands above the one before.
+            let via_keys = ws.iter().any(|&id| bus::above_me(hwnd(id)));
             for &id in &ws {
                 let h = hwnd(id);
-                if bus::above_me(h) && bus::post(bus::Command::Restore, id) {
+                if via_keys && bus::post(bus::Command::Restore, id) {
                     keys += 1;
                     continue;
                 }

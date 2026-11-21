@@ -134,6 +134,13 @@ impl Start {
             return false;
         }
         let keep = self.selected();
+        // The first row is the best match and stays the first row; a row the arrows moved to stays
+        // selected by its path, since the merge reorders the files.
+        let moved = self.found.sel != search::next_item(&self.found.rows, None, 1);
+        let keep_path = keep
+            .filter(|h| moved && matches!(h.kind, search::Kind::File | search::Kind::Folder))
+            .and_then(|h| self.found.files.get(h.index))
+            .map(|f| f.path.clone());
         if self.found.files_stale {
             self.found.files.clear();
             self.found.files_stale = false;
@@ -151,6 +158,10 @@ impl Start {
         self.found.files.extend(files);
         // The Windows index and explorust's own index answer the same query: one row per path.
         search::merge_files(&mut self.found.files, |f| f.path.as_str(), |f| (f.rank, f.modified), |f, r| f.rank = r);
+        let keep = match (keep, keep_path) {
+            (Some(h), Some(p)) => self.found.files.iter().position(|f| f.path.eq_ignore_ascii_case(&p)).map(|index| search::Hit { index, ..h }),
+            (k, _) => k,
+        };
         self.found.files_done = done;
         self.rebuild_rows(keep);
         self.dirty = true;

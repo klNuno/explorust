@@ -10,7 +10,7 @@ mod theme;
 
 use crate::view::{View, step};
 use decode::{Decoded, factory};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
@@ -91,20 +91,26 @@ fn with<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|a| a.try_borrow_mut().ok().and_then(|mut a| a.as_mut().map(f)))
 }
 
+thread_local! {
+    /// The window thread initialized OLE (after the first frame).
+    static OLE: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Entry of `explorust-viewer.exe`; returns the exit code.
 pub fn run(args: &[String]) -> i32 {
     log::mark("main");
     let p = match args.first().map(String::as_str) {
         Some(a @ ("--register" | "--unregister" | "--defaults")) => {
-            unsafe {
-                let _ = OleInitialize(None);
-            }
+            // SAFETY: OLE on this thread, undone below only when it succeeded.
+            let ole = unsafe { OleInitialize(None) }.is_ok();
             let ok = match a {
                 "--register" => actions::register(),
                 "--unregister" => actions::unregister(),
                 _ => actions::defaults(),
             };
-            unsafe { OleUninitialize() };
+            if ole {
+                unsafe { OleUninitialize() };
+            }
             return (!ok) as i32;
         }
         p => p,
@@ -112,14 +118,17 @@ pub fn run(args: &[String]) -> i32 {
     // The device and the font collection load on a worker while this thread makes the window.
     let dev = render::Device::spawn(&["Segoe UI Variable Text", "Segoe Fluent Icons"]);
     // COM for the WIC factory now, OLE (the clipboard) after the first frame.
-    unsafe {
-        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
-    }
+    let com = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED) }.is_ok();
     log::mark("com");
     let code = window(p.map(|p| std::path::absolute(p).map(|a| a.display().to_string()).unwrap_or_else(|_| p.into())), dev);
+    // Each one is undone only when this thread acquired it: a failed start returns before OLE.
     unsafe {
-        OleUninitialize();
-        windows::Win32::System::Com::CoUninitialize();
+        if OLE.with(|o| o.get()) {
+            OleUninitialize();
+        }
+        if com {
+            windows::Win32::System::Com::CoUninitialize();
+        }
     }
     code
 }
@@ -262,7 +271,7 @@ fn window(path: Option<String>, dev: std::sync::mpsc::Receiver<windows_core::Res
         with(|a| a.load(true));
         log::mark("bitmap");
         with(|a| a.paint());
-        let _ = OleInitialize(None);
+        OLE.with(|o| o.set(OleInitialize(None).is_ok()));
         log::mark("ole");
         let mut o = POINT::default();
         let _ = ClientToScreen(hwnd, &mut o);

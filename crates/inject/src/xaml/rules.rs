@@ -76,6 +76,11 @@ impl Rules {
         self.list.len()
     }
 
+    /// Nothing to do: the TAP only undoes what a previous one in the process set.
+    pub fn idle(&self) -> bool {
+        self.list.is_empty() && !self.dump && self.backdrop.is_none()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
     }
@@ -127,6 +132,15 @@ mod tests {
         assert_eq!(argb("#102030"), Some([0xff, 0x10, 0x20, 0x30]));
         assert_eq!(argb("red"), None);
         assert_eq!(argb("#12345"), None);
+    }
+
+    #[test]
+    fn idle() {
+        assert!(Rules::parse("").idle());
+        assert!(Rules::parse("# nothing\n").idle());
+        assert!(!Rules::parse("!dump").idle());
+        assert!(!Rules::parse("!backdrop none").idle());
+        assert!(!Rules::parse("Grid").idle());
     }
 
     #[test]

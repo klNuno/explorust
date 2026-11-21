@@ -1,7 +1,7 @@
 //! One NTFS volume: its handle, the USN journal, the MFT enumeration and the journal follower.
 
 use crate::log;
-use fsindex::table::Table;
+use fsindex::table::{RecState, Table};
 use fsindex::usn::{self, Record};
 use std::sync::RwLock;
 use std::time::Instant;
@@ -114,18 +114,25 @@ fn hard_links(volume: HANDLE, frn: u64, buf: &mut [u8]) -> Option<Vec<(u32, Stri
     Some(out)
 }
 
-/// Gives each file in `frns` (whose name is inside a pruned tree) its first name outside it, if
-/// it has one: System32's binaries are hard links whose first name is in WinSxS. Takes the write
-/// lock per chunk so queries go on meanwhile; returns (files looked at, names added, open failures).
+/// Gives each file in `frns` (whose name is inside a pruned tree, or whose kept name may be gone)
+/// its first name outside the pruned trees, if it has one: System32's binaries are hard links whose
+/// first name is in WinSxS; a kept name with no link left outside is dropped. The links are read
+/// without the lock, so queries and the journal go on meanwhile; a result is written only into the
+/// same table and only when its record still holds what it held before the read (the journal wins
+/// any change made in between). Returns (files looked at, names added, open failures).
 pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>) -> (usize, usize, usize) {
     let mut buf = vec![0u8; 8 << 10];
     let (mut added, mut failed) = (0, 0);
+    let id = table.read().unwrap_or_else(|p| p.into_inner()).id();
     for chunk in frns.chunks(256) {
+        let before: Vec<RecState> = {
+            let t = table.read().unwrap_or_else(|p| p.into_inner());
+            chunk.iter().map(|&f| t.state((f & ((1 << 48) - 1)) as u32)).collect()
+        };
         let mut found = Vec::new();
-        for &frn in chunk {
+        for (&frn, was) in chunk.iter().zip(before) {
             match hard_links(volume, frn, &mut buf) {
-                Some(links) if links.len() > 1 => found.push((frn & ((1 << 48) - 1), links)),
-                Some(_) => {}
+                Some(links) => found.push(((frn & ((1 << 48) - 1)) as u32, was, links)),
                 None => failed += 1,
             }
         }
@@ -133,10 +140,21 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>) -> (usize,
             continue;
         }
         let mut t = table.write().unwrap_or_else(|p| p.into_inner());
-        for (rec, links) in found {
-            if let Some((parent, name)) = links.into_iter().find(|(p, _)| !t.pruned_parent(*p)) {
-                t.upsert(rec as u32, parent, &name, false, false, 0);
-                added += 1;
+        if t.id() != id {
+            break;
+        }
+        for (rec, was, links) in found {
+            if t.state(rec) != was {
+                continue;
+            }
+            match links.into_iter().find(|(p, _)| !t.pruned_parent(*p)) {
+                Some((parent, name)) => {
+                    if !matches!(&was, RecState::Named(p, n) if *p == parent && *n == name) {
+                        t.upsert(rec, parent, &name, false, false, 0);
+                        added += 1;
+                    }
+                }
+                None => t.prune(rec),
             }
         }
     }
@@ -152,7 +170,12 @@ fn apply(t: &mut Table, r: &Record) {
     } else if r.reason & usn::REASON_RENAME_OLD_NAME == 0 {
         let dir = r.attrs & usn::ATTR_DIRECTORY != 0;
         let noisy = r.attrs & (usn::ATTR_HIDDEN | usn::ATTR_SYSTEM) != 0;
-        t.upsert(r.rec as u32, r.parent.min(u32::MAX as u64) as u32, &r.name, dir, noisy, r.usn);
+        let parent = r.parent.min(u32::MAX as u64) as u32;
+        t.upsert(r.rec as u32, parent, &r.name, dir, noisy, r.usn);
+        // A kept name may be gone: renamed into a pruned tree, or one of its hard links removed.
+        if !dir && (r.reason & usn::REASON_HARD_LINK_CHANGE != 0 || (r.reason & usn::REASON_RENAME_NEW_NAME != 0 && t.pruned_parent(parent))) {
+            t.recheck_links(r.rec as u32);
+        }
     }
 }
 

@@ -642,8 +642,19 @@ fn key(vk: u16) {
                 context_on(h, b.x + b.w / 2.0, b.y + b.h / 2.0);
             }
         }
+        // A key whose character TranslateMessage already queued draws with that character
+        // (WM_CHAR), so a frame left dirty by a coalesced answer is not shown first.
+        _ if char_follows() => {}
         _ => redraw(),
     }
+}
+
+/// A WM_CHAR from the key being handled waits in this thread's queue.
+fn char_follows() -> bool {
+    let Some(hwnd) = with(|s| s.hwnd) else { return false };
+    let mut msg = MSG::default();
+    // SAFETY: looks at the first queued character without removing it.
+    unsafe { PeekMessageW(&mut msg, Some(hwnd), WM_CHAR, WM_CHAR, PM_NOREMOVE | PM_NOYIELD) }.as_bool()
 }
 
 fn wheel(delta: i16) {

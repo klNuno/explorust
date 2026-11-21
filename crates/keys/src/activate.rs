@@ -11,7 +11,8 @@ use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_MOUSE, SendInput, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowExW, GA_ROOT,
-    GetAncestor, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindowTextW, GetWindowThreadProcessId, HWND_MESSAGE,
+    GWL_EXSTYLE, GetAncestor, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId,
+    HWND_MESSAGE, IsWindowVisible, WS_EX_TOOLWINDOW,
     HWND_TOP, IsIconic, IsWindow, MSG, RegisterClassW, SW_RESTORE, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos, ShowWindow, ShowWindowAsync, SwitchToThisWindow,
     WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
@@ -74,8 +75,14 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         } else if let Some((cmd @ (bus::Command::Minimize | bus::Command::Restore), h)) = bus::decode(wp, lp) {
             let target = HWND(h as _);
             let min = cmd == bus::Command::Minimize;
-            // SAFETY: async requests on a handle from the shell; a stale one only fails them, a
-            // hung target never stalls this thread.
+            // The bus is open to any sender of this desktop: only what show desktop does is done,
+            // to a visible top-level window, and a restore only to a minimized one.
+            if let Err(why) = show_desktop_target(target, min) {
+                crate::hook::log_line(&format!("{} refused for {:?} ({}): {why}", if min { "minimize" } else { "restore" }, title(target), class(target)));
+                return LRESULT(0);
+            }
+            // SAFETY: async requests on a checked handle; a stale one only fails them, a hung
+            // target never stalls this thread.
             let ok = unsafe {
                 let ok = ShowWindowAsync(target, if min { SW_SHOWMINNOACTIVE } else { SW_SHOWNOACTIVATE }).as_bool();
                 if !min {
@@ -89,6 +96,30 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
     }
     // SAFETY: default handling for everything else.
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+/// A window show desktop may minimize or restore: a visible top-level window, not a tool window,
+/// minimized when it is to be restored.
+fn show_desktop_target(h: HWND, min: bool) -> Result<(), &'static str> {
+    // SAFETY: plain queries on a handle that may be stale.
+    unsafe {
+        if !IsWindow(Some(h)).as_bool() {
+            return Err("not a window");
+        }
+        if GetAncestor(h, GA_ROOT) != h {
+            return Err("not top-level");
+        }
+        if !IsWindowVisible(h).as_bool() {
+            return Err("hidden");
+        }
+        if GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 {
+            return Err("tool window");
+        }
+        if !min && !IsIconic(h).as_bool() {
+            return Err("not minimized");
+        }
+    }
+    Ok(())
 }
 
 fn class(h: HWND) -> String {

@@ -84,6 +84,8 @@ unsafe extern "system" fn create_window_in_band(
         // SAFETY: reads the error of the retry.
         let retry_error = unsafe { GetLastError() };
         hlog!("phase=lightdismiss-window band={band} denied, retry band={DESKTOP_BAND} result=null last_error={retry_error}");
+        // SAFETY: logging may have changed the last error; the caller reads the retry's.
+        unsafe { SetLastError(retry_error) };
     } else {
         hlog!("phase=lightdismiss-window band={band} ex_style={ex_style:#x} denied, retry band={DESKTOP_BAND} hwnd={retry:?}");
     }

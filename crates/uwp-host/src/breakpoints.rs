@@ -4,6 +4,9 @@
 //! unwound call stack as `module+rva`, at most `MAX_HITS` times per breakpoint, then runs the
 //! original instruction (byte restored, one single step, int3 written back). No file, no effect.
 //!
+//! Built only with the `diagnostics` feature. An RVA outside the module's executable sections
+//! (a `bp.txt` left from another Windows build) is refused before any read or write.
+//!
 //! Used to find who hides the notification center (notify-13): hits land in uwp-host.log. A
 //! `winevents` line also logs foreground, focus, cloak and minimize events of every process.
 //! Symbolize the hits with the public PDBs (pdb crate, `rva name` per public symbol).
@@ -74,8 +77,12 @@ pub(crate) fn arm_from_file() {
             hlog!("phase=bp module={module} result=not-loaded");
             continue;
         };
+        if !in_code(handle, rva) {
+            hlog!("phase=bp module={module} rva={rva:#x} result=outside-code");
+            continue;
+        }
         let addr = handle.0 as usize + rva;
-        // SAFETY: `addr` lies in the loaded image (an RVA from its own PDB); reading one byte.
+        // SAFETY: `addr` lies in an executable section of the loaded image (checked above).
         let original = unsafe { std::ptr::read_volatile(addr as *const u8) };
         map.insert(addr, Breakpoint { label, peek, original, hits: AtomicU32::new(0) });
     }
@@ -90,6 +97,38 @@ pub(crate) fn arm_from_file() {
         patch(*addr, INT3);
     }
     hlog!("phase=bp armed={count}");
+}
+
+/// `rva` lies inside an executable section of the loaded image `m` (its PE headers, mapped with
+/// the image).
+fn in_code(m: HMODULE, rva: usize) -> bool {
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    let base = m.0 as usize;
+    // SAFETY: reads the PE headers of a loaded module (always mapped, readable), each offset
+    // checked against SizeOfHeaders before the section table is walked.
+    unsafe {
+        let rd16 = |a: usize| std::ptr::read_unaligned(a as *const u16);
+        let rd32 = |a: usize| std::ptr::read_unaligned(a as *const u32);
+        if rd16(base) != 0x5a4d {
+            return false;
+        }
+        let nt = base + rd32(base + 0x3c) as usize;
+        if rd32(nt) != 0x0000_4550 {
+            return false;
+        }
+        let sections = rd16(nt + 6) as usize;
+        let opt = nt + 24;
+        let (size_of_image, size_of_headers) = (rd32(opt + 56) as usize, rd32(opt + 60) as usize);
+        let table = opt + rd16(nt + 20) as usize;
+        if rva >= size_of_image || table + sections * 40 > base + size_of_headers {
+            return false;
+        }
+        (0..sections).any(|i| {
+            let s = table + i * 40;
+            let (size, va, flags) = (rd32(s + 8) as usize, rd32(s + 12) as usize, rd32(s + 36));
+            flags & IMAGE_SCN_MEM_EXECUTE != 0 && (va..va + size).contains(&rva)
+        })
+    }
 }
 
 fn patch(addr: usize, byte: u8) {

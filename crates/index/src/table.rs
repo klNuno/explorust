@@ -54,7 +54,21 @@ pub struct Table {
     /// Files pruned since the last `take_pruned_files`: a hard link of theirs may sit outside
     /// the pruned tree (System32 binaries are links into WinSxS), looked up by the service.
     pruned_files: Vec<u32>,
+    /// This table's number: a table made by a reload has another, so work begun on the old one
+    /// is not written into it.
+    id: u64,
 }
+
+/// What a record holds, compared across a hard link lookup made without the lock (compaction
+/// renumbers names, so the name itself is compared).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecState {
+    Free,
+    Pruned,
+    Named(u32, String),
+}
+
+static TABLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A match before its path is built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,7 +97,37 @@ fn word_start(prev: u8) -> bool {
 
 impl Table {
     pub fn new() -> Table {
-        Table { case: vec![0], fold: vec![SEP], ..Default::default() }
+        Table { case: vec![0], fold: vec![SEP], id: TABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ..Default::default() }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn state(&self, rec: u32) -> RecState {
+        match self.slots.get(rec as usize) {
+            None => RecState::Free,
+            Some(s) if s.name != NONE => RecState::Named(s.parent, self.name(rec).unwrap_or_default()),
+            Some(s) if s.parent == NONE => RecState::Pruned,
+            Some(_) => RecState::Free,
+        }
+    }
+
+    /// A file whose links were looked up and none is outside the pruned trees: its kept name is
+    /// gone (renamed or unlinked into the tree), so it leaves the table as a pruned record.
+    pub fn prune(&mut self, rec: u32) {
+        if self.slots.get(rec as usize).is_some_and(|s| s.name != NONE && s.name & DIR == 0) {
+            self.remove(rec);
+            self.slots[rec as usize] = PRUNED;
+        }
+    }
+
+    /// A rename into a pruned tree or a hard link change of a file that has a kept name: that
+    /// name may be gone, so the file goes to the next links lookup (`take_pruned_files`).
+    pub fn recheck_links(&mut self, rec: u32) {
+        if self.slots.get(rec as usize).is_some_and(|s| s.name != NONE && s.name & DIR == 0) && !self.pruned_files.contains(&rec) {
+            self.pruned_files.push(rec);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -553,6 +597,29 @@ mod tests {
         t.upsert(44, 42, "new.dll", false, false, 3);
         assert_eq!(t.take_pruned_files(), vec![44]);
         assert!(t.pruned_parent(42) && t.pruned_parent(41) && !t.pruned_parent(50));
+    }
+
+    #[test]
+    fn rename_into_pruned_tree_drops_the_gone_name() {
+        let mut t = sample();
+        t.upsert(40, ROOT, "Windows", true, false, 1);
+        t.upsert(42, 40, "WinSxS", true, false, 1);
+        t.settle();
+        // An ordinary file of Documents renamed into WinSxS: the journal names it there.
+        t.upsert(33, 42, "Rapport final.docx", false, false, 2);
+        t.recheck_links(33);
+        assert_eq!(t.take_pruned_files(), vec![33]);
+        let before = t.state(33);
+        assert!(matches!(&before, RecState::Named(32, n) if n == "Rapport final.docx"));
+        // The lookup found no link outside the tree.
+        t.prune(33);
+        assert_eq!(t.state(33), RecState::Pruned);
+        assert!(t.query("rapport", 5).is_empty());
+        assert!(t.path(33, "C:\\").is_none());
+        // Folders are never pruned this way; a fresh table has another id.
+        t.prune(32);
+        assert!(t.name(32).is_some());
+        assert_ne!(Table::new().id(), t.id());
     }
 
     #[test]

@@ -86,7 +86,8 @@ pub fn settings_loaded(v: Vec<Setting>) {
 
 /// A typed character: the query grows and the results answer in the same frame.
 pub fn ch(c: u32) {
-    let Some(c) = char::from_u32(c).filter(|c| !c.is_control()) else { return };
+    // A character that adds no text still shows the frame its key down left for it.
+    let Some(c) = char::from_u32(c).filter(|c| !c.is_control()) else { return super::redraw() };
     let label = c.to_string();
     answer(&label, |q| {
         let mut q = q.to_string();

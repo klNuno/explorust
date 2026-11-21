@@ -424,8 +424,8 @@ fn run_host_with_parent(
             return ExitCode::FAILURE;
         }
     };
-    // explorust dev probe: no effect without %LOCALAPPDATA%\explorust\bp.txt.
-    #[cfg(target_arch = "x86_64")]
+    // explorust dev probe, diagnostics builds only: no effect without %LOCALAPPDATA%\explorust\bp.txt.
+    #[cfg(all(target_arch = "x86_64", feature = "diagnostics"))]
     crate::breakpoints::arm_from_file();
     #[cfg(feature = "diagnostics")]
     let frame_pool = if trace_view_events.is_some() {
