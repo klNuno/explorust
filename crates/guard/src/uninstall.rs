@@ -108,7 +108,11 @@ pub fn run(yes: bool, quiet: bool) -> u32 {
             return (user, Err("not tried".to_string()), Machine::Code(FAILED));
         }
         let back = manage::bring_back_explorer();
-        let machine = if install::elevated() {
+        // The files stay until explorer is confirmed back: the guard of this session still runs
+        // them, and a retry needs the Apps entry.
+        let machine = if back.is_err() {
+            Machine::Code(FAILED)
+        } else if install::elevated() {
             Machine::Code(machine(account::own_sid().as_deref()))
         } else {
             let mut args = String::from("--uninstall --machine");
@@ -169,8 +173,8 @@ pub fn run(yes: bool, quiet: bool) -> u32 {
             Icon::Warning,
             tr("explorust est désactivé, mais la barre des tâches n'est pas revenue", "explorust is turned off, but the taskbar did not come back"),
             tr(
-                "Fermez la session et rouvrez-la : Windows démarrera normalement.",
-                "Sign out and sign in again: Windows will start normally.",
+                "Fermez la session et rouvrez-la : Windows démarrera normalement. Relancez ensuite la désinstallation pour supprimer ses fichiers.",
+                "Sign out and sign in again: Windows will start normally. Then run the uninstall again to remove its files.",
             ),
         ),
         (Machine::Code(0), None) => (

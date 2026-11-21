@@ -181,14 +181,18 @@ pub fn run_bounded(cmd: &mut std::process::Command, limit: std::time::Duration) 
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("{what}: {e}"))?;
+    // Each pipe is read on its own thread and handed over through a channel, so a grandchild that
+    // keeps a pipe open cannot hold this call past its limit.
     let reader = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut text = String::new();
             if let Some(mut p) = pipe {
                 let _ = p.read_to_string(&mut text);
             }
-            text
-        })
+            let _ = tx.send(text);
+        });
+        rx
     };
     let out = reader(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
     let err = reader(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
@@ -199,13 +203,13 @@ pub fn run_bounded(cmd: &mut std::process::Command, limit: std::time::Duration) 
             Ok(None) if t0.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(200)),
             Ok(None) => {
                 let _ = child.kill();
-                let _ = child.wait();
                 return Err(format!("{what} still running after {} s: stopped", limit.as_secs()));
             }
             Err(e) => return Err(format!("{what}: {e}")),
         }
     };
-    let out = out.join().unwrap_or_default();
-    let err = err.join().unwrap_or_default();
+    let rest = std::time::Duration::from_secs(5);
+    let out = out.recv_timeout(rest).unwrap_or_default();
+    let err = err.recv_timeout(rest).unwrap_or_default();
     Ok((status.success(), out.trim().to_string(), err.trim().to_string()))
 }

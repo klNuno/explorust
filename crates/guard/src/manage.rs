@@ -45,7 +45,9 @@ pub fn install() -> u32 {
         say("install: elevated as another account; sign in with an administrator account and install from there");
         return OTHER_ACCOUNT;
     }
-    let fresh = !install::dir().join("explorust.exe").exists();
+    // Anything already there (even a damaged install other accounts may use) is not undone on a
+    // failure: only a machine with no trace of explorust is.
+    let fresh = !install::dir().exists() && !reg::has_uninstall_entry() && reg::machine_users().is_empty();
     let guard = if elevated {
         match machine_install(&from) {
             Ok(g) => g,
@@ -109,7 +111,7 @@ fn undo_machine() {
     let apps = apps::unregister();
     let files = install::remove_files();
     reg::delete_machine_state();
-    say(&format!("install undone: service {svc:?}, certificate {cert:?}, {apps:?}, {files}"));
+    say(&format!("install undone: service {svc:?}, certificate {cert:?}, {apps:?}, files {files:?}"));
 }
 
 /// This user's half, in this user's own process: Ok once the Shell value is gone (or was never
@@ -198,7 +200,8 @@ pub fn restore_machine(session_sid: Option<&str>) -> Result<bool, String> {
     say(&format!("restore: {svc}"));
     let cert = install::trust(false).map_err(|e| format!("certificate: {e}"))?;
     say(&format!("restore: certificate {cert}"));
-    say(&format!("restore: {}", install::remove_files()));
+    let files = install::remove_files().map_err(|e| format!("files: {e}"))?;
+    say(&format!("restore: {files}"));
     let apps = apps::unregister().map_err(|e| format!("Apps entry: {e}"))?;
     say(&format!("restore: {apps}"));
     reg::delete_machine_state();
@@ -211,10 +214,11 @@ pub fn restore() -> u32 {
     let mine = !install::elevated() || account::is_session_user();
     let user = if mine { restore_user().map(|_| ()) } else { Ok(()) };
     let back = bring_back_explorer();
-    let machine = match (&user, install::elevated()) {
-        (Ok(()), true) => restore_machine(None).map(|_| ()),
-        (Err(_), true) => Err("files kept: the Shell value is still there".to_string()),
-        (_, false) => {
+    let machine = match (&user, &back, install::elevated()) {
+        (Ok(()), Ok(_), true) => restore_machine(None).map(|_| ()),
+        (Err(_), _, true) => Err("files kept: the Shell value is still there".to_string()),
+        (_, Err(_), true) => Err("files kept: explorer is not back yet; sign out and in, then run it again".to_string()),
+        (_, _, false) => {
             if install::dir().exists() || install::trusted() {
                 say("restore: run it elevated to remove the Program Files copy and the certificate");
             }
@@ -222,7 +226,7 @@ pub fn restore() -> u32 {
         }
     };
     let mut code = 0;
-    for (what, r) in [("user", user), ("explorer", back.map(|_| ())), ("machine", machine)] {
+    for (what, r) in [("user", user), ("explorer", back.clone().map(|_| ())), ("machine", machine)] {
         if let Err(e) = r {
             say(&format!("restore failed ({what}): {e}"));
             code = FAILED;

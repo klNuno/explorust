@@ -3,7 +3,7 @@
 //! still runs and falls back to a plain message box, so a dialog can never keep a session from
 //! getting a shell.
 
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Controls::{
@@ -14,7 +14,7 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::WindowsAndMessaging::{
     HWND_TOPMOST, IDNO, IDOK, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
     MB_YESNOCANCEL,
-    MESSAGEBOX_STYLE, MessageBoxW, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowPos,
+    GetWindowRect, MESSAGEBOX_STYLE, MessageBoxW, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowPos,
 };
 use windows::core::{HRESULT, HSTRING, PCWSTR, s, w};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,13 +50,23 @@ fn task_dialog() -> Option<TaskDialogIndirect> {
 }
 
 /// Brings the dialog in front of everything: at logon or after a fallback nothing else owns it.
+/// A new dialog goes on top and asks for the foreground. Its place goes to the log: a guard started
+/// in the background (the notice at logon) may not get the foreground, and the guest tests click
+/// its title bar the way a user would.
+fn raise(hwnd: HWND) {
+    // SAFETY: the dialog's own window.
+    unsafe {
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        let front = SetForegroundWindow(hwnd).as_bool();
+        let mut r = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut r);
+        crate::log::line(&format!("dialog window: {} {} {} {} (foreground: {front})", r.left, r.top, r.right, r.bottom));
+    }
+}
+
 unsafe extern "system" fn on_event(hwnd: HWND, msg: TASKDIALOG_NOTIFICATIONS, _: WPARAM, _: LPARAM, _: isize) -> HRESULT {
     if msg == TDN_CREATED {
-        // SAFETY: the dialog's own window.
-        unsafe {
-            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            let _ = SetForegroundWindow(hwnd);
-        }
+        raise(hwnd);
     }
     HRESULT(0)
 }
@@ -168,8 +178,7 @@ unsafe extern "system" fn on_progress(hwnd: HWND, msg: TASKDIALOG_NOTIFICATIONS,
     // SAFETY: messages to the dialog's own window.
     unsafe {
         if msg == TDN_CREATED {
-            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            let _ = SetForegroundWindow(hwnd);
+            raise(hwnd);
             SendMessageW(hwnd, TDM_SET_PROGRESS_BAR_MARQUEE.0 as u32, Some(WPARAM(1)), Some(LPARAM(30)));
             SendMessageW(hwnd, TDM_ENABLE_BUTTON.0 as u32, Some(WPARAM(IDOK.0 as usize)), Some(LPARAM(0)));
         } else if msg == TDN_TIMER && done {

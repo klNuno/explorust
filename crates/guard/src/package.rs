@@ -25,7 +25,7 @@ const LIMIT: std::time::Duration = std::time::Duration::from_secs(180);
 
 fn powershell(script: &str) -> Result<String, String> {
     let (ok, text, err) = crate::proc::run_bounded(
-        Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]),
+        Command::new(crate::install::system32().join(r"WindowsPowerShell\v1.0\powershell.exe")).args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]),
         LIMIT,
     )?;
     if ok && err.is_empty() {

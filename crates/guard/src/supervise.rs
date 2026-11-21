@@ -108,6 +108,8 @@ fn turn_off(why: &str) -> Notice {
             Notice::TurnedOff(why.to_string())
         }
         Err(e) => {
+            // Latched: the next logon must not clear the streak, so it tries to turn off again.
+            reg::set_logon_had_problem(true);
             log::line(&format!("explorust should turn off ({why}) but the Shell value stays: {e}"));
             Notice::Problem(format!("{why}; turning explorust off failed: {e}"))
         }
@@ -243,41 +245,40 @@ fn shell_exe() -> PathBuf {
 }
 
 pub fn explorer_path() -> PathBuf {
-    let windir = std::env::var_os("WINDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    windir.join("explorer.exe")
+    use windows::Win32::UI::Shell::FOLDERID_Windows;
+    crate::install::known(&FOLDERID_Windows).unwrap_or_else(|| PathBuf::from(r"C:\Windows")).join("explorer.exe")
 }
 
 /// Keeps a plain explorer.exe as the shell for the rest of the session: started (or an explorer
 /// whose taskbar already answers, adopted), confirmed by its answering taskbar, restarted when it
-/// ends, hangs before its taskbar comes or fails to start, at most 5 times in 5 minutes. `notice`
-/// shows once that taskbar answers; when it never does, the user is told how to start it by hand.
+/// ends. A start that fails (no process, no taskbar within 60 s, or a taskbar that lives under 30 s)
+/// counts; after 3 in a row the user is told once how to start it by hand, and the guard keeps
+/// trying, waiting longer between tries (up to a minute). `notice` shows once a taskbar answers.
 fn explorer_forever(notice: Option<Notice>) -> u32 {
     folders::handler(false);
     let mut notice = notice;
     let path = explorer_path();
-    let mut starts: Vec<Instant> = Vec::new();
+    let mut failures = 0u32;
     let mut told = false;
     loop {
+        if failures > 0 {
+            if failures >= 3 && !told {
+                told = true;
+                log::line(&format!("explorer failed to come up {failures} times in a row: telling the user"));
+                notice::show_later(Notice::NoShell);
+            }
+            std::thread::sleep(Duration::from_secs((u64::from(failures) * 5).min(60)));
+        }
         let pid = match taskbar::explorer() {
             Some(pid) => {
-                log::line(&format!("explorer pid {pid} already owns the taskbar"));
+                log::line(&format!("explorer pid {pid} owns the taskbar"));
                 pid
             }
             None => {
-                let now = Instant::now();
-                starts.retain(|t| now.duration_since(*t) < Duration::from_secs(300));
-                if starts.len() >= 5 {
-                    log::line("explorer did not come up 5 times in 5 minutes: telling the user, next try in 1 minute");
-                    if !told {
-                        told = true;
-                        notice::show_later(Notice::NoShell);
-                    }
-                    starts.clear();
-                    std::thread::sleep(Duration::from_secs(60));
+                let Some(child) = spawn_explorer(&path) else {
+                    failures += 1;
                     continue;
-                }
-                starts.push(now);
-                let Some(child) = spawn_explorer(&path) else { continue };
+                };
                 let t0 = Instant::now();
                 match taskbar::wait_explorer(&child, Duration::from_secs(60)) {
                     Start::Up(pid) => {
@@ -286,12 +287,13 @@ fn explorer_forever(notice: Option<Notice>) -> u32 {
                     }
                     Start::Exited(code) => {
                         log::line(&format!("explorer pid {} ended before its taskbar came, code {code:#x}", child.pid));
-                        std::thread::sleep(Duration::from_secs(2));
+                        failures += 1;
                         continue;
                     }
                     Start::Timeout => {
                         log::line(&format!("explorer pid {} has no taskbar after 60 s: restarting it", child.pid));
                         child.kill();
+                        failures += 1;
                         continue;
                     }
                 }
@@ -300,12 +302,18 @@ fn explorer_forever(notice: Option<Notice>) -> u32 {
         if let Some(n) = notice.take() {
             notice::show_later(n);
         }
+        let up = Instant::now();
         match Child::open(pid) {
             Ok(shell) => {
                 wait_any(&[shell.handle], None);
-                log::line(&format!("explorer pid {pid} ended, code {:#x}", shell.exit_code()));
+                log::line(&format!("explorer pid {pid} ended after {} s, code {:#x}", up.elapsed().as_secs(), shell.exit_code()));
             }
             Err(e) => log::line(&format!("explorer pid {pid}: {e}")),
+        }
+        if up.elapsed() < Duration::from_secs(30) {
+            failures += 1;
+        } else {
+            failures = 0;
         }
         std::thread::sleep(Duration::from_secs(2));
     }

@@ -41,18 +41,36 @@ const FILES: [&str; 11] = [
 ];
 /// The MFT/USN index (`crates/index`), registered as the service `explorust-index`.
 const INDEX: &str = "explorust-index.exe";
+const SERVICE: &str = "explorust-index";
 
 pub fn elevated() -> bool {
     // SAFETY: a plain token query.
     unsafe { IsUserAnAdmin() }.as_bool()
 }
 
+/// A Windows folder from the shell's known folders, never from environment variables: an elevated
+/// install must not take a path the user's own programs can redirect.
+pub fn known(id: &windows::core::GUID) -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    // SAFETY: the returned string is copied, then freed with CoTaskMemFree.
+    unsafe {
+        let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
+        let out = p.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(p.0 as *const _));
+        out
+    }
+}
+
 pub fn dir() -> PathBuf {
-    let base = std::env::var_os("ProgramW6432")
-        .or_else(|| std::env::var_os("ProgramFiles"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
-    base.join("explorust")
+    use windows::Win32::UI::Shell::FOLDERID_ProgramFiles;
+    known(&FOLDERID_ProgramFiles).unwrap_or_else(|| PathBuf::from(r"C:\Program Files")).join("explorust")
+}
+
+/// `%SystemRoot%\System32`, from the known folders.
+pub fn system32() -> PathBuf {
+    use windows::Win32::UI::Shell::FOLDERID_System;
+    known(&FOLDERID_System).unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"))
 }
 
 /// Copies the shell's files from `from` into the install folder; returns the installed guard.
@@ -210,15 +228,23 @@ fn delete_at_boot(path: &Path) {
     log::line(&format!("{} in use: deleted at next boot ({r:?})", path.display()));
 }
 
-/// Removes the install folder. A file still running is renamed to a unique name first and that
-/// name is deleted at the next boot, so a later `--install` into the same folder is not undone.
-pub fn remove_files() -> String {
+/// Removes the install folder. A file still running is renamed to a unique name and that name is
+/// deleted at the next boot; the live name itself is never scheduled, or a reinstall before the
+/// reboot would lose its new file. Err lists what could be neither removed nor renamed.
+pub fn remove_files() -> Result<String, String> {
     let to = dir();
-    let Ok(entries) = std::fs::read_dir(&to) else { return format!("{} absent", to.display()) };
-    let (mut gone, mut later) = (0, 0);
+    let entries = match std::fs::read_dir(&to) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(format!("{} absent", to.display())),
+        Err(e) => return Err(format!("{}: {e}", to.display())),
+    };
+    let (mut gone, mut later, mut stuck) = (0, 0, Vec::new());
     for (i, e) in entries.flatten().enumerate() {
         let path = e.path();
-        if path.is_dir() && std::fs::remove_dir_all(&path).is_ok() {
+        if path.is_dir() {
+            if std::fs::remove_dir_all(&path).is_err() {
+                stuck.push(path.display().to_string());
+            }
             continue;
         }
         if std::fs::remove_file(&path).is_ok() {
@@ -226,16 +252,23 @@ pub fn remove_files() -> String {
             continue;
         }
         let unique = path.with_extension(format!("del{}-{i}", std::process::id()));
-        let doomed = if std::fs::rename(&path, &unique).is_ok() { unique } else { path };
-        delete_at_boot(&doomed);
-        later += 1;
+        if std::fs::rename(&path, &unique).is_ok() {
+            delete_at_boot(&unique);
+            later += 1;
+        } else {
+            stuck.push(path.display().to_string());
+        }
+    }
+    if !stuck.is_empty() {
+        return Err(format!("still in use: {}", stuck.join(", ")));
     }
     if later == 0 {
         let _ = std::fs::remove_dir(&to);
     } else {
+        // Deleted at boot only if empty by then: a reinstall in between keeps it.
         delete_at_boot(&to);
     }
-    format!("{} removed: {gone} files now, {later} at next boot", to.display())
+    Ok(format!("{} removed: {gone} files now, {later} at next boot", to.display()))
 }
 
 fn open_store(name: &str) -> Result<HCERTSTORE, String> {
@@ -333,7 +366,18 @@ pub fn trusted() -> bool {
 pub fn index_service(install: bool) -> Result<String, String> {
     let exe = dir().join(INDEX);
     if !exe.exists() {
-        return Ok(format!("{} absent, no service", exe.display()));
+        if install {
+            return Ok(format!("{} absent, no service", exe.display()));
+        }
+        // A service entry can outlive its exe (a partial install): remove it by name.
+        let sc = system32().join("sc.exe");
+        let _ = crate::proc::run_bounded(std::process::Command::new(&sc).args(["stop", SERVICE]), std::time::Duration::from_secs(30));
+        return match crate::proc::run_bounded(std::process::Command::new(&sc).args(["delete", SERVICE]), std::time::Duration::from_secs(30)) {
+            Ok((true, out, _)) => Ok(out),
+            Ok((false, out, _)) if out.contains("1060") || out.contains("1072") => Ok(format!("service {SERVICE} absent")),
+            Ok((false, out, err)) => Err(format!("sc delete {SERVICE}: {out} {err}")),
+            Err(e) => Err(e),
+        };
     }
     let arg = if install { "--install" } else { "--uninstall" };
     match crate::proc::run_bounded(std::process::Command::new(&exe).arg(arg), std::time::Duration::from_secs(60)) {
