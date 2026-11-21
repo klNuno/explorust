@@ -1,7 +1,8 @@
 //! The index: one table per fixed NTFS volume, loaded from the MFT then kept current from the
 //! journal on a thread per volume, and the pipe that answers queries from them.
 
-use crate::{log, pipe, volume};
+use crate::hydration::Hydration;
+use crate::{log, metadata, pipe, volume};
 use fsindex::fold;
 use fsindex::proto::{Hit, Reply};
 use fsindex::table::{SortKey, Table};
@@ -12,7 +13,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, Set
 
 pub struct Vol {
     pub root: String,
-    pub table: RwLock<Table>,
+    pub table: Arc<RwLock<Table>>,
 }
 
 fn memory() -> (f64, f64) {
@@ -30,22 +31,23 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
             let v = volume::Volume::open(letter)?;
             let j = v.journal()?;
             let t0 = Instant::now();
-            let (t, pruned) = v.load(j.NextUsn)?;
-            let id = t.id();
+            let volume::Mft { names, sequences, pruned } = v.load(j.NextUsn)?;
+            let id = names.id();
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let (n, bytes) = (t.len(), t.bytes());
-            *vol.table.write().unwrap_or_else(|p| p.into_inner()) = t;
+            let (n, bytes) = (names.len(), names.bytes());
+            let hydration = Hydration::publish(vol.table.clone(), names);
             log::line(&format!("{letter}: MFT read: {n} names in {ms:.0} ms, table {:.1} MB ({:.1} bytes a name)", bytes as f64 / 1048576.0, bytes as f64 / n.max(1) as f64));
+            if first {
+                let _ = loaded.send(());
+                first = false;
+            }
             if !pruned.is_empty() {
                 match v.duplicate() {
                     Ok(handle) => links_later(letter, handle, pruned, vol.clone(), id),
                     Err(e) => log::line(&format!("{letter}: hard links: duplicate volume handle failed: {e}")),
                 }
             }
-            if first {
-                let _ = loaded.send(());
-                first = false;
-            }
+            metadata::spawn(letter, v.device_path(), sequences, hydration);
             Ok(v.follow(j.UsnJournalID, j.NextUsn, &vol.table))
         })();
         match r {
@@ -117,7 +119,7 @@ static VOLS: RwLock<Vec<(char, Arc<Vol>)>> = RwLock::new(Vec::new());
 static LOADED: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
 
 fn add(c: char) -> Arc<Vol> {
-    let v = Arc::new(Vol { root: format!("{c}:\\"), table: RwLock::new(Table::new()) });
+    let v = Arc::new(Vol { root: format!("{c}:\\"), table: Arc::new(RwLock::new(Table::new())) });
     let (tx, _rx) = std::sync::mpsc::channel();
     let tx = LOADED.lock().ok().and_then(|l| l.clone()).unwrap_or(tx);
     let v2 = v.clone();

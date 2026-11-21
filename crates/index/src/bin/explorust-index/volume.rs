@@ -14,7 +14,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_READ_ATTRIBUTES,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdType, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
-    OPEN_EXISTING, OpenFileById,
+    GetVolumeNameForVolumeMountPointW, OPEN_EXISTING, OpenFileById,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
@@ -28,7 +28,7 @@ const DRIVE_FIXED: u32 = 3;
 /// Metadata files ($MFT, $LogFile, the root itself) sit below record 16.
 const FIRST_USER_RECORD: u64 = 16;
 
-fn full_reference(rec: u32, seq: u16) -> u64 {
+pub(crate) fn full_reference(rec: u32, seq: u16) -> u64 {
     u64::from(rec) | (u64::from(seq) << 48)
 }
 
@@ -55,10 +55,16 @@ pub fn fixed_ntfs() -> Vec<char> {
 pub struct Volume {
     pub letter: char,
     h: HANDLE,
+    path: HSTRING,
 }
 
-// SAFETY: each Volume owns its handle. The link worker receives a duplicate and only uses it
-// to open files by ID while the follower reads the journal through the original handle.
+pub struct Mft {
+    pub names: Table,
+    pub sequences: Vec<u16>,
+    pub pruned: Vec<u64>,
+}
+
+// SAFETY: each Volume owns its handle. The workers receive their own handles.
 unsafe impl Send for Volume {}
 
 impl Drop for Volume {
@@ -237,12 +243,27 @@ fn apply(t: &mut Table, r: &Record, modified: i64) {
 
 impl Volume {
     pub fn open(letter: char) -> windows_core::Result<Volume> {
-        let path = HSTRING::from(format!(r"\\.\{letter}:"));
+        let root = HSTRING::from(format!("{letter}:\\"));
+        let mut name = [0u16; 64];
+        // SAFETY: writes into the given volume GUID path buffer.
+        unsafe { GetVolumeNameForVolumeMountPointW(&root, &mut name)? };
+        let name = name.split(|&c| c == 0).next().unwrap_or_default();
+        // A trailing backslash opens the root directory, rather than the volume device.
+        let path = HSTRING::from_wide(name.strip_suffix(&[b'\\' as u16]).unwrap_or(name));
+        Self::open_path(letter, path)
+    }
+
+    pub fn open_path(letter: char, path: HSTRING) -> windows_core::Result<Self> {
         // SAFETY: opens the volume for reads; the handle is closed on drop.
         let h = unsafe {
             CreateFileW(&path, GENERIC_READ.0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_FLAGS_AND_ATTRIBUTES(0), None)?
         };
-        Ok(Volume { letter, h })
+        Ok(Self { letter, h, path })
+    }
+
+    /// A new handle opened by this path accesses the same volume even after a letter change.
+    pub fn device_path(&self) -> HSTRING {
+        self.path.clone()
     }
 
     pub fn duplicate(&self) -> windows_core::Result<Self> {
@@ -252,7 +273,7 @@ impl Volume {
             let process = GetCurrentProcess();
             DuplicateHandle(process, self.h, process, &mut h, 0, false, DUPLICATE_SAME_ACCESS)?;
         }
-        Ok(Self { letter: self.letter, h })
+        Ok(Self { letter: self.letter, h, path: self.path.clone() })
     }
 
     pub fn journal(&self) -> windows_core::Result<USN_JOURNAL_DATA_V0> {
@@ -275,9 +296,8 @@ impl Volume {
         self.h
     }
 
-    /// Every name in the MFT up to `high` into a new table, and the full references of the files
-    /// left out with the pruned trees (for `add_links`).
-    pub fn load(&self, high: i64) -> windows_core::Result<(Table, Vec<u64>)> {
+    /// Reads the names up to `high`, keeping the sequence numbers for later metadata lookups.
+    pub fn load(&self, high: i64) -> windows_core::Result<Mft> {
         let mut t = Table::new();
         let mut seqs: Vec<u16> = Vec::new();
         let mut med = MFT_ENUM_DATA_V0 { StartFileReferenceNumber: 0, LowUsn: 0, HighUsn: high };
@@ -303,26 +323,10 @@ impl Volume {
             });
         }
         let pruned = t.settle();
-        let clock = Instant::now();
-        if let Err(e) = metadata::initial(self.h, &mut t, &seqs) {
-            log::line(&format!("{}: file layout unavailable ({e}), reading remaining last write times by ID", self.letter));
-        }
-        let mut modified = 0;
-        for (rec, &seq) in seqs.iter().enumerate() {
-            let rec = rec as u32;
-            if !t.has_name(rec) {
-                continue;
-            }
-            if t.needs_modified(rec) && let Some(m) = metadata::last_write_by_id(self.h, full_reference(rec, seq)) {
-                t.set_modified(rec, m);
-            }
-            modified += usize::from(!t.needs_modified(rec));
-        }
-        log::line(&format!("{}: last write times loaded for {modified}/{} names in {} ms", self.letter, t.len(), clock.elapsed().as_millis()));
         t.shrink();
         let files: Vec<u64> = t.take_pruned_files().into_iter().filter_map(|r| seqs.get(r as usize).map(|&seq| full_reference(r, seq))).collect();
         log::line(&format!("{}: {pruned} names inside WinSxS left out ({} files)", self.letter, files.len()));
-        Ok((t, files))
+        Ok(Mft { names: t, sequences: seqs, pruned: files })
     }
 
     fn changes(&self, bytes: &[u8], table: &RwLock<Table>, retries: &mut HashMap<u32, LinkRetry>) -> u64 {

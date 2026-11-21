@@ -6,6 +6,8 @@
 //!   the service `explorust-index` for this exe; `explorust-guard --install` and `--restore` call them.
 //! - `--query <text>`: ask the running service and print the hits and timings.
 
+#[cfg(any(target_os = "windows", test))]
+mod hydration;
 #[cfg(target_os = "windows")]
 mod log;
 #[cfg(target_os = "windows")]
