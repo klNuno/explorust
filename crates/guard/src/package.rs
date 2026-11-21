@@ -78,8 +78,8 @@ pub fn add(from: &Path, dir: &Path) -> Result<String, String> {
 pub fn remove() -> Result<String, String> {
     let script = format!(
         "$ErrorActionPreference='Stop'; $p = Get-AppxPackage {NAME}; \
-         if ($p) {{ $p | Remove-AppxPackage; 'removed' }} else {{ 'absent' }}; \
-         Remove-Item {} -Force -EA SilentlyContinue",
+         $c = {}; if (Test-Path $c) {{ Remove-Item $c -Force }}; \
+         if ($p) {{ $p | Remove-AppxPackage; 'removed' }} else {{ 'absent' }}",
         quote(&format!(r"{CONSENT}\{FAMILY}")),
     );
     let r = powershell(&script);
