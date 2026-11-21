@@ -12,7 +12,7 @@ use windows::Win32::System::Services::{
     SERVICE_CONTROL_DEVICEEVENT, SERVICE_CONTROL_SESSIONCHANGE, SERVICE_FAILURE_ACTIONSW, ControlService, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
     RegisterServiceCtrlHandlerExW, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
     SERVICE_AUTO_START, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_RUNNING,
-    SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
     SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW,
 };
 use windows_core::{HSTRING, PCWSTR, PWSTR};
@@ -57,8 +57,15 @@ unsafe extern "system" fn handler(ctrl: u32, event: u32, _: *mut core::ffi::c_vo
         }
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
             log::line("service: stop");
-            report(SERVICE_STOPPED);
-            std::process::exit(0);
+            report(SERVICE_STOP_PENDING);
+            // The handler answers first: ending the process inside it breaks the SCM's call, and
+            // `sc stop` or Restart-Service then report that the service cannot be stopped.
+            let _ = std::thread::Builder::new().name("index-stop".into()).spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                report(SERVICE_STOPPED);
+                std::process::exit(0);
+            });
+            NO_ERROR.0
         }
         SERVICE_CONTROL_INTERROGATE => NO_ERROR.0,
         _ => ERROR_CALL_NOT_IMPLEMENTED.0,
