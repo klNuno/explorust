@@ -42,6 +42,7 @@ pub fn take() -> Option<String> {
 /// The part watchdog: every `PROBE`, each part's command window must answer a WM_NULL within 2 s;
 /// one that has not answered (or has had no window) for `HUNG_FOR` of wall time, over at least
 /// `MIN_MISSES` probes in a row, is a problem.
+#[cfg(target_os = "windows")]
 pub const PROBE: Duration = Duration::from_secs(5);
 pub const HUNG_FOR: Duration = Duration::from_secs(20);
 const MIN_MISSES: u32 = 4;

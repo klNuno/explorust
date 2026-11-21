@@ -70,6 +70,11 @@ pub fn install() -> u32 {
         Err(e) => say(&format!("install: notification helper package not installed ({e}); toasts are polled")),
     }
     folders::viewer(&dir, true);
+    if let Err(e) = crate::prefetch::run(&dir.join("explorust.exe"), elevated) {
+        say(&format!("install: symbol prefetch incomplete ({e})"));
+    } else {
+        say("install: this user's Windows symbols are cached");
+    }
     // The users list keeps the shared files while any account still starts the guard: without this
     // account in it, an uninstall from another account could remove them under it.
     let owner = if elevated {

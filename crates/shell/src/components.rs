@@ -42,9 +42,18 @@ fn parts_off() -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn spawn_all() {
+pub fn part_enabled(owner: bus::Owner) -> bool {
+    !parts_off().iter().any(|name| name == owner.name())
+}
+
+/// Notification Center initializes the immersive shell's readiness signal, so start it only once
+/// the host publishes its services. The other parts can create their UI immediately.
+pub fn spawn_parts(host_ready: bool) {
     let off = parts_off();
     for (owner, run) in PARTS {
+        if (owner == bus::Owner::Notify) != host_ready {
+            continue;
+        }
         let name = owner.name();
         if off.iter().any(|o| o == name) {
             log::line(&format!("{name}: off (parts-off.txt)"));
@@ -54,6 +63,9 @@ pub fn spawn_all() {
         if let Err(e) = spawned {
             problem::report(format!("the {name} part did not start: {e}"));
         }
+    }
+    if host_ready {
+        return;
     }
     // The injector has no bus owner: it answers no hotkey, only window shows of other apps.
     if off.iter().any(|o| o == "inject") {

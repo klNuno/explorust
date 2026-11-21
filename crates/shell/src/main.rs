@@ -5,6 +5,7 @@
 //! - `--ready-event <name>`: set that named event once the host is up (and the self-test passed).
 //! - `--guard <pid>`: the guard that started it; if it ends, explorust starts one that adopts it.
 //! - `--self-test`: before signalling ready, open Calculator and wait for its frame on screen.
+//! - `--prefetch-symbols`: populate this user's cache for the installed Windows build and exit.
 //! - `--quit`: ask the running explorust of this session to exit cleanly (code 0).
 //! - `--reload`: ask it to exit with code 5; the guard then swaps in `explorust.next.exe` beside it,
 //!   if there is one, and starts explorust again (the guest's deploy loop).
@@ -38,9 +39,16 @@ mod problem;
 mod run;
 #[cfg(target_os = "windows")]
 mod selftest;
+#[cfg(target_os = "windows")]
+mod startup;
+#[cfg(any(target_os = "windows", test))]
+mod startup_rules;
 
 #[cfg(target_os = "windows")]
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--prefetch-symbols") {
+        std::process::exit(if uwp_host::prefetch() { 0 } else { 1 });
+    }
     // Before any COM call of the process (AppContainer hosts call back into twinui here).
     match comsec::init() {
         Ok(()) => log::line("COM security set (explorer's SDDL, AppContainers allowed)"),

@@ -28,6 +28,7 @@ mod manage;
 mod notice;
 mod package;
 mod policy;
+mod prefetch;
 mod proc;
 mod reg;
 mod setup;

@@ -4,12 +4,45 @@ use std::{
     collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, atomic::{AtomicU32, Ordering}},
+    time::Duration,
 };
 
 use object::Object;
 use pdb::{FallibleIterator, SymbolData};
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+const PREFETCH_MODULES: [&str; 4] = [
+    "twinui.pcshell.dll",
+    "ApplicationFrame.dll",
+    "Windows.UI.Immersive.dll",
+    "Windows.ImmersiveShell.ServiceProvider.dll",
+];
+
+/// Fetch the same CodeView-identified PDBs as the host, without loading DLLs or starting a shell.
+pub fn prefetch() -> bool {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    let mut path = [0u16; 32_768];
+    // SAFETY: the buffer is writable for its full length.
+    let len = unsafe { GetSystemDirectoryW(Some(&mut path)) } as usize;
+    if len == 0 || len >= path.len() {
+        hlog!("phase=prefetch result=no-system-directory");
+        return false;
+    }
+    let dir = PathBuf::from(OsString::from_wide(&path[..len]));
+    let mut success = true;
+    for name in PREFETCH_MODULES {
+        match cache_pdb(name, &dir.join(name)) {
+            Ok((path, _)) => hlog!("phase=prefetch module={name} result=ready pdb={}", path.display()),
+            Err(error) => {
+                hlog!("phase=prefetch module={name} result=failed error={error}");
+                success = false;
+            }
+        }
+    }
+    success
+}
 
 struct ModuleSymbols {
     base: usize,
@@ -66,6 +99,22 @@ fn module(module_name: &str) -> Result<Arc<ModuleSymbols>, String> {
         return Err(format!("get path for loaded module {module_name}"));
     }
     let image_path = PathBuf::from(String::from_utf16_lossy(&path[..length]));
+    let (pdb, manifest) = cache_pdb(module_name, &image_path)?;
+    let resolved = read_manifest(&manifest)?;
+    let module = Arc::new(ModuleSymbols {
+        base: handle.0 as usize,
+        manifest,
+        pdb,
+        resolved: Mutex::new(resolved),
+    });
+    modules
+        .lock()
+        .unwrap()
+        .insert(module_name.to_owned(), module.clone());
+    Ok(module)
+}
+
+fn cache_pdb(module_name: &str, image_path: &Path) -> Result<(PathBuf, PathBuf), String> {
     let image =
         fs::read(&image_path).map_err(|error| format!("read {}: {error}", image_path.display()))?;
     let pe = object::File::parse(image.as_slice())
@@ -84,40 +133,25 @@ fn module(module_name: &str) -> Result<Arc<ModuleSymbols>, String> {
     let cache = symbol_cache()?.join(&pdb_name).join(&key);
     let pdb_path = cache.join(&pdb_name);
     let manifest = cache.join("nickel-uwu-symbols.txt");
-    let version = file_version(&image_path).unwrap_or_else(|| "?".into());
-    if !pdb_path.exists() {
-        let started = std::time::Instant::now();
-        hlog!("phase=symbols module={module_name} version={version} pdb={pdb_name}/{key} result=downloading");
-        download_pdb(&pdb_name, &key, &pdb_path).inspect_err(|error| {
-            hlog!("phase=symbols module={module_name} result=download-failed error={error}");
-        })?;
-        hlog!(
-            "phase=symbols module={module_name} result=downloaded in {} ms",
-            started.elapsed().as_millis()
-        );
-    } else {
+    let version = file_version(image_path).unwrap_or_else(|| "?".into());
+    if validate_pdb(&pdb_path, &key, codeview.age()).is_ok() {
         hlog!("phase=symbols module={module_name} version={version} pdb={pdb_name}/{key} result=cached");
+        return Ok((pdb_path, manifest));
     }
-    if let Err(error) = validate_pdb(&pdb_path, &key, codeview.age()) {
-        // explorust: a damaged cache entry heals itself once instead of failing every logon.
-        hlog!("phase=symbols module={module_name} result=damaged error={error}; downloading again");
-        let _ = fs::remove_file(&pdb_path);
+    if pdb_path.exists() {
+        hlog!("phase=symbols module={module_name} result=damaged; downloading again");
         let _ = fs::remove_file(&manifest);
-        download_pdb(&pdb_name, &key, &pdb_path)?;
-        validate_pdb(&pdb_path, &key, codeview.age())?;
     }
-    let resolved = read_manifest(&manifest)?;
-    let module = Arc::new(ModuleSymbols {
-        base: handle.0 as usize,
-        manifest,
-        pdb: pdb_path,
-        resolved: Mutex::new(resolved),
-    });
-    modules
-        .lock()
-        .unwrap()
-        .insert(module_name.to_owned(), module.clone());
-    Ok(module)
+    let started = std::time::Instant::now();
+    hlog!("phase=symbols module={module_name} version={version} pdb={pdb_name}/{key} result=downloading");
+    download_pdb(&pdb_name, &key, codeview.age(), &pdb_path).inspect_err(|error| {
+        hlog!("phase=symbols module={module_name} result=download-failed error={error}");
+    })?;
+    hlog!(
+        "phase=symbols module={module_name} result=downloaded in {} ms",
+        started.elapsed().as_millis()
+    );
+    Ok((pdb_path, manifest))
 }
 
 /// explorust: the file version of a loaded module (`10.0.26100.9278`), for the log.
@@ -174,21 +208,35 @@ fn symbol_key(guid: [u8; 16], age: u32) -> String {
     )
 }
 
-fn download_pdb(name: &str, key: &str, destination: &Path) -> Result<(), String> {
+fn download_pdb(name: &str, key: &str, age: u32, destination: &Path) -> Result<(), String> {
+    static NEXT_TEMP: AtomicU32 = AtomicU32::new(0);
     let parent = destination.parent().ok_or("PDB cache path has no parent")?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("create symbol cache {}: {error}", parent.display()))?;
-    let temporary = parent.join(format!("{name}.download"));
     let url = format!("https://msdl.microsoft.com/download/symbols/{name}/{key}/{name}");
-    let mut response = ureq::get(&url)
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(25)))
+        .build()
+        .into();
+    let mut response = agent.get(&url)
         .call()
         .map_err(|error| format!("download {url}: {error}"))?;
-    let mut output = fs::File::create(&temporary)
+    let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!("{name}.{}.{serial}.download", std::process::id()));
+    let mut output = fs::File::create_new(&temporary)
         .map_err(|error| format!("create {}: {error}", temporary.display()))?;
-    io::copy(&mut response.body_mut().as_reader(), &mut output)
-        .map_err(|error| format!("write {}: {error}", temporary.display()))?;
-    fs::rename(&temporary, destination)
-        .map_err(|error| format!("install downloaded PDB {}: {error}", destination.display()))
+    let written = io::copy(&mut response.body_mut().as_reader(), &mut output);
+    drop(output);
+    let installed = written
+        .map_err(|error| format!("write {}: {error}", temporary.display()))
+        .and_then(|_| validate_pdb(&temporary, key, age))
+        .and_then(|_| {
+            fs::rename(&temporary, destination)
+                .or_else(|error| if validate_pdb(destination, key, age).is_ok() { Ok(()) } else { Err(error) })
+                .map_err(|error| format!("install downloaded PDB {}: {error}", destination.display()))
+        });
+    let _ = fs::remove_file(&temporary);
+    installed
 }
 
 fn validate_pdb(path: &Path, key: &str, image_age: u32) -> Result<(), String> {

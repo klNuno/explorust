@@ -6,15 +6,24 @@
 //! type flags 3)` and returns E_ACCESSDENIED (appframe.cpp 1379) when the window is null. Under
 //! explorust that call is denied. This guard redirects ApplicationFrame.dll's import: the call goes
 //! through unchanged, and only when user32 answers null with ERROR_ACCESS_DENIED it is made again
-//! with type flags 0, each step logged.
+//! with type flags 0. The retry can leave an empty frame onscreen, so keep it cloaked until
+//! its CoreWindow attaches.
 
 use std::{
     ffi::c_void,
     path::PathBuf,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{Mutex, atomic::{AtomicUsize, Ordering}},
 };
 
 use libloading::Library;
+use windows::{
+    Win32::{
+        Foundation::{HANDLE, HWND},
+        Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute},
+        UI::WindowsAndMessaging::{FindWindowExW, GetPropW, RemovePropW, SetPropW},
+    },
+    core::{BOOL, w},
+};
 
 const MODULE: &str = "ApplicationFrame.dll";
 const IAT: &str = "__imp_CreateWindowInBandEx";
@@ -46,6 +55,53 @@ unsafe extern "system" {
 }
 
 static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static UNATTACHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+const CLOAK_PROPERTY: windows::core::PCWSTR = w!("explorust.unattached-appframe");
+
+fn cloak(hwnd: HWND, value: bool) -> windows::core::Result<()> {
+    let enabled = BOOL::from(value);
+    // SAFETY: the attribute uses a Win32 BOOL and the caller supplies a window handle.
+    unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, (&enabled as *const BOOL).cast(), size_of::<BOOL>() as u32) }
+}
+
+fn cloak_until_attached(hwnd: HWND) {
+    // SAFETY: this is the frame we just created. The property prevents an HWND recycled
+    // between ticks from being mistaken for one we cloaked.
+    if unsafe { SetPropW(hwnd, CLOAK_PROPERTY, Some(HANDLE(1usize as *mut c_void))) }.is_err() {
+        return;
+    }
+    if let Err(error) = cloak(hwnd, true) {
+        let _ = unsafe { RemovePropW(hwnd, CLOAK_PROPERTY) };
+        hlog!("phase=appframe-window hwnd={:?} cloak-error={error}", hwnd.0);
+        return;
+    }
+    UNATTACHED.lock().unwrap_or_else(|e| e.into_inner()).push(hwnd.0 as usize);
+    hlog!("phase=appframe-window hwnd={:?} result=cloaked-until-attached", hwnd.0);
+}
+
+fn release_cloaks(only_attached: bool) {
+    let mut windows = UNATTACHED.lock().unwrap_or_else(|e| e.into_inner());
+    windows.retain(|&raw| {
+        let hwnd = HWND(raw as *mut c_void);
+        // SAFETY: the property is on retry frames only and disappears when they are destroyed.
+        if unsafe { GetPropW(hwnd, CLOAK_PROPERTY) }.is_invalid() {
+            return false;
+        }
+        if only_attached && unsafe { FindWindowExW(Some(hwnd), None, w!("Windows.UI.Core.CoreWindow"), None) }.is_err() {
+            return true;
+        }
+        if cloak(hwnd, false).is_err() {
+            return true;
+        }
+        let _ = unsafe { RemovePropW(hwnd, CLOAK_PROPERTY) };
+        hlog!("phase=appframe-window hwnd={:?} result=cloak-released", hwnd.0);
+        false
+    });
+}
+
+pub(crate) fn show_attached_frames() {
+    release_cloaks(true);
+}
 
 unsafe extern "system" fn create_window_in_band_ex(
     ex_style: u32,
@@ -84,6 +140,11 @@ unsafe extern "system" fn create_window_in_band_ex(
     let retry = call(0);
     let retry_error = unsafe { GetLastError() };
     hlog!("phase=appframe-window band={band} flags=0 retry hwnd={retry:?} last_error={retry_error}");
+    if !retry.is_null() {
+        cloak_until_attached(HWND(retry));
+    }
+    // SAFETY: restore the result from the call that produced our return value.
+    unsafe { SetLastError(retry_error) };
     retry
 }
 
@@ -130,6 +191,7 @@ impl Drop for AppFrameBandRedirect {
         if let Err(error) = unsafe { write_slot(self.slot, self.original_slot_value) } {
             hlog!("phase=restore-appframe-import error={error}");
         }
+        release_cloaks(false);
     }
 }
 

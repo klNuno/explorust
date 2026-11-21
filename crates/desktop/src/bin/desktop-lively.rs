@@ -41,7 +41,6 @@ mod win {
         SM_CXSCREEN, SM_CYSCREEN, SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
         SW_SHOWNA, SendMessageTimeoutW, SetLayeredWindowAttributes, SetParent, ShowWindow, SetWindowLongPtrW, SetWindowPos, TranslateMessage,
         WM_PAINT, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
-        WS_VISIBLE,
     };
     use windows_core::{BOOL, w};
 
@@ -148,7 +147,7 @@ mod win {
             let raised_layout = GetWindowLongPtrW(progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP.0 as isize != 0;
             log.push(format!("mode {mode}; Progman {:?}, WS_EX_NOREDIRECTIONBITMAP {raised_layout}", progman.0));
             log.push("tree before:".into());
-            describe(progman, 1, log);
+            describe(progman, 0, log);
             let t = Instant::now();
             let mut res = 0usize;
             let sent = SendMessageTimeoutW(progman, 0x052C, WPARAM(0xD), LPARAM(1), SMTO_NORMAL, 1000, Some(&mut res));
@@ -161,7 +160,7 @@ mod win {
                 log.push(format!("raised: WorkerW child of Progman {:?}", f.workerw.map(|h| h.0)));
             }
             log.push("tree after 0x052C:".into());
-            describe(progman, 1, log);
+            describe(progman, 0, log);
             let (Some(defview), Some(workerw)) = (f.defview, f.workerw) else {
                 log.push("FAIL: no DefView or WorkerW".into());
                 return;
@@ -194,11 +193,12 @@ mod win {
                 log.push("FAIL: window not created".into());
                 return;
             };
+            // SetParent does not update WS_POPUP/WS_CHILD. Make it a child before attaching.
+            SetWindowLongPtrW(h, GWL_STYLE, WS_CHILD.0 as isize);
             let parent = if mode == "workerw" {
                 SetParent(h, Some(workerw)).is_ok().then_some(workerw)
             } else {
                 // Lively: WS_CHILD, WS_EX_LAYERED alpha 255, SetParent(progman), then under the DefView.
-                SetWindowLongPtrW(h, GWL_STYLE, (WS_CHILD | WS_VISIBLE).0 as isize);
                 let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
                 SetWindowLongPtrW(h, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
                 let _ = SetLayeredWindowAttributes(h, COLORREF(0), 255, LWA_ALPHA);
@@ -211,9 +211,6 @@ mod win {
                 let _ = DestroyWindow(h);
                 return;
             };
-            // WS_CHILD | WS_VISIBLE only: SetParent keeps the WS_CLIPSIBLINGS of a top-level window,
-            // and the DefView above would then clip this GDI test's paint (Lively presents with DX).
-            SetWindowLongPtrW(h, GWL_STYLE, (WS_CHILD | WS_VISIBLE).0 as isize);
             // Lively fills the display: screen rectangle mapped into the parent.
             let mut pts = [POINT { x: 0, y: 0 }, POINT { x: sw, y: sh }];
             MapWindowPoints(None, Some(parent), &mut pts);
@@ -235,7 +232,7 @@ mod win {
             let _ = UpdateWindow(h);
             log.push(format!("window {:?} parented to {} {:?}", h.0, class(parent), parent.0));
             log.push("tree with the window:".into());
-            describe(progman, 1, log);
+            describe(progman, 0, log);
             flush(log);
             let end = Instant::now() + Duration::from_secs(secs);
             let mut msg = MSG::default();

@@ -71,12 +71,16 @@ fn log_view_event_window_state(kind: &str, hwnd: usize) {
 }
 
 #[cfg(target_os = "windows")]
-struct HostReadiness(Option<std::sync::mpsc::SyncSender<Result<(), String>>>);
+#[derive(Default)]
+struct HostReadiness {
+    ready: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+    registered: Option<std::sync::mpsc::SyncSender<()>>,
+}
 
 #[cfg(target_os = "windows")]
 impl HostReadiness {
     fn ready(&mut self) {
-        if let Some(sender) = self.0.take() {
+        if let Some(sender) = self.ready.take() {
             hlog!("phase=host-ready result=signalled");
             let _ = sender.send(Ok(()));
         }
@@ -84,7 +88,7 @@ impl HostReadiness {
 
     fn failed(&mut self, phase: &'static str, error: impl std::fmt::Display) {
         hlog!("phase={phase} result=failed error={error}");
-        if let Some(sender) = self.0.take() {
+        if let Some(sender) = self.ready.take() {
             let _ = sender.send(Err(format!("{phase}: {error}")));
         }
     }
@@ -93,14 +97,14 @@ impl HostReadiness {
 #[cfg(target_os = "windows")]
 impl Drop for HostReadiness {
     fn drop(&mut self) {
-        if let Some(sender) = self.0.take() {
+        if let Some(sender) = self.ready.take() {
             let _ = sender.send(Err("UWP shell host exited before ready".into()));
         }
     }
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn configure_dpi_awareness() -> Result<(), String> {
+pub fn configure_dpi_awareness() -> Result<(), String> {
     use windows::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
@@ -122,7 +126,7 @@ pub fn run_host(pump_messages: bool) -> ExitCode {
         true,
         None,
         None,
-        HostReadiness(None),
+        HostReadiness::default(),
     )
 }
 
@@ -137,7 +141,7 @@ pub fn run_host_with_broker(pump_messages: bool) -> ExitCode {
         true,
         None,
         None,
-        HostReadiness(None),
+        HostReadiness::default(),
     )
 }
 
@@ -152,7 +156,7 @@ pub fn run_host_without_auto_present(publish_broker: bool) -> ExitCode {
         false,
         None,
         None,
-        HostReadiness(None),
+        HostReadiness::default(),
     )
 }
 
@@ -167,7 +171,7 @@ pub fn run_host_view_events(app_id: String) -> ExitCode {
         false,
         Some(ViewEventCallbackResult::Success),
         Some(app_id),
-        HostReadiness(None),
+        HostReadiness::default(),
     )
 }
 
@@ -183,7 +187,7 @@ pub fn run_host_view_events_fail_callback() -> ExitCode {
         false,
         Some(ViewEventCallbackResult::NotImplemented),
         Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".to_string()),
-        HostReadiness(None),
+        HostReadiness::default(),
     )
 }
 
@@ -278,7 +282,26 @@ pub fn run_embedded_host(
         true,
         None,
         None,
-        HostReadiness(Some(ready)),
+        HostReadiness { ready: Some(ready), registered: None },
+    )
+}
+
+/// The process configured DPI before starting the STA. Its UI can start as soon as the
+/// host owns the shell window, while the controller and its symbols are still loading.
+#[cfg(target_os = "windows")]
+pub fn run_shell_host(
+    registered: std::sync::mpsc::SyncSender<()>,
+    ready: std::sync::mpsc::SyncSender<Result<(), String>>,
+) -> ExitCode {
+    run_host_with_parent(
+        true,
+        None,
+        false,
+        false,
+        true,
+        None,
+        None,
+        HostReadiness { ready: Some(ready), registered: Some(registered) },
     )
 }
 
@@ -309,7 +332,7 @@ pub fn run_managed_host(parent_pid: u32) -> ExitCode {
         true,
         None,
         None,
-        HostReadiness(None),
+        HostReadiness::default(),
     )
 }
 
@@ -375,6 +398,9 @@ fn run_host_with_parent(
         readiness.failed("host-shell-window", "shell window registration failed");
         return ExitCode::FAILURE;
     };
+    if let Some(sender) = readiness.registered.take() {
+        let _ = sender.send(());
+    }
     // SAFETY: This thread balances successful COM initialization below.
     if let Err(error) = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok() {
         hlog!("phase=host-com error={error}");
@@ -588,6 +614,7 @@ fn run_host_with_parent(
                     break;
                 }
                 shell_hook.tick();
+                crate::appframe_band::show_attached_frames();
                 if auto_present {
                     presenter.tick();
                     if let Some(frameless) = frameless.as_mut() {

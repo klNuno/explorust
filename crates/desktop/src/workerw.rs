@@ -26,13 +26,13 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetClipBox, Invalidate
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, FindWindowExW, GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW, HWND_BOTTOM,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW, HWND_BOTTOM,
     IDC_ARROW, LWA_ALPHA, LWA_COLORKEY, LoadCursorW, RegisterClassExW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SendMessageW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, WINDOWPOS,
     WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_PRINTCLIENT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_WINDOWPOSCHANGING, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, CS_DBLCLKS,
-    WS_CHILD, WS_EX_LAYERED, WS_VISIBLE,
+    WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_VISIBLE,
 };
 use windows_core::{PCWSTR, w};
 
@@ -98,8 +98,9 @@ pub fn create(progman: HWND) -> windows_core::Result<HWND> {
             WS_EX_LAYERED,
             CLASS,
             None,
-            // No WS_CLIPSIBLINGS: the DefView above covers it all and would clip every GDI paint.
-            WS_CHILD | WS_VISIBLE,
+            // Clip an attached wallpaper's pixels from our static GDI paint. Do not clip siblings:
+            // the layered DefView above covers the virtual screen and would clip the entire host.
+            WS_CHILD | WS_CLIPCHILDREN | WS_VISIBLE,
             0,
             0,
             rc.right,
@@ -109,7 +110,10 @@ pub fn create(progman: HWND) -> windows_core::Result<HWND> {
             Some(inst.into()),
             None,
         )?;
-        SetLayeredWindowAttributes(h, COLORREF(0), 255, LWA_ALPHA)?;
+        if let Err(error) = SetLayeredWindowAttributes(h, COLORREF(0), 255, LWA_ALPHA) {
+            let _ = DestroyWindow(h);
+            return Err(error);
+        }
         let _ = SetWindowPos(h, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         Ok(h)
     }
