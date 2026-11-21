@@ -9,11 +9,11 @@ set -eu
 cd /home/boite/projects/explorust
 t=target/x86_64-pc-windows-gnu/release
 pay=target/package/payload
-build() { nice -n 10 env EXPLORUST_UIACCESS=1 cargo build "$@" --release --target x86_64-pc-windows-gnu -p shell -p keys -p guard -p files -p inject -p notify -p viewer -p taskman -p fsindex; }
+build() { nice -n 10 env EXPLORUST_UIACCESS=1 cargo build "$@" --release --target x86_64-pc-windows-gnu -p shell -p keys -p guard -p files -p inject -p notify -p viewer -p taskman -p fsindex -p settings; }
 build || build -j 2 || { echo "package: build failed" >&2; exit 1; }
 rm -rf target/package
 mkdir -p "$pay" dist
-for f in explorust.exe explorust-guard.exe explorust-keys.exe explorust-open.exe explorust_inject.dll explorust-notify.exe explorust-viewer.exe explorust-taskman.exe explorust-index.exe; do
+for f in explorust.exe explorust-guard.exe explorust-keys.exe explorust-open.exe explorust_inject.dll explorust-notify.exe explorust-viewer.exe explorust-taskman.exe explorust-index.exe explorust-settings.exe; do
   cp "$t/$f" "$pay/$f"
 done
 python3 -I crates/notify/package/make-msix.py "$pay/explorust-notify.msix"

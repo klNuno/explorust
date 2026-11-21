@@ -26,7 +26,7 @@ const STORES: [&str; 2] = ["Root", "TrustedPublisher"];
 /// some host builds start beside explorust.exe, the toast listener's helper with its sparse
 /// package (`package.rs`), the UI-access keyboard hook, the file index service and the default
 /// handlers (image viewer, Task Manager for Win+X).
-const FILES: [&str; 11] = [
+const FILES: [&str; 12] = [
     "explorust-guard.exe",
     "explorust.exe",
     "explorust-open.exe",
@@ -38,6 +38,7 @@ const FILES: [&str; 11] = [
     INDEX,
     crate::folders::VIEWER_EXE,
     "explorust-taskman.exe",
+    crate::apps::SETTINGS_EXE,
 ];
 /// The MFT/USN index (`crates/index`), registered as the service `explorust-index`.
 const INDEX: &str = "explorust-index.exe";

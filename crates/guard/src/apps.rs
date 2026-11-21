@@ -1,7 +1,6 @@
 //! How a user who never opens a terminal finds the way back: an entry in Settings > Apps
-//! ("explorust", Uninstall runs `--uninstall`) and two shortcuts in the Start menu's explorust
-//! folder, one that uninstalls and one that switches to Windows Explorer for this session. All
-//! of it is machine-wide (HKLM, ProgramData), so it is written elevated, by `--install`.
+//! The Apps entry and Start shortcuts for Settings, uninstall and session fallback.
+//! These machine-wide registrations are written elevated by `--install`.
 
 use crate::{log, reg, ui::tr};
 use std::path::{Path, PathBuf};
@@ -14,13 +13,10 @@ fn programs() -> PathBuf {
     base.join(r"Microsoft\Windows\Start Menu\Programs\explorust")
 }
 
-fn explorer_icon() -> String {
-    crate::supervise::explorer_path().display().to_string()
-}
+pub const SETTINGS_EXE: &str = "explorust-settings.exe";
 
-/// The shortcuts: file name, guard argument, description. French or English after the display
-/// language at install time.
-fn shortcuts() -> [(&'static str, &'static str, &'static str); 2] {
+/// Localized name, target arguments and description. An empty argument targets Settings.
+fn shortcuts() -> [(&'static str, &'static str, &'static str); 3] {
     [
         (
             tr("Revenir à Windows (désinstaller explorust)", "Back to Windows (uninstall explorust)"),
@@ -38,10 +34,15 @@ fn shortcuts() -> [(&'static str, &'static str, &'static str); 2] {
                 "Replaces explorust with Windows Explorer until the next sign-in.",
             ),
         ),
+        (
+            tr("Paramètres d'explorust", "explorust settings"),
+            "",
+            tr("Personnaliser l'apparence d'explorust.", "Customize the appearance of explorust."),
+        ),
     ]
 }
 
-fn make_link(path: &Path, target: &Path, args: &str, description: &str) -> Result<(), String> {
+fn make_link(path: &Path, target: &Path, args: &str, description: &str, icon: &Path) -> Result<(), String> {
     // SAFETY: COM on this thread for the shell link object, released when it drops.
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -49,7 +50,7 @@ fn make_link(path: &Path, target: &Path, args: &str, description: &str) -> Resul
         link.SetPath(&HSTRING::from(target.as_os_str())).map_err(|e| format!("SetPath: {e}"))?;
         link.SetArguments(&HSTRING::from(args)).map_err(|e| format!("SetArguments: {e}"))?;
         link.SetDescription(&HSTRING::from(description)).map_err(|e| format!("SetDescription: {e}"))?;
-        let _ = link.SetIconLocation(&HSTRING::from(explorer_icon()), 0);
+        let _ = link.SetIconLocation(&HSTRING::from(icon.as_os_str()), 0);
         if let Some(dir) = target.parent() {
             let _ = link.SetWorkingDirectory(&HSTRING::from(dir.as_os_str()));
         }
@@ -69,7 +70,8 @@ pub fn register(guard: &Path) -> Result<String, String> {
     let uninstall = format!("\"{g}\" --uninstall");
     let quiet = format!("\"{g}\" --uninstall --quiet");
     let location = dir.display().to_string();
-    let icon = explorer_icon();
+    let settings = dir.join(SETTINGS_EXE);
+    let icon = format!("\"{}\",0", settings.display());
     let entry = reg::set_uninstall_entry(
         &[
             ("DisplayName", "explorust"),
@@ -95,7 +97,8 @@ pub fn register(guard: &Path) -> Result<String, String> {
         }
     }
     for (name, args, desc) in shortcuts() {
-        match make_link(&folder.join(format!("{name}.lnk")), guard, args, desc) {
+        let target = if args.is_empty() { &settings } else { guard };
+        match make_link(&folder.join(format!("{name}.lnk")), target, args, desc, &settings) {
             Ok(()) => made += 1,
             Err(e) => errors.push(e),
         }

@@ -9,6 +9,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=res/app.rc");
     println!("cargo:rerun-if-changed=res/app.manifest");
+    println!("cargo:rerun-if-changed=../settings/res/explorust.ico");
     println!("cargo:rerun-if-env-changed=EXPLORUST_PAYLOAD");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let mut list = String::from("pub const FILES: &[(&str, &[u8])] = &[\n");
