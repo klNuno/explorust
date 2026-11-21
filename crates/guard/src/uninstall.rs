@@ -108,6 +108,7 @@ pub fn run(yes: bool, quiet: bool) -> u32 {
             return (user, Err("not tried".to_string()), Machine::Code(FAILED));
         }
         let back = manage::bring_back_explorer();
+        manage::remove_package();
         // The files stay until explorer is confirmed back: the guard of this session still runs
         // them, and a retry needs the Apps entry.
         let machine = if back.is_err() {

@@ -115,20 +115,26 @@ fn undo_machine() {
 }
 
 /// This user's half, in this user's own process: Ok once the Shell value is gone (or was never
-/// there); the rest only warns.
+/// there); the rest only warns. The notification package goes later (`remove_package`), once
+/// explorer is back: its removal can take half a minute.
 pub fn restore_user() -> Result<String, String> {
     let shell = reg::delete_shell().map_err(|e| format!("the Shell value stays: {e}"))?;
     folders::handler(false);
     folders::viewer(&install::dir(), false);
-    let pkg = match package::remove() {
-        Ok(r) => r,
-        Err(e) => format!("not removed ({e})"),
-    };
     reg::set_problem_streak(0);
     reg::set_logon_had_problem(false);
-    let r = format!("Shell value {}, notification package {pkg}", if shell { "deleted" } else { "absent" });
+    let r = format!("Shell value {}", if shell { "deleted" } else { "absent" });
     say(&format!("restore: {r}"));
     Ok(r)
+}
+
+/// This user's notification helper package; a failure only warns (it does nothing without the
+/// files).
+pub fn remove_package() {
+    match package::remove() {
+        Ok(r) => say(&format!("restore: notification package {r}")),
+        Err(e) => say(&format!("restore: notification package not removed ({e})")),
+    }
 }
 
 /// Brings explorer's taskbar back now and says so only once it answers. A running guard does it
@@ -214,6 +220,9 @@ pub fn restore() -> u32 {
     let mine = !install::elevated() || account::is_session_user();
     let user = if mine { restore_user().map(|_| ()) } else { Ok(()) };
     let back = bring_back_explorer();
+    if mine {
+        remove_package();
+    }
     let machine = match (&user, &back, install::elevated()) {
         (Ok(()), Ok(_), true) => restore_machine(None).map(|_| ()),
         (Err(_), _, true) => Err("files kept: the Shell value is still there".to_string()),

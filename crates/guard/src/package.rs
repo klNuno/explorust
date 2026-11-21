@@ -25,10 +25,22 @@ const LIMIT: std::time::Duration = std::time::Duration::from_secs(180);
 
 fn powershell(script: &str) -> Result<String, String> {
     let (ok, text, err) = crate::proc::run_bounded(
-        Command::new(crate::install::system32().join(r"WindowsPowerShell\v1.0\powershell.exe")).args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]),
+        Command::new(crate::install::system32().join(r"WindowsPowerShell\v1.0\powershell.exe")).args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &format!("$ProgressPreference='SilentlyContinue'; {script}"),
+        ]),
         LIMIT,
     )?;
-    if ok && err.is_empty() {
+    // Every script sets ErrorActionPreference Stop, so a failure ends with a non-zero code;
+    // stderr alone can be a progress record PowerShell serializes when its output is redirected.
+    if ok {
+        if !err.is_empty() {
+            log::line(&format!("package: stderr: {}", err.chars().take(300).collect::<String>()));
+        }
         Ok(text)
     } else {
         Err(format!("{text} {err}").trim().chars().take(600).collect())
