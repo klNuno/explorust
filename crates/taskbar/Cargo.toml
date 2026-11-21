@@ -10,6 +10,7 @@ path = "src/bin/taskbar-dev.rs"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 bus = { path = "../bus" }
+menu = { path = "../menu" }
 render = { path = "../render" }
 shelldata = { path = "../shelldata" }
 windows-core.workspace = true

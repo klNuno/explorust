@@ -219,6 +219,7 @@ impl Scene {
         let ctx = &s.ctx;
         let row = Row { width: self.width, buttons: slots.len(), left };
         s.begin();
+        render::style::paint_base(ctx, render::style::Part::Taskbar);
         // SAFETY: drawing calls between BeginDraw and EndDraw on this thread's context.
         unsafe {
             let k = self.scale;

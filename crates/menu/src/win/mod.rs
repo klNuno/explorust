@@ -505,6 +505,7 @@ fn on_context(defview: HWND, view: &IShellView, lp: LPARAM, t0: Instant) -> bool
 }
 
 pub use popup::prewarm;
+pub use popup::track_commands;
 
 /// True when a WM_CONTEXTMENU came from the view itself (its list or item area), not from a
 /// child with its own menu such as the details view's column header.

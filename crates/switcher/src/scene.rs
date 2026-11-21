@@ -81,6 +81,7 @@ impl Scene {
         let icons: Vec<Option<ID2D1Bitmap1>> = v.keys.iter().map(|k| self.bitmap(k, v.icons)).collect();
         let ctx = self.surface.ctx.clone();
         self.surface.begin();
+        render::style::paint_base(&ctx, render::style::Part::Switcher);
         // SAFETY: drawing calls between BeginDraw and EndDraw on our device context.
         unsafe {
             ctx.SetTransform(&Matrix3x2::scale(v.scale, v.scale));

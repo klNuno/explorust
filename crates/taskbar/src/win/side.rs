@@ -77,7 +77,7 @@ impl Side {
         let status = watch.read();
         log::line(&format!("status: {status:?}"));
         let mut tray = TrayHost::new();
-        let logo = context::Logo::new();
+        let logo = context::Logo::new(hwnd);
         if let Some(logo) = &logo {
             let _ = tray.tray.apply(&logo.registration(hwnd), false);
             log::line("explorust tray icon registered in the overflow");

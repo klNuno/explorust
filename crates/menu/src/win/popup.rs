@@ -3,18 +3,23 @@
 
 use super::paint::{self, Fonts, View};
 use super::{log, read, tip::Tip, worker};
-use crate::model::{self, Entry, Hit, Kind, Layout, Recent};
+use crate::model::{self, CommandItem, Entry, Hit, Kind, Layout, Recent};
 use render::Surface;
+use render::style::{self, Part, WindowStyle};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::rc::Rc;
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
 };
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint};
+use windows::Win32::Graphics::Gdi::{
+    CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromPoint, SetWindowRgn,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -28,6 +33,7 @@ const TIMER_SUB: usize = 1;
 const TIMER_TIP: usize = 2;
 const TIP_MS: u32 = 500;
 const HOVER_MS: u32 = 300;
+const CORNER_DIP: f32 = 8.0;
 /// Acrylic tint of the dark flyout (ABGR).
 const TINT: u32 = 0xE62C_2C2C;
 
@@ -47,6 +53,14 @@ pub enum Src {
     Local(IContextMenu),
     /// The worker's menu of this generation.
     Worker(u64),
+    /// Static commands owned by an explorust surface.
+    Commands(Rc<Commands>),
+}
+
+pub struct Commands {
+    root: Vec<Entry>,
+    submenus: Vec<Vec<Entry>>,
+    centered: bool,
 }
 
 struct Win {
@@ -143,11 +157,11 @@ fn new_window(root: bool) -> windows_core::Result<Win> {
         let inst = GetModuleHandleW(None)?;
         let ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | if root { WINDOW_EX_STYLE(0) } else { WS_EX_NOACTIVATE };
         let hwnd = CreateWindowExW(ex, CLASS, w!(""), WS_POPUP, 0, 0, 64, 64, None, None, Some(inst.into()), None)?;
-        render::backdrop::apply(hwnd, render::backdrop::Backdrop::Acrylic { tint_abgr: TINT });
-        let round = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &round as *const _ as _, 4);
-        let border = 0x0040_4040u32;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border as *const _ as _, 4);
+        style::bind_with_repaint(hwnd, Part::Menus, WindowStyle::popup(TINT, 0x0040_4040), Some(|hwnd| {
+            with(|ui| {
+                if let Some(depth) = ui.level_of(hwnd) { ui.draw(depth); }
+            });
+        }));
         let dark = 1u32;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
         let surface = Surface::new(hwnd, 64, 64)?;
@@ -223,6 +237,17 @@ fn work_area(x: i32, y: i32) -> (i32, i32, i32, i32) {
     }
 }
 
+fn round_window(hwnd: HWND, width: i32, height: i32, diameter: i32) {
+    // The region also clips the backdrop when DWM disables its own corner treatment.
+    // SAFETY: Windows owns the region after SetWindowRgn succeeds.
+    unsafe {
+        let region = CreateRoundRectRgn(0, 0, width, height, diameter, diameter);
+        if !region.is_invalid() && SetWindowRgn(hwnd, Some(region), true) == 0 {
+            let _ = DeleteObject(region.into());
+        }
+    }
+}
+
 impl Ui {
     fn px(&self, v: f32) -> i32 {
         (v * self.scale).round() as i32
@@ -243,6 +268,10 @@ impl Ui {
         let (x, y) = if sub {
             let (x, y) = model::place_sub((at.left, at.top, at.right, at.bottom), w, h, area, self.px(4.0));
             (x, y - self.px(model::metrics::PAD))
+        } else if let Some(Src::Commands(commands)) = &self.src {
+            let x = at.left - if commands.centered { w / 2 } else { 0 };
+            let y = at.top - h;
+            (x.clamp(area.0, (area.2 - w).max(area.0)), y.clamp(area.1, (area.3 - h).max(area.1)))
         } else {
             model::place(at.left, at.top, w, h, area)
         };
@@ -256,6 +285,7 @@ impl Ui {
         self.levels.push(level);
         self.draw(depth);
         let hwnd = self.pool[depth].hwnd;
+        round_window(hwnd, w, h, self.px(2.0 * CORNER_DIP));
         // SAFETY: shows our own popup; the root takes the foreground for the keyboard.
         unsafe {
             let flags = SWP_SHOWWINDOW | if sub || depth > 0 { SWP_NOACTIVATE } else { SET_WINDOW_POS_FLAGS(0) };
@@ -346,6 +376,7 @@ impl Ui {
                 worker::send(worker::Job::Sub { gn, menu: e.submenu, index: row as u32, depth, row, reply });
                 return;
             }
+            Src::Commands(commands) => commands.submenus[e.submenu as usize].clone(),
         };
         self.show_sub(depth, row, entries, select_first);
     }
@@ -438,6 +469,7 @@ impl Ui {
         };
         let hwnd = win.hwnd;
         self.levels[0] = Level { win: 0, entries: list, top, layout, hover, open: None, bitmaps, origin: (x, y) };
+        round_window(hwnd, w, h, self.px(2.0 * CORNER_DIP));
         // SAFETY: moves and sizes our own popup; the swap chain already has the new size.
         unsafe {
             let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -579,7 +611,9 @@ impl Ui {
                     self.finish(None);
                 }
             }
-            VK_F10 if unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 => self.finish(Some(Pick::More)),
+            VK_F10 if !matches!(self.src, Some(Src::Commands(_))) && unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 => {
+                self.finish(Some(Pick::More));
+            }
             VK_APPS => self.finish(None),
             _ => {}
         }
@@ -816,11 +850,31 @@ fn drain_late() {
     }
 }
 
+/// Opens a menu above a screen position. Returns the chosen command id.
+pub fn track_commands(owner: HWND, at: POINT, items: &[CommandItem], centered: bool) -> Option<u32> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut submenus = Vec::new();
+    let root = model::command_rows(items, &mut submenus);
+    let src = Src::Commands(Rc::new(Commands { root, submenus, centered }));
+    let req = Request {
+        src, owner, at, t0: Instant::now(), key: String::new(), items: false, more: "", fill: None,
+    };
+    match run(req) {
+        Some(Pick::Command(id, _)) => Some(id),
+        _ => None,
+    }
+}
+
 /// Shows the Windows 11 menu and runs its modal loop; returns what was picked. The first frame
 /// shows the previous menu of the same kind (or the static part of another); the handlers' rows
 /// replace it when they arrive.
 pub fn run(req: Request) -> Option<Pick> {
     prewarm();
+    if with(|ui| ui.levels.is_empty()) != Some(true) {
+        return None;
+    }
     drain_late();
     let Request { src, key, items, more, owner, at, t0, mut fill } = req;
     let cached = with(|ui| ui.recent.get(&key)).flatten();
@@ -848,18 +902,22 @@ pub fn run(req: Request) -> Option<Pick> {
         ui.pick = None;
         ui.done = false;
         ui.pressed = false;
-        let (top, list, what) = match (&filled, cached) {
-            (Some(entries), _) => {
+        let (top, list, what) = match (&ui.src, &filled, cached) {
+            (Some(Src::Commands(commands)), _, _) => {
+                ui.ready = true;
+                (Vec::new(), commands.root.clone(), "application commands")
+            }
+            (_, Some(entries), _) => {
                 let (t, l) = model::arrange(entries, items, more);
                 ui.recent.store(&key, &t, &l);
                 ui.ready = true;
                 (t, l, "filled")
             }
-            (None, Some((t, l, same))) => {
+            (_, None, Some((t, l, same))) => {
                 ui.ready = false;
                 (t, l, if same { "previous menu of this kind" } else { "static part of another kind" })
             }
-            (None, None) => {
+            (_, None, None) => {
                 ui.ready = false;
                 (Vec::new(), model::static_part(&model::arrange(&[], items, more).1), "nothing cached")
             }
@@ -922,7 +980,7 @@ pub fn run(req: Request) -> Option<Pick> {
     }
     with(|ui| {
         ui.close_from(0);
-        if matches!(ui.src, Some(Src::Local(_))) {
+        if !matches!(ui.src, Some(Src::Worker(_))) {
             ui.src = None;
         }
         ui.pick.take()

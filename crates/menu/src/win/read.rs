@@ -74,6 +74,7 @@ pub fn entries(cm: &IContextMenu, menu: HMENU, first: u32) -> Vec<Entry> {
                 mnemonic,
                 shortcut,
                 verb,
+                glyph: None,
                 kind: if sub { Kind::Submenu } else { Kind::Command },
                 enabled: mii.fState.0 & (MFS_DISABLED.0 | MFS_GRAYED.0) == 0,
                 checked: mii.fState.0 & MFS_CHECKED.0 != 0,

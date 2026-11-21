@@ -530,6 +530,7 @@ impl Start {
 
     pub fn draw(&mut self) -> Result<()> {
         self.surface.begin();
+        render::style::paint_base(&self.surface.ctx, render::style::Part::Start);
         // SAFETY: inside BeginDraw.
         unsafe { self.surface.ctx.SetTransform(&Matrix3x2::scale(self.scale, self.scale)) };
         self.draw_search();

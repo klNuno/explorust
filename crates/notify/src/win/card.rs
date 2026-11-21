@@ -3,12 +3,13 @@
 
 use crate::model::{self, Toast, geo};
 use render::text::{Align, Text};
+use render::style::{self, Material, Part, WindowStyle};
 use render::{Surface, rgba};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{D2D1_INTERPOLATION_MODE_LINEAR, D2D1_ROUNDED_RECT, ID2D1Bitmap1};
 use windows::Win32::Graphics::DirectWrite::*;
-use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Dwm::DWMWA_COLOR_DEFAULT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -59,11 +60,11 @@ impl Card {
         let (pw, ph) = ((geo::WIDTH * scale).round() as u32, (height_dip * scale).round() as u32);
         let dark = super::system::dark();
         let tint = if dark { 0xE0_2C_2C_2C } else { 0xE0_EE_EE_EE };
-        render::backdrop::apply(hwnd, render::backdrop::Backdrop::Acrylic { tint_abgr: tint });
-        let round = DWMWCP_ROUND;
-        // SAFETY: sets Windows 11's rounded corners on our window (after the backdrop chose square).
+        style::bind_with_repaint(hwnd, Part::Notifications, WindowStyle::popup(tint, DWMWA_COLOR_DEFAULT), Some(|hwnd| {
+            super::with_card(hwnd, |card| card.paint());
+        }));
+        // SAFETY: sizes our popup without activation.
         unsafe {
-            let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &round as *const _ as _, 4);
             let _ = SetWindowPos(hwnd, None, 0, 0, pw as i32, ph as i32, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
         let surface = Surface::new(hwnd, pw, ph)?;
@@ -86,7 +87,9 @@ impl Card {
 
     fn draw(&self) -> Result<()> {
         let ctx = &self.surface.ctx;
-        let (primary, secondary) = if self.dark {
+        let material = style::current(Part::Notifications).material;
+        let dark = self.dark || matches!(material, Material::Oled | Material::Mica);
+        let (primary, secondary) = if dark {
             (rgba(255, 255, 255, 1.0), rgba(255, 255, 255, 0.79))
         } else {
             (rgba(0, 0, 0, 0.9), rgba(0, 0, 0, 0.62))
@@ -98,6 +101,7 @@ impl Card {
         let body = self.format("Segoe UI Variable Text", 14.0)?;
         let glyphs = self.text.format("Segoe Fluent Icons", 10.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?;
         self.surface.begin();
+        style::paint_base(ctx, Part::Notifications);
         // SAFETY: drawing calls between begin and end on our device context.
         unsafe {
             if let Some(icon) = &self.icon {
@@ -106,7 +110,7 @@ impl Card {
                 ctx.DrawBitmap(icon, Some(&r), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
             }
             if self.hover_close {
-                let hb = self.surface.brush(if self.dark { rgba(255, 255, 255, 0.08) } else { rgba(0, 0, 0, 0.06) })?;
+                let hb = self.surface.brush(if dark { rgba(255, 255, 255, 0.08) } else { rgba(0, 0, 0, 0.06) })?;
                 let cx = w - geo::CLOSE_DX;
                 let half = geo::CLOSE_HIT / 2.0;
                 let r = D2D_RECT_F { left: cx - half, top: geo::CLOSE_CY - half, right: cx + half, bottom: geo::CLOSE_CY + half };

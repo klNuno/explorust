@@ -18,6 +18,7 @@ use super::log;
 use crate::geom::{self as G, Row};
 use crate::model::{Action, Group, Model};
 use crate::theme::Theme;
+use render::style::{self, Material, Native, Part, WindowStyle};
 use shelldata::items::{self, PinItem};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -221,6 +222,16 @@ fn current_theme() -> Theme {
     Theme::new(light, ((accent & 0xff) as u8, (accent >> 8 & 0xff) as u8, (accent >> 16 & 0xff) as u8))
 }
 
+fn style_bar(hwnd: HWND, theme: &Theme) {
+    use windows::Win32::Graphics::Dwm::{DWMWA_COLOR_NONE, DWMWCP_DONOTROUND};
+    style::bind(hwnd, Part::Taskbar, WindowStyle {
+        native: Native::Acrylic(theme.tint_abgr),
+        border: DWMWA_COLOR_NONE,
+        corner: DWMWCP_DONOTROUND,
+        popup: true,
+    });
+}
+
 fn create(class: &HSTRING) -> windows_core::Result<()> {
     // SAFETY: window creation and hooks on this thread; handles stay owned by it.
     unsafe {
@@ -255,7 +266,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         bus::listen(cmd);
         BAR_HWND.with(|h| h.set(hwnd.0 as isize));
         let theme = current_theme();
-        render::backdrop::apply(hwnd, render::backdrop::Backdrop::Acrylic { tint_abgr: theme.tint_abgr });
+        style_bar(hwnd, &theme);
         let settings = settings::read();
         let (h_px, scene) = place(hwnd, monitor, &theme)?;
         if settings.autohide {
@@ -471,7 +482,7 @@ fn run_effect(e: Effect) {
         }
         Effect::JumpList(i) => {
             let Some((owner, x, y, nodes, recent)) = with_bar(|b| b.jump_list(i)).flatten() else { return };
-            let id = menu::track(owner, x, y, &nodes, TPM_CENTERALIGN | TPM_BOTTOMALIGN);
+            let id = menu::track(owner, x, y, &nodes, true);
             log::line(&format!("jump list {i}: picked {id}"));
             if let Some(p) = jump::pick(id) {
                 let _ = with_bar(|b| b.jump_pick(i, p, &recent));
@@ -659,7 +670,13 @@ impl Bar {
         let focus = self.tray_focus.and_then(|i| self.tray_hits().get(i).copied());
         let right = RightView { layout: &self.side.layout, icons: &hicons, glyphs: &glyphs, hover: self.side.hover, pressed: self.side.pressed, focus };
         let indeterminate = slots.iter().any(|s| s.progress.is_some_and(|(p, _)| p.state == crate::taskband::ProgressState::Indeterminate));
-        if let Err(e) = scene.draw(&self.theme, &slots, &self.clock, &right, self.settings.align_left) {
+        let material = style::current(Part::Taskbar).material;
+        let dark_theme = (self.theme.light && matches!(material, Material::Oled | Material::Mica)).then(|| {
+            let (r, g, b, _) = self.theme.active_ind;
+            Theme::new(false, (r, g, b))
+        });
+        let theme = dark_theme.as_ref().unwrap_or(&self.theme);
+        if let Err(e) = scene.draw(theme, &slots, &self.clock, &right, self.settings.align_left) {
             log::line(&format!("draw failed: {e}"));
         }
         // SAFETY: timers on our own window.
@@ -1070,7 +1087,18 @@ impl Bar {
             .into_iter()
             .map(|e| match e {
                 jump::Entry::Header(h) => menu::Node::Header(h.to_string()),
-                jump::Entry::Item(id, l) => menu::Node::Item(id, l),
+                jump::Entry::Item(id, l) => {
+                    let glyph = match id {
+                        jump::ID_LAUNCH => '\u{E8A7}',
+                        jump::ID_PIN if input.pinned_to_bar => '\u{E77A}',
+                        jump::ID_PIN => '\u{E718}',
+                        jump::ID_CLOSE => '\u{E711}',
+                        jump::ID_PINNED..jump::ID_RECENT => '\u{E718}',
+                        jump::ID_RECENT..jump::ID_TASK => '\u{E81C}',
+                        _ => '\u{E8A7}',
+                    };
+                    menu::Node::Item(id, l, glyph)
+                }
                 jump::Entry::Separator => menu::Node::Separator,
             })
             .collect::<Vec<_>>();
@@ -1494,7 +1522,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             with_bar(|b| {
                 if name == "ImmersiveColorSet" {
                     b.theme = current_theme();
-                    render::backdrop::apply(b.hwnd, render::backdrop::Backdrop::Acrylic { tint_abgr: b.theme.tint_abgr });
+                    style_bar(b.hwnd, &b.theme);
                     b.effects.push(Effect::Reposition);
                 } else if wp.0 as u32 == SPI_SETWORKAREA.0 {
                     b.effects.push(Effect::WorkArea);

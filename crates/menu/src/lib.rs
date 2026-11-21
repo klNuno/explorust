@@ -12,9 +12,10 @@
 //! Shift+F10 on that view then show this menu instead of the classic one.
 
 pub mod model;
+pub use model::CommandItem;
 
 #[cfg(target_os = "windows")]
 mod win;
 
 #[cfg(target_os = "windows")]
-pub use win::{hook, prewarm, show};
+pub use win::{hook, prewarm, show, track_commands};

@@ -8,6 +8,7 @@ use crate::layout::{self as L, Layout, Rect};
 use crate::scene::{Scene, View};
 use crate::windows_list::{self as wl, Entry};
 use crate::{activate, log, model};
+use render::style::{self, Part, WindowStyle};
 use shelldata::Image;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -15,8 +16,7 @@ use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
-    DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail,
-    DwmSetWindowAttribute, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
+    DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
 };
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, ValidateRect};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
@@ -154,11 +154,9 @@ fn create() -> windows_core::Result<(HWND, HWND)> {
             Some(inst.into()),
             None,
         )?;
-        render::backdrop::apply(panel, render::backdrop::Backdrop::Acrylic { tint_abgr: TINT });
-        let round = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(panel, DWMWA_WINDOW_CORNER_PREFERENCE, &round as *const _ as _, 4);
-        let border = 0x003A_3A3Au32;
-        let _ = DwmSetWindowAttribute(panel, DWMWA_BORDER_COLOR, &border as *const _ as _, 4);
+        style::bind_with_repaint(panel, Part::Switcher, WindowStyle::popup(TINT, 0x003A_3A3A), Some(|_| {
+            with(|s| s.draw());
+        }));
         let cmd = CreateWindowExW(WINDOW_EX_STYLE(0), &cmd_class, w!(""), WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(inst.into()), None)?;
         bus::listen(cmd);
         log::line("switcher: command window on the bus");

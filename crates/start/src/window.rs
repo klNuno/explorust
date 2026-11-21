@@ -8,12 +8,13 @@ use crate::power::{self, Power};
 use crate::recent::{self, Recent};
 use crate::scene::{RecKind, Start, View};
 use crate::{index, log, menu, model, strings};
+use render::style::{self, Part, WindowStyle};
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_CLOAK, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmFlush, DwmSetWindowAttribute,
+    DWMWA_CLOAK, DwmFlush, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint};
 use windows::Win32::Security::Authentication::Identity::{GetUserNameExW, NameDisplay};
@@ -122,13 +123,14 @@ fn create() -> windows_core::Result<()> {
         )?;
         MENU.with(|m| m.set(hwnd.0 as isize));
         cloak(hwnd, true);
-        // The accent acrylic of `render` (the look of session 1); DWM's transient-window backdrop
-        // came out light grey over the black desktop of g1 and is not used.
-        render::backdrop::apply(hwnd, render::backdrop::Backdrop::Acrylic { tint_abgr: TINT });
-        let round = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &round as *const _ as _, 4);
-        let border = 0x003A_3A3Au32;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border as *const _ as _, 4);
+        style::bind_with_repaint(hwnd, Part::Start, WindowStyle::popup(TINT, 0x003A_3A3A), Some(|_| {
+            with(|s| {
+                s.dirty = true;
+                if s.shown {
+                    let _ = s.draw();
+                }
+            });
+        }));
         let scale = GetDpiForWindow(hwnd) as f32 / 96.0;
         let (x, y, w, h) = L::place(0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), scale);
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);

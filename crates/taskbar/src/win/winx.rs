@@ -19,7 +19,7 @@ use windows::Win32::System::Shutdown::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW};
-use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_LEFTALIGN};
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows_core::{HSTRING, PCSTR, PCWSTR, w};
 
 static DRY_POWER: AtomicBool = AtomicBool::new(false);
@@ -36,15 +36,16 @@ pub fn show(owner: HWND, x: i32, y: i32) -> Option<bus::Command> {
     let nodes: Vec<Node> = X::entries()
         .iter()
         .map(|e| match e {
-            Entry::Item(i) => Node::Item(i.id, i.label(fr).to_string()),
+            Entry::Item(i) => node(i, fr),
             Entry::Separator => Node::Separator,
             Entry::Power { en, fr: f } => Node::Sub(
                 (if fr { *f } else { *en }).to_string(),
-                X::POWER.iter().map(|i| Node::Item(i.id, i.label(fr).to_string())).collect(),
+                X::POWER.iter().map(|i| node(i, fr)).collect(),
+                '\u{E7E8}',
             ),
         })
         .collect();
-    let id = menu::track(owner, x, y, &nodes, TPM_LEFTALIGN | TPM_BOTTOMALIGN);
+    let id = menu::track(owner, x, y, &nodes, false);
     let item = X::by_id(id)?;
     log::line(&format!("win+x picked {id} {:?}", item.act));
     match item.act {
@@ -56,6 +57,30 @@ pub fn show(owner: HWND, x: i32, y: i32) -> Option<bus::Command> {
             None
         }
     }
+}
+
+fn node(item: &X::Item, french: bool) -> Node {
+    let glyph = match item.act {
+        Act::Open("ms-settings:appsfeatures") => '\u{ECAA}',
+        Act::Open("ms-settings:powersleep") | Act::ShutDown => '\u{E7E8}',
+        Act::Open("eventvwr.msc") => '\u{E9D9}',
+        Act::Open("ms-settings:about") => '\u{E770}',
+        Act::Open("devmgmt.msc") => '\u{E772}',
+        Act::Open("ms-settings:network") => '\u{E968}',
+        Act::Open("diskmgmt.msc") => '\u{EDA2}',
+        Act::Open("compmgmt.msc") => '\u{E770}',
+        Act::Open(_) => '\u{E713}',
+        Act::Terminal { .. } => '\u{E756}',
+        Act::Run => '\u{E768}',
+        Act::TaskManager => '\u{E9D9}',
+        Act::Search => '\u{E721}',
+        Act::Files => '\u{E8B7}',
+        Act::Desktop => '\u{E7F4}',
+        Act::SignOut => '\u{E8AC}',
+        Act::Sleep => '\u{E708}',
+        Act::Restart => '\u{E72C}',
+    };
+    Node::Item(item.id, item.label(french).into(), glyph)
 }
 
 fn run(act: Act) {

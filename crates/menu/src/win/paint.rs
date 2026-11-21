@@ -96,13 +96,17 @@ pub fn draw(s: &Surface, f: &Fonts, v: &View, scale: f32) -> Result<()> {
     let shortcut = s.brush(rgba(255, 255, 255, 0.6))?;
     let hover = s.brush(rgba(255, 255, 255, if v.pressed { 0.04 } else { 0.065 }))?;
     let line = s.brush(rgba(255, 255, 255, 0.084))?;
-    let fill = s.brush(rgba(44, 44, 44, 0.2))?;
     s.begin();
+    use render::style::{self, Material, Part};
+    style::paint_base(ctx, Part::Menus);
     // SAFETY: drawing calls between begin and end on this thread's device context.
     unsafe {
         ctx.SetTransform(&Matrix3x2 { M11: scale, M12: 0.0, M21: 0.0, M22: scale, M31: 0.0, M32: 0.0 });
         let l = v.layout;
-        ctx.FillRectangle(&rect(0.0, 0.0, l.width, l.height), &fill);
+        if style::current(Part::Menus).material == Material::Windows {
+            let fill = s.brush(rgba(44, 44, 44, 0.2))?;
+            ctx.FillRectangle(&rect(0.0, 0.0, l.width, l.height), &fill);
+        }
         for (i, ((verb, _), &(x, y, w, h))) in v.top.iter().zip(&l.top).enumerate() {
             if v.hover == Some(Hit::Top(i)) {
                 ctx.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x, y, w, h), radiusX: RADIUS, radiusY: RADIUS }, &hover);
@@ -151,5 +155,5 @@ fn icon_glyph(e: &Entry) -> Option<char> {
     if e.kind == Kind::More {
         return Some('\u{E8A7}');
     }
-    crate::model::glyph(&e.verb)
+    e.glyph.or_else(|| crate::model::glyph(&e.verb))
 }

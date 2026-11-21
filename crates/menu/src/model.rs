@@ -15,6 +15,8 @@ pub struct Entry {
     pub shortcut: String,
     /// The canonical verb from `GetCommandString(GCS_VERBW)`, empty when the handler gives none.
     pub verb: String,
+    /// A Fluent glyph supplied by an explorust command menu.
+    pub glyph: Option<char>,
     pub kind: Kind,
     pub enabled: bool,
     pub checked: bool,
@@ -36,6 +38,42 @@ pub enum Kind {
     Submenu,
     /// `Show more options`: the classic menu.
     More,
+}
+
+/// A row in an explorust command menu.
+pub enum CommandItem {
+    Item(u32, String, char),
+    Header(String),
+    Separator,
+    Sub(String, Vec<CommandItem>, char),
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn command_rows(items: &[CommandItem], submenus: &mut Vec<Vec<Entry>>) -> Vec<Entry> {
+    items.iter().map(|item| {
+        let (raw, mut entry) = match item {
+            CommandItem::Item(id, text, glyph) => (
+                text,
+                Entry { id: *id, enabled: true, glyph: Some(*glyph), ..Default::default() },
+            ),
+            CommandItem::Header(text) => (text, Entry::default()),
+            CommandItem::Separator => return Entry { kind: Kind::Separator, ..Default::default() },
+            CommandItem::Sub(text, items, glyph) => {
+                let rows = command_rows(items, submenus);
+                let submenu = submenus.len() as isize;
+                submenus.push(rows);
+                (text, Entry {
+                    kind: Kind::Submenu,
+                    enabled: !items.is_empty(),
+                    glyph: Some(*glyph),
+                    submenu,
+                    ..Default::default()
+                })
+            }
+        };
+        (entry.label, entry.mnemonic, entry.shortcut) = parse_label(raw);
+        entry
+    }).collect()
 }
 
 /// Splits a menu text into its label, its mnemonic and the shortcut after a tab.
