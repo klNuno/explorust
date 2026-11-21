@@ -3,10 +3,10 @@ use windows::Win32::{
     Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS},
     System::{
         Registry::{
-            HKEY, HKEY_CURRENT_USER, KEY_CREATE_SUB_KEY, KEY_SET_VALUE, KEY_WOW64_32KEY,
+            HKEY, HKEY_CURRENT_USER, KEY_CREATE_SUB_KEY, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_32KEY,
             KEY_WOW64_64KEY, REG_CREATED_NEW_KEY, REG_EXPAND_SZ, REG_OPTION_VOLATILE,
             REG_SAM_FLAGS, REG_SZ, RRF_RT_REG_BINARY, RegCloseKey, RegCreateKeyExW,
-            RegDeleteValueW, RegEnumValueW, RegGetValueW, RegOpenKeyExW, RegQueryInfoKeyW,
+            REG_VALUE_TYPE, RegDeleteValueW, RegEnumValueW, RegGetValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW,
         },
         RemoteDesktop::ProcessIdToSessionId,
     },
@@ -150,13 +150,25 @@ impl Key {
     pub fn writer(root: HKEY, path: &HSTRING, view: View) -> windows::core::Result<Self> {
         let mut raw = HKEY::default();
         // SAFETY: the output and HSTRING are valid for the call.
-        unsafe { RegOpenKeyExW(root, path, None, KEY_SET_VALUE | view, &mut raw) }.ok()?;
+        unsafe { RegOpenKeyExW(root, path, None, KEY_QUERY_VALUE | KEY_SET_VALUE | view, &mut raw) }.ok()?;
         Ok(Self(raw))
     }
 
     pub fn delete(&self, name: &HSTRING) -> windows::core::Result<()> {
         // SAFETY: the open key handle and value name outlive the operation.
         unsafe { RegDeleteValueW(self.0, name) }.ok()
+    }
+
+    pub fn matches(&self, value: &Value) -> bool {
+        let mut data = vec![0u16; value.data.len()];
+        let mut bytes = size_of_val(data.as_slice()) as u32;
+        let mut kind = REG_VALUE_TYPE::default();
+        // SAFETY: RegQueryValueExW reads the exact bytes without expanding or adding a NUL.
+        let result = unsafe {
+            RegQueryValueExW(self.0, &value.name, None, Some(&mut kind), Some(data.as_mut_ptr().cast()), Some(&mut bytes))
+        };
+        result == ERROR_SUCCESS && bytes as usize == size_of_val(data.as_slice())
+            && startup_rules::same_value((value.kind, &value.data), (kind.0, &data))
     }
 }
 

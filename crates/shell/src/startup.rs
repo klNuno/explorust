@@ -1,16 +1,19 @@
-//! Launches the user's logon apps after the desktop and tray have come up.
+//! The independently running logon-app batch. The guard starts it when the native desktop answers.
 
 mod registry;
+#[cfg(test)]
+mod tests;
 
-use crate::{components, log, startup_rules};
+use crate::{events, launch_timing, log, startup_rules};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, SyncSender};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use windows::Win32::{
     Foundation::{HANDLE, WAIT_OBJECT_0},
-    Graphics::Dwm::DwmFlush,
     System::{
         Com::CoTaskMemFree,
         Environment::ExpandEnvironmentStringsW,
@@ -20,119 +23,115 @@ use windows::Win32::{
     },
     UI::{
         Shell::{
-            FOLDERID_CommonStartup, FOLDERID_Profile, FOLDERID_Startup, KNOWN_FOLDER_FLAG,
+            FOLDERID_CommonStartup, FOLDERID_Profile, FOLDERID_Startup, KF_FLAG_DONT_VERIFY,
             SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
             SHGetKnownFolderPath, ShellExecuteExW,
         },
-        WindowsAndMessaging::{
-            FindWindowW, GetSystemMetrics, GetWindowThreadProcessId, IsWindowVisible, SM_CLEANBOOT,
-            SMTO_ABORTIFHUNG, SMTO_BLOCK, SW_SHOWNOACTIVATE, SendMessageTimeoutW, WM_NULL,
-        },
+        WindowsAndMessaging::{GetSystemMetrics, SM_CLEANBOOT, SW_SHOWNOACTIVATE},
     },
 };
-use windows::core::{GUID, HSTRING, PCWSTR, w};
+use windows::core::{GUID, HSTRING, PCWSTR};
 
-pub fn after_taskbar(started: Instant, limit: Duration, logon: bool) {
-    let _ = std::thread::Builder::new()
-        .name("startup-apps".into())
-        .spawn(move || {
-            if !components::part_enabled(bus::Owner::Taskbar) {
-                if logon {
-                    after_desktop(started, limit);
-                }
-                return;
-            }
-            while started.elapsed() < limit {
-                if crate::problem::pending() {
-                    return;
-                }
-                if window_ready(w!("Shell_TrayWnd")) {
-                    // SAFETY: wait for the compositor after the taskbar starts processing messages.
-                    let composed = unsafe { DwmFlush() }.is_ok();
-                    log::line(&format!(
-                        "taskbar answering in {} ms (DwmFlush: {composed})",
-                        started.elapsed().as_millis()
-                    ));
-                    if logon {
-                        after_desktop(started, limit);
-                    }
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-        });
+pub fn spawn_legacy_runner() {
+    let result = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg("--startup-apps").spawn());
+    if let Err(e) = result {
+        log::line(&format!("startup: could not launch the session runner: {e}"));
+    }
 }
 
-fn after_desktop(started: Instant, limit: Duration) {
-    let desktop = components::part_enabled(bus::Owner::Desktop);
-    while desktop && !window_ready(w!("Progman")) {
-        if started.elapsed() >= limit {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    if crate::problem::pending() {
-        return;
-    }
-    // SAFETY: initializes and uninitializes OLE on this thread, as ShellExecuteEx recommends.
-    unsafe {
-        if let Err(e) = OleInitialize(None) {
-            log::line(&format!("startup: OLE: {e}"));
-            return;
-        }
+pub fn run() -> i32 {
+    if events::Owned::is_signalled(launch_timing::FALLBACK_EVENT) {
+        log::line("startup: handoff requested before claim; Explorer owns startup");
+        return 0;
     }
     match registry::claim() {
-        Ok(true) => launch_all(),
+        Ok(true) => {
+            log::line("startup: session runner claimed Explorer's startup marker");
+            launch_all();
+        }
         Ok(false) => log::line("startup: apps already handled for this logon"),
-        Err(e) => log::line(&format!("startup: could not claim this logon: {e}")),
+        Err(e) => {
+            log::line(&format!("startup: could not claim this logon: {e}"));
+            return 1;
+        }
     }
-    unsafe { OleUninitialize() };
+    0
 }
 
-fn window_ready(class: PCWSTR) -> bool {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    // SAFETY: query an HWND and send a bounded, data-free message.
-    unsafe {
-        let Ok(hwnd) = FindWindowW(class, None) else {
-            return false;
-        };
-        let mut owner = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut owner));
-        owner == std::process::id()
-            && IsWindowVisible(hwnd).as_bool()
-            && SendMessageTimeoutW(
-                hwnd,
-                WM_NULL,
-                WPARAM(0),
-                LPARAM(0),
-                SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                50,
-                None,
-            )
-            .0 != 0
+const LAUNCH_GRACE: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct Batch(Vec<JoinHandle<()>>);
+
+impl Batch {
+    // Give ordinary entries their usual launch order. A provider stuck in ShellExecute or a
+    // redirected Startup folder gets its own STA, so it cannot hold up the next entry or folder.
+    fn step(&mut self, label: &str, work: impl FnOnce(SyncSender<()>) + Send + 'static) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        match thread::Builder::new().name("startup-entry".into()).spawn(move || work(tx)) {
+            Ok(worker) => {
+                if rx.recv_timeout(LAUNCH_GRACE) == Err(mpsc::RecvTimeoutError::Timeout) {
+                    log::line(&format!("startup: {label} still pending after {} s; continuing", LAUNCH_GRACE.as_secs()));
+                }
+                self.0.push(worker);
+            }
+            Err(e) => log::line(&format!("startup: {label} worker: {e}")),
+        }
+    }
+
+    fn finish(self) {
+        for worker in self.0 {
+            let _ = worker.join();
+        }
     }
 }
 
 fn launch_all() {
     // SAFETY: system metric for the current boot mode.
     let safe_mode = unsafe { GetSystemMetrics(SM_CLEANBOOT) } != 0;
+    let mut batch = Batch::default();
     let profile = known_folder(&FOLDERID_Profile);
+    if machine_run_once_allowed() {
+        launch_registry(&mut batch, HKEY_LOCAL_MACHINE, "RunOnce", registry::NATIVE, true, safe_mode, profile.as_deref());
+    }
     for (root, subkey, view, once) in [
-        (HKEY_LOCAL_MACHINE, "RunOnce", registry::NATIVE, true),
         (HKEY_LOCAL_MACHINE, "Run", registry::NATIVE, false),
         (HKEY_LOCAL_MACHINE, "Run", registry::WOW32, false),
         (HKEY_CURRENT_USER, "Run", registry::NATIVE, false),
         (HKEY_CURRENT_USER, "RunOnce", registry::NATIVE, true),
     ] {
-        launch_registry(root, subkey, view, once, safe_mode, profile.as_deref());
+        launch_registry(&mut batch, root, subkey, view, once, safe_mode, profile.as_deref());
     }
     if !safe_mode {
-        launch_folder(&FOLDERID_CommonStartup, HKEY_LOCAL_MACHINE);
-        launch_folder(&FOLDERID_Startup, HKEY_CURRENT_USER);
+        for (id, common, label) in [(FOLDERID_CommonStartup, true, "Common Startup"), (FOLDERID_Startup, false, "user Startup")] {
+            batch.step(label, move |done| {
+                let mut folder = Batch::default();
+                let root = if common { HKEY_LOCAL_MACHINE } else { HKEY_CURRENT_USER };
+                launch_folder(&mut folder, &id, root);
+                let _ = done.send(());
+                folder.finish();
+            });
+        }
     }
+    batch.finish();
+}
+
+fn machine_run_once_allowed() -> bool {
+    use windows::Win32::Security::{CheckTokenMembership, CreateWellKnownSid, PSID, SECURITY_MAX_SID_SIZE, WinBuiltinAdministratorsSid};
+    use windows::core::BOOL;
+    let mut size = SECURITY_MAX_SID_SIZE;
+    let mut sid = [0u32; (SECURITY_MAX_SID_SIZE as usize).div_ceil(size_of::<u32>())];
+    let sid = PSID(sid.as_mut_ptr().cast());
+    let mut member = BOOL(0);
+    // SAFETY: the aligned buffer is large enough for any SID. A null token checks this thread.
+    unsafe {
+        CreateWellKnownSid(WinBuiltinAdministratorsSid, None, Some(sid), &mut size)
+            .and_then(|()| CheckTokenMembership(None, sid, &mut member))
+    }.is_ok() && member.as_bool()
 }
 
 fn launch_registry(
+    batch: &mut Batch,
     root: HKEY,
     subkey: &str,
     view: registry::View,
@@ -170,68 +169,86 @@ fn launch_registry(
                 continue;
             }
         };
-        if !deferred
-            && let Some(key) = &writer
-            && !consume(key, &value.name)
-        {
-            continue;
-        }
-        match launch_command(&command, profile, once && deferred) {
-            Ok(process) => {
-                log::line(&format!("startup: launched {subkey} {}", value.name));
-                if deferred && let Some(key) = writer {
-                    consume_after_run(key, value.name, process);
-                }
+        let label = format!("{subkey} {}", value.name);
+        let description = label.clone();
+        let profile = profile.map(Path::to_path_buf);
+        batch.step(&label, move |done| {
+            let Some(ole) = OleSession::new() else { return };
+            if !deferred && let Some(key) = &writer && !consume(key, &value) {
+                return;
             }
-            Err(e) => log::line(&format!("startup: {subkey} {}: {e}", value.name)),
+            let launched = launch_command(&command, profile.as_deref(), once && deferred);
+            drop(ole);
+            let _ = done.send(());
+            match launched {
+                Ok(process) => {
+                    log::line(&format!("startup: launched {description}"));
+                    if deferred && let Some(key) = writer {
+                        consume_after_run(key, value, process);
+                    }
+                }
+                Err(e) => log::line(&format!("startup: {description}: {e}")),
+            }
+        });
+    }
+}
+
+struct OleSession;
+
+impl OleSession {
+    fn new() -> Option<Self> {
+        // SAFETY: this is a fresh worker thread. Drop balances initialization on it.
+        match unsafe { OleInitialize(None) } {
+            Ok(()) => Some(Self),
+            Err(e) => {
+                log::line(&format!("startup: OLE: {e}"));
+                None
+            }
         }
     }
 }
 
-fn consume(key: &registry::Key, name: &HSTRING) -> bool {
-    match key.delete(name) {
+impl Drop for OleSession {
+    fn drop(&mut self) {
+        unsafe { OleUninitialize() };
+    }
+}
+
+fn consume(key: &registry::Key, value: &registry::Value) -> bool {
+    if !key.matches(value) {
+        log::line(&format!("startup: RunOnce {} changed or was removed; leaving it intact", value.name));
+        return false;
+    }
+    match key.delete(&value.name) {
         Ok(()) => true,
         Err(e) => {
-            log::line(&format!("startup: could not consume {name}: {e}"));
+            log::line(&format!("startup: could not consume {}: {e}", value.name));
             false
         }
     }
 }
 
-fn consume_after_run(key: registry::Key, name: HSTRING, process: Option<OwnedHandle>) {
-    let Some(process) = process else {
-        // ShellExecuteEx can hand a command to an already-running app without returning a process.
-        consume(&key, &name);
-        return;
-    };
-    let started = std::thread::Builder::new()
-        .name("startup-run-once".into())
-        .spawn(move || {
-            // SAFETY: this thread owns the returned process handle for the whole wait.
-            if unsafe { WaitForSingleObject(HANDLE(process.as_raw_handle()), INFINITE) }
-                == WAIT_OBJECT_0
-            {
-                consume(&key, &name);
-            }
-        });
-    if let Err(e) = started {
-        log::line(&format!(
-            "startup: could not wait for deferred RunOnce: {e}"
-        ));
+fn consume_after_run(key: registry::Key, value: registry::Value, process: Option<OwnedHandle>) {
+    // ShellExecuteEx can hand the command to an existing app without returning a process.
+    if process.is_none_or(|process| {
+        // SAFETY: this thread owns the returned process handle for the entire wait.
+        (unsafe { WaitForSingleObject(HANDLE(process.as_raw_handle()), INFINITE) }) == WAIT_OBJECT_0
+    }) {
+        consume(&key, &value);
     }
 }
 
 fn known_folder(id: &GUID) -> Option<PathBuf> {
     // SAFETY: the returned NUL-terminated string is copied before freeing it.
     unsafe {
-        let name = SHGetKnownFolderPath(id, KNOWN_FOLDER_FLAG(0), None).ok()?;
+        let name = SHGetKnownFolderPath(id, KF_FLAG_DONT_VERIFY, None).ok()?;
         let path = PathBuf::from(OsString::from_wide(name.as_wide()));
         CoTaskMemFree(Some(name.0.cast()));
         Some(path)
     }
 }
 
-fn launch_folder(id: &GUID, root: HKEY) {
+fn launch_folder(batch: &mut Batch, id: &GUID, root: HKEY) {
     let Some(dir) = known_folder(id) else { return };
     let Ok(entries) = dir.read_dir() else { return };
     for entry in entries.flatten() {
@@ -249,18 +266,17 @@ fn launch_folder(id: &GUID, root: HKEY) {
         {
             continue;
         }
-        let file = HSTRING::from(path.as_os_str());
-        // ShellExecute uses the working directory stored in .lnk files.
-        match execute(&file, &HSTRING::new(), None, false) {
-            Ok(_) => log::line(&format!(
-                "startup: launched shortcut {}",
-                entry.file_name().to_string_lossy()
-            )),
-            Err(e) => log::line(&format!(
-                "startup: shortcut {}: {e}",
-                entry.file_name().to_string_lossy()
-            )),
-        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let label = name.clone();
+        batch.step(&label, move |_| {
+            let Some(_ole) = OleSession::new() else { return };
+            let file = HSTRING::from(path.as_os_str());
+            // ShellExecute uses the working directory stored in .lnk files.
+            match execute(&file, &HSTRING::new(), None, false) {
+                Ok(_) => log::line(&format!("startup: launched shortcut {name}")),
+                Err(e) => log::line(&format!("startup: shortcut {name}: {e}")),
+            }
+        });
     }
 }
 

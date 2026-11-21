@@ -25,7 +25,7 @@ fn say(msg: &str) {
 /// `--install`: elevated, the machine part then this user's; not elevated (a dev run), only the
 /// Shell value pointing to this exe.
 pub fn install() -> u32 {
-    let _lock = match install::lock() {
+    let lock = match install::lock() {
         Ok(l) => l,
         Err(e) => {
             say(&format!("install: {e}"));
@@ -70,11 +70,6 @@ pub fn install() -> u32 {
         Err(e) => say(&format!("install: notification helper package not installed ({e}); toasts are polled")),
     }
     folders::viewer(&dir, true);
-    if let Err(e) = crate::prefetch::run(&dir.join("explorust.exe"), elevated) {
-        say(&format!("install: symbol prefetch incomplete ({e})"));
-    } else {
-        say("install: this user's Windows symbols are cached");
-    }
     // The users list keeps the shared files while any account still starts the guard: without this
     // account in it, an uninstall from another account could remove them under it.
     let owner = if elevated {
@@ -99,6 +94,10 @@ pub fn install() -> u32 {
     reg::set_problem_streak(0);
     reg::set_logon_had_problem(false);
     say(&format!("installed: next logon starts {}", guard.display()));
+    drop(lock);
+    if let Err(e) = crate::prefetch::start(&dir.join("explorust.exe"), elevated) {
+        log::line(&format!("install: could not start optional symbol prefetch ({e})"));
+    }
     0
 }
 

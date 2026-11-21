@@ -3,14 +3,15 @@
 //! back on the hotkey, on Shift held at logon or when explorust.exe is missing, without a word.
 
 use crate::notice::{self, Notice};
-use crate::policy::{AtLogon, MAX_STREAK, PROBE, Watchdog, at_logon, ready_timeout};
+use crate::launch_timing;
+use crate::policy::{AtLogon, MAX_STREAK, PROBE, Watchdog, at_logon};
 use crate::proc::{Child, Event, wait_any};
 use crate::taskbar::{self, Start};
 use crate::{folders, hotkey, log, reg};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub const FALLBACK_EVENT: &str = r"Local\explorust-guard-fallback";
+pub use launch_timing::FALLBACK_EVENT;
 
 enum End {
     /// Something went wrong: explorer takes over and the user is told.
@@ -28,7 +29,7 @@ const RELOAD: u32 = 5;
 const PROBLEM: u32 = 6;
 
 /// `adopt`: the pid of a running explorust whose guard died; it is watched instead of starting one.
-pub fn run(adopt: Option<u32>) -> u32 {
+pub fn run(adopt: Option<(u32, Option<String>)>) -> u32 {
     let fallback = match Event::named(FALLBACK_EVENT) {
         Ok(e) => e,
         Err(e) => {
@@ -41,10 +42,11 @@ pub fn run(adopt: Option<u32>) -> u32 {
     let build = reg::windows_build();
     let mut attempt = 0u32;
     let mut adopted = None;
-    if let Some(pid) = adopt {
+    let mut startup_launched = false;
+    if let Some((pid, name)) = adopt {
         log::line(&format!("guard adopts explorust pid {pid}: its guard ended"));
         match Child::open(pid) {
-            Ok(child) => adopted = Some(child),
+            Ok(child) => adopted = Some((child, name)),
             Err(e) => log::line(&format!("adopt: {e}; starting a new explorust")),
         }
     } else {
@@ -68,21 +70,30 @@ pub fn run(adopt: Option<u32>) -> u32 {
         }
     }
     loop {
+        let self_test = reg::last_good_build().as_deref() != Some(build.as_str());
         let end = match adopted.take() {
-            Some(child) => watch(&child, &fallback),
+            Some((child, Some(name))) => match PhaseEvents::open(&name) {
+                Ok(phases) => supervise(&child, &fallback, &phases, self_test, &build, &exe, &mut startup_launched),
+                Err(e) => {
+                    child.kill();
+                    End::Problem(e)
+                }
+            },
+            Some((child, None)) => watch(&child, &fallback, TaskbarWatch::new()),
             None => {
                 attempt += 1;
-                let self_test = reg::last_good_build().as_deref() != Some(build.as_str());
-                run_once(&exe, attempt, self_test, &build, &fallback)
+                run_once(&exe, attempt, self_test, &build, &fallback, &mut startup_launched)
             }
         };
         match end {
             End::Reload => swap_next(&exe),
             End::Fallback(why) => {
+                let _ = fallback.signal();
                 log::line(&format!("fallback: {why}"));
                 return explorer_forever(None);
             }
             End::Problem(why) => {
+                let _ = fallback.signal();
                 let streak = reg::problem_streak() + 1;
                 reg::set_problem_streak(streak);
                 reg::set_logon_had_problem(true);
@@ -116,82 +127,147 @@ fn turn_off(why: &str) -> Notice {
     }
 }
 
-fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &Event) -> End {
+struct PhaseEvents {
+    native: Event,
+    immersive: Event,
+    verified: Event,
+}
+
+impl PhaseEvents {
+    fn open(name: &str) -> Result<Self, String> {
+        Ok(Self {
+            native: Event::named(&launch_timing::native_event(name))?,
+            immersive: Event::named(&launch_timing::immersive_event(name))?,
+            verified: Event::named(name)?,
+        })
+    }
+}
+
+fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &Event, startup_launched: &mut bool) -> End {
     let name = format!(r"Local\explorust-ready-{}-{attempt}", std::process::id());
-    let ready = match Event::named(&name) {
-        Ok(e) => e,
+    let phases = match PhaseEvents::open(&name) {
+        Ok(phases) => phases,
         Err(e) => return End::Fallback(e),
     };
-    let mut args = format!("--ready-event {name} --guard {}", std::process::id());
+    let mut args = format!("--ready-event {name} --staged-ready --guard {}", std::process::id());
     if self_test {
         args.push_str(" --self-test");
     }
+    let _ = std::fs::remove_file(problem_file());
     let child = match Child::spawn(exe, &args) {
         Ok(c) => c,
         Err(e) => return End::Problem(format!("explorust did not start: {e}")),
     };
-    let _ = std::fs::remove_file(problem_file());
     log::line(&format!("started explorust pid {} ({args})", child.pid));
-    let timeout = ready_timeout(self_test);
-    match wait_any(&[child.handle, ready.0, fallback.0], Some(timeout.as_millis() as u32)) {
-        Some(0) => {
-            let code = child.exit_code();
-            return End::Problem(match problem_reason(code) {
-                Some(r) => format!("explorust stopped while starting: {r}"),
-                None => format!("explorust stopped while starting (code {code:#x})"),
-            });
-        }
-        Some(1) => {
-            log::line(&format!("explorust ready (self-test: {self_test})"));
-            folders::handler(true);
-            if self_test && let Err(e) = reg::set_last_good_build(build) {
-                log::line(&format!("could not record the good build: {e}"));
+    supervise(&child, fallback, &phases, self_test, build, exe, startup_launched)
+}
+
+fn supervise(child: &Child, fallback: &Event, phases: &PhaseEvents, self_test: bool, build: &str, exe: &Path, startup_launched: &mut bool) -> End {
+    if let Err(end) = wait_phase(child, fallback, &phases.native, "native desktop", launch_timing::NATIVE_BUDGET, None) {
+        return end;
+    }
+    log::line("explorust native desktop ready");
+    if !*startup_launched {
+        match Child::spawn(exe, "--startup-apps") {
+            Ok(runner) => {
+                *startup_launched = true;
+                log::line(&format!("session startup runner pid {}", runner.pid));
             }
-        }
-        Some(_) => {
-            child.kill();
-            return End::Fallback("hotkey or --fallback before ready".into());
-        }
-        None => {
-            child.kill();
-            return End::Problem(format!("explorust was not ready after {} s", timeout.as_secs()));
+            Err(e) => log::line(&format!("could not start the session startup runner: {e}")),
         }
     }
-    watch(&child, fallback)
+    let mut taskbar = TaskbarWatch::new();
+    for (event, label, limit) in [
+        (&phases.immersive, "immersive host", launch_timing::IMMERSIVE_BUDGET),
+        (&phases.verified, "build verdict", launch_timing::VERDICT_BUDGET),
+    ] {
+        if let Err(end) = wait_phase(child, fallback, event, label, limit, Some(&mut taskbar)) {
+            return end;
+        }
+        log::line(&format!("explorust {label} ready"));
+    }
+    folders::handler(true);
+    if self_test && let Err(e) = reg::set_last_good_build(build) {
+        log::line(&format!("could not record the good build: {e}"));
+    }
+    watch(child, fallback, taskbar)
+}
+
+fn wait_phase(child: &Child, fallback: &Event, phase: &Event, label: &str, budget: Duration, mut taskbar: Option<&mut TaskbarWatch>) -> Result<(), End> {
+    let start = Instant::now();
+    loop {
+        let remaining = budget.saturating_sub(start.elapsed());
+        let wait = if taskbar.is_some() { remaining.min(PROBE) } else { remaining };
+        match wait_any(&[fallback.0, child.handle, phase.0], Some(wait.as_millis() as u32)) {
+            Some(0) => {
+                child.kill();
+                return Err(End::Fallback(format!("hotkey or --fallback during {label}")));
+            }
+            Some(1) => return Err(ended(child, Some(label))),
+            Some(_) => return Ok(()),
+            None if start.elapsed() >= budget => {
+                let _ = fallback.signal();
+                child.kill();
+                return Err(End::Problem(format!("explorust {label} was not ready after {} s", budget.as_secs())));
+            }
+            None => {
+                if let Some(end) = taskbar.as_deref_mut().and_then(|watch| watch.probe(child, fallback)) {
+                    return Err(end);
+                }
+            }
+        }
+    }
+}
+
+struct TaskbarWatch {
+    started: Instant,
+    dog: Option<Watchdog>,
+}
+
+impl TaskbarWatch {
+    fn new() -> Self {
+        let enabled = !parts_off().iter().any(|p| p == "taskbar");
+        Self { started: Instant::now(), dog: enabled.then(Watchdog::default) }
+    }
+
+    fn probe(&mut self, child: &Child, fallback: &Event) -> Option<End> {
+        let at = self.started.elapsed();
+        let why = self.dog.as_mut()?.probe(taskbar::probe(child.pid), at)?;
+        let _ = fallback.signal();
+        child.kill();
+        Some(End::Problem(why))
+    }
+}
+
+fn ended(child: &Child, starting: Option<&str>) -> End {
+    let code = child.exit_code();
+    match code {
+        0 if starting.is_none() => End::Fallback("explorust exited cleanly".into()),
+        RELOAD => End::Reload,
+        _ => {
+            let reason = problem_reason(code).unwrap_or_else(|| format!("exit code {code:#x}"));
+            match starting {
+                Some(phase) => End::Problem(format!("explorust stopped during {phase}: {reason}")),
+                None => End::Problem(reason),
+            }
+        }
+    }
 }
 
 /// Watches a ready explorust until it ends, its taskbar stops answering, or the escape hatch.
-fn watch(child: &Child, fallback: &Event) -> End {
-    let t0 = Instant::now();
-    let mut dog = Watchdog::default();
-    let taskbar_off = parts_off().iter().any(|p| p == "taskbar");
+fn watch(child: &Child, fallback: &Event, mut taskbar: TaskbarWatch) -> End {
     loop {
-        match wait_any(&[child.handle, fallback.0], Some(PROBE.as_millis() as u32)) {
+        match wait_any(&[fallback.0, child.handle], Some(PROBE.as_millis() as u32)) {
             Some(0) => {
-                return match child.exit_code() {
-                    0 => End::Fallback("explorust exited cleanly".into()),
-                    RELOAD => End::Reload,
-                    code => End::Problem(match problem_reason(code) {
-                        Some(r) => r,
-                        None => format!("explorust crashed (code {code:#x})"),
-                    }),
-                };
-            }
-            Some(_) => {
                 child.kill();
                 return End::Fallback("hotkey or --fallback".into());
             }
-            None => {}
-        }
-        if taskbar_off {
-            continue;
-        }
-        let at = t0.elapsed();
-        if let Some(why) = dog.probe(taskbar::probe(child.pid), at) {
-            // A hung process may also ignore its quit event: kill waits up to 10 s, then the
-            // fallback goes on anyway.
-            child.kill();
-            return End::Problem(why);
+            Some(_) => return ended(child, None),
+            None => {
+                if let Some(end) = taskbar.probe(child, fallback) {
+                    return end;
+                }
+            }
         }
     }
 }
@@ -332,4 +408,44 @@ fn spawn_explorer(path: &Path) -> Option<Child> {
         std::thread::sleep(Duration::from_secs(2));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "fixture process for the Windows readiness test"]
+    fn idle_shell() {
+        std::thread::sleep(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn immersive_wait_is_separate_and_escape_takes_priority() {
+        let prefix = format!(r"Local\explorust-phase-test-{}", std::process::id());
+        let phases = PhaseEvents::open(&prefix).unwrap();
+        let fallback = Event::named(&format!("{prefix}-fallback")).unwrap();
+        let child = Child::spawn(
+            &std::env::current_exe().unwrap(),
+            "--exact supervise::tests::idle_shell --ignored",
+        ).unwrap();
+        phases.native.signal().unwrap();
+        assert!(wait_phase(&child, &fallback, &phases.native, "native", Duration::ZERO, None).is_ok());
+        let name = launch_timing::immersive_event(&prefix);
+        let delay = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            Event::set_existing(&name).unwrap();
+        });
+        let ready = wait_phase(&child, &fallback, &phases.immersive, "immersive", Duration::from_secs(2), None);
+        delay.join().unwrap();
+        assert!(ready.is_ok());
+
+        phases.verified.signal().unwrap();
+        fallback.signal().unwrap();
+        assert!(matches!(
+            wait_phase(&child, &fallback, &phases.verified, "build verdict", Duration::from_secs(1), None),
+            Err(End::Fallback(_))
+        ));
+        assert!(child.ended());
+    }
 }

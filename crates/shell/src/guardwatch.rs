@@ -9,11 +9,11 @@ use windows::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONI
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-pub fn spawn(guard_pid: u32) {
-    let _ = std::thread::Builder::new().name("guard-watch".into()).spawn(move || watch(guard_pid));
+pub fn spawn(guard_pid: u32, staged_event: Option<String>) {
+    let _ = std::thread::Builder::new().name("guard-watch".into()).spawn(move || watch(guard_pid, staged_event));
 }
 
-fn watch(mut pid: u32) {
+fn watch(mut pid: u32, staged_event: Option<String>) {
     let guard = std::env::current_exe().map(|p| p.with_file_name("explorust-guard.exe"));
     loop {
         // SAFETY: opens, waits on and closes a handle owned here.
@@ -28,7 +28,12 @@ fn watch(mut pid: u32) {
         }
         let Ok(exe) = &guard else { return };
         let me = std::process::id().to_string();
-        match std::process::Command::new(exe).args(["--adopt", &me]).creation_flags(CREATE_NO_WINDOW).spawn() {
+        let mut command = std::process::Command::new(exe);
+        command.args(["--adopt", &me]);
+        if let Some(name) = &staged_event {
+            command.arg(name);
+        }
+        match command.creation_flags(CREATE_NO_WINDOW).spawn() {
             Ok(child) => {
                 log::line(&format!("guard pid {pid} ended: started guard pid {} to adopt this shell", child.id()));
                 pid = child.id();

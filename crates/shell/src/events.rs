@@ -2,6 +2,7 @@
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::SYNCHRONIZATION_SYNCHRONIZE;
 use windows::core::HSTRING;
 
 pub const QUIT_EVENT: &str = r"Local\explorust-quit";
@@ -32,6 +33,17 @@ impl Owned {
     pub fn wait(&self, ms: u32) -> bool {
         // SAFETY: the handle is valid while self lives.
         unsafe { WaitForSingleObject(self.0, ms) == WAIT_OBJECT_0 }
+    }
+
+    pub fn is_signalled(name: &str) -> bool {
+        // SAFETY: the returned handle, when present, is closed by the owner.
+        unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) }
+            .is_ok_and(|handle| Self(handle).wait(0))
+    }
+
+    pub fn signal(&self) -> Result<(), String> {
+        // SAFETY: the handle is valid while self lives.
+        unsafe { SetEvent(self.0) }.map_err(|e| e.to_string())
     }
 }
 

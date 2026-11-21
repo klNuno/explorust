@@ -42,10 +42,6 @@ fn parts_off() -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn part_enabled(owner: bus::Owner) -> bool {
-    !parts_off().iter().any(|name| name == owner.name())
-}
-
 /// Notification Center initializes the immersive shell's readiness signal, so start it only once
 /// the host publishes its services. The other parts can create their UI immediately.
 pub fn spawn_parts(host_ready: bool) {
@@ -109,46 +105,128 @@ fn supervise(name: &str, run: fn(), critical: bool) {
 
 /// The running parts (not off in parts-off.txt) and whether one of their command windows exists in
 /// this process: a stand-in dev exe of the same part in the session is not ours to probe.
-fn enabled() -> Vec<(usize, bus::Owner)> {
+pub fn enabled(immersive: bool) -> Vec<(usize, bus::Owner)> {
     let off = parts_off();
-    PARTS.iter().enumerate().filter(|(_, (o, _))| !off.iter().any(|n| n == o.name())).map(|(i, (o, _))| (i, *o)).collect()
+    PARTS.iter().enumerate()
+        .filter(|(_, (owner, _))| (*owner == bus::Owner::Notify) == immersive && !off.iter().any(|name| name == owner.name()))
+        .map(|(i, (owner, _))| (i, *owner)).collect()
 }
 
 fn own_window(owner: bus::Owner) -> Option<windows::Win32::Foundation::HWND> {
-    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
-    let h = bus::target(owner)?;
-    let mut pid = 0u32;
-    // SAFETY: a lookup on a window that may be gone (pid stays 0).
-    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
-    (pid == std::process::id()).then_some(h)
+    use windows::Win32::UI::WindowsAndMessaging::HWND_MESSAGE;
+    let class = windows::core::HSTRING::from(bus::class_of(owner));
+    let pid = std::process::id();
+    find_window_for_pid(Some(HWND_MESSAGE), &class, pid).or_else(|| find_window_for_pid(None, &class, pid))
 }
 
-/// Waits until every running part has its command window, at most `limit`. A part that did not
-/// come up is a problem before the shell says it is ready, so the guard never trusts a half shell.
-pub fn wait_ready(limit: Duration) -> Result<(), String> {
-    let t0 = Instant::now();
-    let parts = enabled();
-    loop {
-        let missing: Vec<&str> = parts.iter().filter(|(_, o)| own_window(*o).is_none()).map(|(_, o)| o.name()).collect();
-        if missing.is_empty() {
-            log::line(&format!("parts ready in {} ms", t0.elapsed().as_millis()));
-            return Ok(());
+fn find_window_for_pid(
+    parent: Option<windows::Win32::Foundation::HWND>,
+    class: &windows::core::HSTRING,
+    expected_pid: u32,
+) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
+    let mut after = None;
+    // SAFETY: lookups on live HWNDs; if a window disappears the probe can retry on the next tick.
+    unsafe {
+        while let Ok(hwnd) = FindWindowExW(parent, after, class, None) {
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == expected_pid {
+                return Some(hwnd);
+            }
+            after = Some(hwnd);
         }
-        if t0.elapsed() >= limit {
-            return Err(format!("the {} part did not start within {} s", missing.join(", "), limit.as_secs()));
+    }
+    None
+}
+
+pub fn ready(owner: bus::Owner) -> bool {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsWindowVisible, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL,
+    };
+    let visible_class = match owner {
+        bus::Owner::Taskbar => Some("Shell_TrayWnd"),
+        bus::Owner::Desktop => Some("Progman"),
+        _ => None,
+    };
+    let window = match visible_class {
+        Some(class) => find_window_for_pid(None, &windows::core::HSTRING::from(class), std::process::id())
+            .filter(|&window| unsafe { IsWindowVisible(window) }.as_bool()),
+        None => own_window(owner),
+    };
+    // SAFETY: a bounded send of a message every window accepts.
+    window.is_some_and(|window| unsafe {
+        SendMessageTimeoutW(window, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 50, None)
+    }.0 != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_window_for_pid;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, GetWindowThreadProcessId,
+        HWND_MESSAGE, RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    };
+    use windows::core::{HSTRING, PCWSTR};
+
+    unsafe extern "system" fn fixture_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    }
+
+    #[test]
+    fn finds_the_supervised_pid_after_a_same_class_window() {
+        const CLASS_ENV: &str = "EXPLORUST_TEST_COMMAND_WINDOW_CLASS";
+        let inherited = std::env::var(CLASS_ENV).ok();
+        let class = HSTRING::from(inherited.clone().unwrap_or_else(|| format!("explorust.test.command.{}", std::process::id())));
+        let window = unsafe {
+            let module = GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSW { lpfnWndProc: Some(fixture_proc), hInstance: module, lpszClassName: PCWSTR(class.as_ptr()), ..Default::default() };
+            assert_ne!(RegisterClassW(&wc), 0);
+            CreateWindowExW(WINDOW_EX_STYLE(0), &class, None, WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(module), None).unwrap()
+        };
+        if inherited.is_some() {
+            std::thread::sleep(Duration::from_secs(10));
+            return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "components::tests::finds_the_supervised_pid_after_a_same_class_window"])
+            .env(CLASS_ENV, class.to_string_lossy())
+            .stdout(Stdio::null()).spawn().unwrap();
+        let mut checked = None;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            let first = unsafe { FindWindowExW(Some(HWND_MESSAGE), None, &class, None) }.unwrap();
+            if let Ok(second) = unsafe { FindWindowExW(Some(HWND_MESSAGE), Some(first), &class, None) } {
+                let mut pid = 0;
+                unsafe { GetWindowThreadProcessId(second, Some(&mut pid)); }
+                checked = Some((pid, second, find_window_for_pid(Some(HWND_MESSAGE), &class, pid)));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let child_pid = child.id();
+        let _ = child.kill();
+        let _ = child.wait();
+        unsafe { DestroyWindow(window).unwrap() };
+        let (pid, second, found) = checked.expect("both fixture processes must create a window");
+        assert!(pid == child_pid || pid == std::process::id());
+        assert_eq!(found, Some(second));
     }
 }
 
 /// Every `problem::PROBE`, each running part's command window must answer within 2 s; one silent
 /// for `problem::HUNG_FOR` is a problem, and so is a part whose window is gone that long. Parts off
 /// in parts-off.txt are skipped.
-pub fn spawn_watchdog() {
-    let _ = std::thread::Builder::new().name("watchdog".into()).spawn(|| {
+pub fn spawn_watchdog(immersive: bool) {
+    let _ = std::thread::Builder::new().name("watchdog".into()).spawn(move || {
         use windows::Win32::Foundation::{LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL};
-        let parts = enabled();
+        let parts = enabled(immersive);
         let mut hung = problem::Hung::new(PARTS.len());
         let t0 = Instant::now();
         loop {
@@ -173,11 +251,17 @@ pub fn spawn_watchdog() {
 
 /// Asks every part to close its windows, and gives them a moment to do it.
 pub fn shutdown_all() {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
     STOPPING.store(true, Ordering::SeqCst);
     explorust_inject::shutdown();
     let mut asked = 0;
     for (owner, _) in PARTS {
-        if bus::post_to(owner, bus::Command::Shutdown, 0) {
+        if let Some(window) = own_window(owner)
+            && unsafe {
+                PostMessageW(Some(window), bus::MSG_COMMAND, WPARAM(bus::Command::Shutdown as usize), LPARAM(0))
+            }.is_ok()
+        {
             asked += 1;
         }
     }

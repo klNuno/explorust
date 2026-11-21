@@ -22,12 +22,6 @@ pub fn report(why: String) {
     }
 }
 
-/// True once a problem was reported (not yet taken).
-#[cfg(target_os = "windows")]
-pub fn pending() -> bool {
-    FIRST.lock().unwrap_or_else(|e| e.into_inner()).is_some()
-}
-
 /// The problem to stop on, written for the guard.
 #[cfg(target_os = "windows")]
 pub fn take() -> Option<String> {

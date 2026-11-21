@@ -11,12 +11,6 @@
 
 use std::time::Duration;
 
-/// How long explorust gets to signal ready. A changed Windows build adds the symbol download and the
-/// UWP self-test.
-pub fn ready_timeout(self_test: bool) -> Duration {
-    if self_test { Duration::from_secs(120) } else { Duration::from_secs(45) }
-}
-
 /// Logons in a row that ended in a problem before explorust is turned off.
 pub const MAX_STREAK: u32 = 3;
 
@@ -84,11 +78,6 @@ impl Watchdog {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn self_test_gets_more_time() {
-        assert!(ready_timeout(true) > ready_timeout(false));
-    }
 
     #[test]
     fn third_problem_logon_turns_off() {

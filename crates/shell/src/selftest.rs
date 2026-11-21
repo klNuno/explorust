@@ -18,10 +18,6 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Milliseconds from activation to the frame on screen.
 pub fn calculator() -> Result<u128, String> {
-    std::thread::spawn(calculator_on_mta).join().map_err(|_| "self-test thread panicked".to_string())?
-}
-
-fn calculator_on_mta() -> Result<u128, String> {
     // SAFETY: this thread is ours; COM stays initialized until it ends.
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok().map_err(|e| format!("COM: {e}"))?;
     // SAFETY: standard creation of the activation manager.

@@ -23,6 +23,7 @@ mod apps;
 mod folders;
 mod hotkey;
 mod install;
+mod launch_timing;
 mod log;
 mod manage;
 mod notice;
@@ -54,7 +55,7 @@ fn main() {
     let code = match arg.as_str() {
         "" => run_shell(None),
         "--adopt" => match std::env::args().nth(2).and_then(|p| p.parse().ok()) {
-            Some(pid) => run_shell(Some(pid)),
+            Some(pid) => run_shell(Some((pid, std::env::args().nth(3)))),
             None => {
                 say("--adopt needs the explorust pid");
                 2
@@ -104,7 +105,7 @@ fn main() {
     std::process::exit(code as i32);
 }
 
-fn run_shell(adopt: Option<u32>) -> u32 {
+fn run_shell(adopt: Option<(u32, Option<String>)>) -> u32 {
     // SAFETY: one guard per session; the mutex lives until the process ends.
     let _mutex = unsafe { CreateMutexW(None, false, &HSTRING::from(r"Local\explorust-guard")) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {

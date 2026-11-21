@@ -43,4 +43,4 @@ pub use host::{run_embedded_host, run_host, run_managed_host};
 #[cfg(target_os = "windows")]
 pub use host::{configure_dpi_awareness, run_shell_host};
 #[cfg(target_os = "windows")]
-pub use symbols::prefetch;
+pub use symbols::{clean_prefetch_downloads, prefetch};

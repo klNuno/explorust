@@ -23,6 +23,10 @@ pub fn run_once_flags(name: &[u16]) -> (bool, bool) {
     (deferred, safe_mode)
 }
 
+pub fn same_value(snapshot: (u32, &[u16]), current: (u32, &[u16])) -> bool {
+    snapshot == current
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +51,13 @@ mod tests {
         assert_eq!(run_once_flags(&[33]), (true, false));
         assert_eq!(run_once_flags(&[42]), (false, true));
         assert_eq!(run_once_flags(&[65, 33, 42]), (false, false));
+    }
+
+    #[test]
+    fn run_once_preserves_a_replacement_with_different_data_or_type() {
+        assert!(same_value((1, &[42, 0]), (1, &[42, 0])));
+        assert!(!same_value((1, &[42, 0]), (1, &[24, 0])));
+        assert!(!same_value((1, &[42, 0]), (2, &[42, 0])));
+        assert!(!same_value((1, &[42, 0]), (1, &[42])));
     }
 }

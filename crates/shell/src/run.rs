@@ -1,7 +1,7 @@
 //! Argument parsing and the process lifetime: host thread up, optional self-test, ready signal,
 //! then wait for a quit request or the host's end.
 
-use crate::{actions, components, events, guardwatch, keyhost, log, minimized, problem, selftest, startup};
+use crate::{actions, components, events, guardwatch, keyhost, launch_timing, log, minimized, problem, selftest, startup};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
@@ -14,15 +14,9 @@ pub const SELF_TEST_FAILED: i32 = 4;
 pub const RELOAD: i32 = 5;
 /// A problem found inside (`problem`): the guard starts explorer.exe and tells the user.
 pub const PROBLEM: i32 = 6;
-/// How long the parts get to show their command windows before the shell says it is ready.
-const PARTS_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// How long the host gets to publish the shell window and start the controller. A first run on a
-/// new Windows build downloads twinui's PDB (tens of MB) before it is ready.
-const HOST_READY_TIMEOUT: Duration = Duration::from_secs(100);
-
 struct Args {
     ready_event: Option<String>,
+    staged_ready: bool,
     guard: Option<u32>,
     self_test: bool,
     quit: bool,
@@ -30,11 +24,12 @@ struct Args {
 }
 
 fn parse() -> Result<Args, String> {
-    let mut args = Args { ready_event: None, guard: None, self_test: false, quit: false, reload: false };
+    let mut args = Args { ready_event: None, staged_ready: false, guard: None, self_test: false, quit: false, reload: false };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--ready-event" => args.ready_event = Some(it.next().ok_or("--ready-event needs a name")?),
+            "--staged-ready" => args.staged_ready = true,
             "--guard" => args.guard = it.next().and_then(|p| p.parse().ok()),
             "--self-test" => args.self_test = true,
             "--quit" => args.quit = true,
@@ -43,6 +38,23 @@ fn parse() -> Result<Args, String> {
         }
     }
     Ok(args)
+}
+
+struct PhaseEvents {
+    native: events::Owned,
+    immersive: events::Owned,
+    verified: events::Owned,
+}
+
+impl PhaseEvents {
+    fn open(name: &str) -> Result<Self, String> {
+        // Retain the handles so a replacement guard can observe the same phase after adoption.
+        Ok(Self {
+            native: events::Owned::create(&launch_timing::native_event(name))?,
+            immersive: events::Owned::create(&launch_timing::immersive_event(name))?,
+            verified: events::Owned::create(name)?,
+        })
+    }
 }
 
 pub fn main() -> i32 {
@@ -85,6 +97,18 @@ fn shell(args: &Args) -> i32 {
             return HOST_FAILED;
         }
     };
+    let exits = ExitRequests { quit, reload };
+    let staged = args.ready_event.as_deref().filter(|_| args.staged_ready);
+    let phases = match staged.map(PhaseEvents::open).transpose() {
+        Ok(phases) => phases,
+        Err(e) => {
+            log::line(&format!("readiness events: {e}"));
+            return HOST_FAILED;
+        }
+    };
+    if let Some(pid) = args.guard {
+        guardwatch::spawn(pid, staged.map(str::to_string));
+    }
     if let Err(e) = uwp_host::configure_dpi_awareness() {
         log::line(&format!("process DPI: {e}"));
         return HOST_FAILED;
@@ -101,9 +125,8 @@ fn shell(args: &Args) -> i32 {
         log::line(&format!("uwp host thread: {e}"));
         return HOST_FAILED;
     }
-    if registered_rx.recv_timeout(PARTS_READY_TIMEOUT).is_err() {
-        log::line("uwp host did not register the shell window");
-        return HOST_FAILED;
+    if let Err(code) = exits.wait_reply(&registered_rx, launch_timing::REGISTRATION, HOST_FAILED, "shell window registration") {
+        return code;
     }
     // Dark menus and shell views for every part (uxtheme's app mode is process-wide).
     files::dark_mode_for_process();
@@ -111,51 +134,61 @@ fn shell(args: &Args) -> i32 {
     components::spawn_parts(false);
     actions::spawn();
     keyhost::start();
-    startup::after_taskbar(launched, PARTS_READY_TIMEOUT, args.guard.is_some());
-    let host_started = Instant::now();
-    loop {
-        if let Some(code) = requested_exit(&quit, &reload, 0) {
-            return code;
+    if let Err(code) = exits.wait_parts(false) {
+        return code;
+    }
+    log::line(&format!("native desktop ready in {} ms", launched.elapsed().as_millis()));
+    components::spawn_watchdog(false);
+    if let Some(phases) = &phases {
+        signal(&phases.native, "native ready");
+    } else if args.guard.is_some() {
+        // An installed guard can outlive a live shell update. It has no native event to wait on.
+        startup::spawn_legacy_runner();
+    }
+    match exits.wait_reply(&ready_rx, launch_timing::HOST, HOST_FAILED, "immersive host startup") {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            log::line(&format!("uwp host failed: {e}"));
+            return shutdown(HOST_FAILED);
         }
-        match ready_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(())) => break,
-            Ok(Err(e)) => {
-                log::line(&format!("uwp host failed: {e}"));
-                return shutdown(HOST_FAILED);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) if host_started.elapsed() < HOST_READY_TIMEOUT => {}
-            Err(e) => {
-                log::line(&format!("uwp host did not become ready: {e}"));
-                return shutdown(HOST_FAILED);
-            }
-        }
+        Err(code) => return code,
     }
     log::line("uwp host ready");
     components::spawn_parts(true);
+    if let Err(code) = exits.wait_parts(true) {
+        return code;
+    }
+    components::spawn_watchdog(true);
+    if let Some(phases) = &phases {
+        signal(&phases.immersive, "immersive ready");
+    }
     if args.self_test {
-        match selftest::calculator() {
-            Ok(ms) => log::line(&format!("self-test passed: Calculator frame shown in {ms} ms")),
-            Err(e) => {
+        let (tx, rx) = mpsc::sync_channel(1);
+        if let Err(e) = std::thread::Builder::new().name("self-test".into()).spawn(move || {
+            let _ = tx.send(selftest::calculator());
+        }) {
+            log::line(&format!("self-test thread: {e}"));
+            return shutdown(SELF_TEST_FAILED);
+        }
+        match exits.wait_reply(&rx, launch_timing::SELF_TEST, SELF_TEST_FAILED, "self-test") {
+            Ok(Ok(ms)) => log::line(&format!("self-test passed: Calculator frame shown in {ms} ms")),
+            Ok(Err(e)) => {
                 log::line(&format!("self-test failed: {e}"));
                 return shutdown(SELF_TEST_FAILED);
             }
+            Err(code) => return code,
         }
     }
-    // Ready only once every part is up: a part that cannot start is a problem now, not later.
-    match components::wait_ready(PARTS_READY_TIMEOUT) {
-        Ok(()) => components::spawn_watchdog(),
-        Err(why) => problem::report(why),
+    if let Some(code) = exits.requested(0) {
+        return code;
     }
-    if let Some(pid) = args.guard {
-        guardwatch::spawn(pid);
-    }
-    if let Some(name) = args.ready_event.as_ref().filter(|_| !problem::pending()) {
-        if let Err(e) = events::set_existing(name) {
-            log::line(&format!("ready event: {e}"));
-        }
+    if let Some(phases) = &phases {
+        signal(&phases.verified, "build verdict");
+    } else if let Some(name) = &args.ready_event && let Err(e) = events::set_existing(name) {
+        log::line(&format!("ready event: {e}"));
     }
     loop {
-        if let Some(code) = requested_exit(&quit, &reload, 250) {
+        if let Some(code) = exits.requested(250) {
             return code;
         }
         // The host thread ended, or panicked (its sender dropped): the UWP frames are gone.
@@ -166,20 +199,71 @@ fn shell(args: &Args) -> i32 {
     }
 }
 
-fn requested_exit(quit: &events::Owned, reload: &events::Owned, wait: u32) -> Option<i32> {
-    let code = if quit.wait(wait) {
-        log::line("quit requested");
-        CLEAN
-    } else if reload.wait(0) {
-        log::line("reload requested");
-        RELOAD
-    } else if let Some(why) = problem::take() {
-        log::line(&format!("stopping on a problem: {why}"));
-        PROBLEM
-    } else {
-        return None;
-    };
-    Some(shutdown(code))
+fn signal(event: &events::Owned, phase: &str) {
+    if let Err(e) = event.signal() {
+        log::line(&format!("{phase} event: {e}"));
+    }
+}
+
+struct ExitRequests {
+    quit: events::Owned,
+    reload: events::Owned,
+}
+
+impl ExitRequests {
+    fn wait_parts(&self, immersive: bool) -> Result<(), i32> {
+        let started = Instant::now();
+        let parts = components::enabled(immersive);
+        loop {
+            if let Some(code) = self.requested(0) {
+                return Err(code);
+            }
+            let missing: Vec<_> = parts.iter().map(|(_, owner)| *owner)
+                .filter(|&owner| !components::ready(owner)).map(bus::Owner::name).collect();
+            if missing.is_empty() {
+                return Ok(());
+            }
+            if started.elapsed() >= launch_timing::PARTS {
+                problem::report(format!("the {} part did not answer within {} s", missing.join(", "), launch_timing::PARTS.as_secs()));
+                return Err(self.requested(0).unwrap_or_else(|| shutdown(PROBLEM)));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn wait_reply<T>(&self, receiver: &mpsc::Receiver<T>, limit: Duration, failure: i32, phase: &str) -> Result<T, i32> {
+        let started = Instant::now();
+        loop {
+            if let Some(code) = self.requested(0) {
+                return Err(code);
+            }
+            let remaining = limit.saturating_sub(started.elapsed());
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(value) => return Ok(value),
+                Err(mpsc::RecvTimeoutError::Timeout) if started.elapsed() < limit => {}
+                Err(e) => {
+                    log::line(&format!("{phase} did not finish within {} s: {e}", limit.as_secs()));
+                    return Err(shutdown(failure));
+                }
+            }
+        }
+    }
+
+    fn requested(&self, wait: u32) -> Option<i32> {
+        let code = if self.quit.wait(wait) {
+            log::line("quit requested");
+            CLEAN
+        } else if self.reload.wait(0) {
+            log::line("reload requested");
+            RELOAD
+        } else if let Some(why) = problem::take() {
+            log::line(&format!("stopping on a problem: {why}"));
+            PROBLEM
+        } else {
+            return None;
+        };
+        Some(shutdown(code))
+    }
 }
 
 fn shutdown(code: i32) -> i32 {

@@ -13,14 +13,18 @@ use std::{
     ffi::c_void,
     path::PathBuf,
     sync::{Mutex, atomic::{AtomicUsize, Ordering}},
+    time::{Duration, Instant},
 };
 
 use libloading::Library;
 use windows::{
     Win32::{
-        Foundation::{HANDLE, HWND},
+        Foundation::{HANDLE, HWND, LPARAM, RECT},
         Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute},
-        UI::WindowsAndMessaging::{FindWindowExW, GetPropW, RemovePropW, SetPropW},
+        UI::WindowsAndMessaging::{
+            EnumChildWindows, GA_ROOT, GetAncestor, GetClassNameW, GetClientRect, GetPropW,
+            IsWindowVisible, RemovePropW, SetPropW, WS_CHILD, WS_EX_NOREDIRECTIONBITMAP,
+        },
     },
     core::{BOOL, w},
 };
@@ -55,8 +59,63 @@ unsafe extern "system" {
 }
 
 static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
-static UNATTACHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static UNATTACHED: Mutex<Vec<PendingFrame>> = Mutex::new(Vec::new());
 const CLOAK_PROPERTY: windows::core::PCWSTR = w!("explorust.unattached-appframe");
+const ATTACHMENT_GRACE: Duration = Duration::from_secs(30);
+
+struct PendingFrame {
+    hwnd: usize,
+    since: Instant,
+    reported: bool,
+}
+
+fn class_is(hwnd: HWND, class: &str) -> bool {
+    let mut name = [0u16; 64];
+    // SAFETY: the output buffer is writable for the call.
+    let length = unsafe { GetClassNameW(hwnd, &mut name) }.max(0) as usize;
+    name[..length].iter().copied().eq(class.encode_utf16())
+}
+
+fn core_child(frame: HWND, require_layout: bool) -> bool {
+    struct Match {
+        require_layout: bool,
+        found: bool,
+    }
+
+    unsafe extern "system" fn visit(window: HWND, result: LPARAM) -> BOOL {
+        // SAFETY: EnumChildWindows invokes this callback synchronously.
+        let result = unsafe { &mut *(result.0 as *mut Match) };
+        if !class_is(window, "Windows.UI.Core.CoreWindow") {
+            return BOOL(1);
+        }
+        let mut rect = RECT::default();
+        // SAFETY: the window is a descendant of the frame. It has been laid out once the client
+        // area is visible with positive dimensions, including under a nested layout host.
+        if !result.require_layout
+            || unsafe { IsWindowVisible(window) }.as_bool()
+                && unsafe { GetClientRect(window, &mut rect) }.is_ok()
+                && rect.right > rect.left && rect.bottom > rect.top
+        {
+            result.found = true;
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+
+    let mut result = Match { require_layout, found: false };
+    // SAFETY: the output lives until the synchronous enumeration returns.
+    let _ = unsafe { EnumChildWindows(Some(frame), Some(visit), LPARAM(&mut result as *mut Match as isize)) };
+    result.found
+}
+
+fn empty_retry_frame(hwnd: HWND, ex_style: u32, style: u32, parent: *mut c_void, band: u32, flags: u32) -> bool {
+    band == 1 && flags == 3 && parent.is_null() && style & WS_CHILD.0 == 0
+        && ex_style & WS_EX_NOREDIRECTIONBITMAP.0 != 0
+        // SAFETY: queried immediately after the creation call returned this HWND.
+        && unsafe { GetAncestor(hwnd, GA_ROOT) } == hwnd
+        && class_is(hwnd, "ApplicationFrameWindow")
+        && !core_child(hwnd, false)
+}
 
 fn cloak(hwnd: HWND, value: bool) -> windows::core::Result<()> {
     let enabled = BOOL::from(value);
@@ -75,20 +134,35 @@ fn cloak_until_attached(hwnd: HWND) {
         hlog!("phase=appframe-window hwnd={:?} cloak-error={error}", hwnd.0);
         return;
     }
-    UNATTACHED.lock().unwrap_or_else(|e| e.into_inner()).push(hwnd.0 as usize);
+    UNATTACHED.lock().unwrap_or_else(|e| e.into_inner()).push(PendingFrame {
+        hwnd: hwnd.0 as usize,
+        since: Instant::now(),
+        reported: false,
+    });
     hlog!("phase=appframe-window hwnd={:?} result=cloaked-until-attached", hwnd.0);
 }
 
-fn release_cloaks(only_attached: bool) {
+fn release_cloaks(only_ready: bool) {
     let mut windows = UNATTACHED.lock().unwrap_or_else(|e| e.into_inner());
-    windows.retain(|&raw| {
-        let hwnd = HWND(raw as *mut c_void);
+    windows.retain_mut(|pending| {
+        let hwnd = HWND(pending.hwnd as *mut c_void);
         // SAFETY: the property is on retry frames only and disappears when they are destroyed.
         if unsafe { GetPropW(hwnd, CLOAK_PROPERTY) }.is_invalid() {
             return false;
         }
-        if only_attached && unsafe { FindWindowExW(Some(hwnd), None, w!("Windows.UI.Core.CoreWindow"), None) }.is_err() {
-            return true;
+        if only_ready && !core_child(hwnd, true) {
+            if pending.since.elapsed() < ATTACHMENT_GRACE {
+                return true;
+            }
+            if !pending.reported {
+                pending.reported = true;
+                hlog!("phase=appframe-window hwnd={:?} result=attachment-timeout", hwnd.0);
+            }
+            // Keep a visible empty frame suppressed. The same HWND can be used again later.
+            // A hidden window can safely lose our cloak and the host can show it normally.
+            if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                return true;
+            }
         }
         if cloak(hwnd, false).is_err() {
             return true;
@@ -140,7 +214,7 @@ unsafe extern "system" fn create_window_in_band_ex(
     let retry = call(0);
     let retry_error = unsafe { GetLastError() };
     hlog!("phase=appframe-window band={band} flags=0 retry hwnd={retry:?} last_error={retry_error}");
-    if !retry.is_null() {
+    if !retry.is_null() && empty_retry_frame(HWND(retry), ex_style, style, parent, band, type_flags) {
         cloak_until_attached(HWND(retry));
     }
     // SAFETY: restore the result from the call that produced our return value.
@@ -209,4 +283,49 @@ pub(crate) unsafe fn write_slot(slot: *mut usize, value: usize) -> Result<(), St
         return Err(format!("VirtualProtect-restore failed: {}", std::io::Error::last_os_error()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::{LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE,
+        WNDCLASSW, WS_POPUP, WS_VISIBLE,
+    };
+    use windows::core::PCWSTR;
+
+    unsafe extern "system" fn fixture_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    }
+
+    #[test]
+    fn a_retried_frame_accepts_nested_core_layout_on_reuse() {
+        let frame_class = w!("ApplicationFrameWindow");
+        let core_class = w!("Windows.UI.Core.CoreWindow");
+        let helper_class = w!("explorust.test.appframe-layout");
+        let module = unsafe { GetModuleHandleW(None).unwrap().into() };
+        let make = |class: PCWSTR, style, parent| unsafe {
+            CreateWindowExW(WINDOW_EX_STYLE(0), class, None, style, 0, 0, 80, 80, parent, None, Some(module), None).unwrap()
+        };
+        for name in [frame_class, core_class, helper_class] {
+            let wc = WNDCLASSW { lpfnWndProc: Some(fixture_proc), hInstance: module, lpszClassName: name, ..Default::default() };
+            assert_ne!(unsafe { RegisterClassW(&wc) }, 0);
+        }
+        let frame = make(frame_class, WS_POPUP | WS_VISIBLE, None);
+        let retry_target = |hwnd, style, parent| empty_retry_frame(hwnd, WS_EX_NOREDIRECTIONBITMAP.0, style, parent, 1, 3);
+        let helper = make(helper_class, WS_CHILD | WS_VISIBLE, Some(frame));
+        assert!(!retry_target(helper, WS_CHILD.0, frame.0));
+        assert!(retry_target(frame, WS_POPUP.0, std::ptr::null_mut()));
+        assert!(!core_child(frame, true));
+        for _ in 0..2 {
+            let core = make(core_class, WS_CHILD | WS_VISIBLE, Some(helper));
+            assert!(core_child(frame, true));
+            assert!(!retry_target(frame, WS_POPUP.0, std::ptr::null_mut()));
+            unsafe { DestroyWindow(core).unwrap() };
+            assert!(!core_child(frame, true));
+        }
+        unsafe { DestroyWindow(frame).unwrap() };
+    }
 }

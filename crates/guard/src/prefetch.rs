@@ -1,38 +1,26 @@
-//! Warm the signed-in user's symbol cache before offering to sign out.
+//! Start the signed-in user's optional symbol warm-up after installation commits.
 
 use crate::proc::Child;
 use std::path::Path;
 use windows::Win32::{
-    Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
+    Foundation::{CloseHandle, HANDLE},
     Security::{GetTokenInformation, TOKEN_LINKED_TOKEN, TOKEN_QUERY, TokenLinkedToken},
     System::Threading::{
         CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CreateProcessWithTokenW, GetCurrentProcess,
-        OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+        OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW,
     },
 };
 use windows::core::{HSTRING, PWSTR};
 
 const ARG: &str = "--prefetch-symbols";
-const LIMIT_MS: u32 = 35_000;
-
-/// Called on the existing installation worker. An offline server or unavailable user token is
-/// nonfatal: the shell can populate the cache at logon.
-pub fn run(exe: &Path, elevated: bool) -> Result<(), String> {
+/// The child owns its download deadline and cleanup. Dropping the handle lets setup finish.
+pub fn start(exe: &Path, elevated: bool) -> Result<(), String> {
     let child = if elevated {
         spawn_unelevated(exe)?
     } else {
         Child::spawn(exe, ARG)?
     };
-    // SAFETY: child owns the handle for this wait.
-    if unsafe { WaitForSingleObject(child.handle, LIMIT_MS) } != WAIT_OBJECT_0 {
-        // SAFETY: this is only the prefetch child. Do not signal the live shell's quit event.
-        let _ = unsafe { TerminateProcess(child.handle, 1) };
-        return Err("download exceeded the install time limit".into());
-    }
-    let code = child.exit_code();
-    if code != 0 {
-        return Err(format!("prefetch exited {code}"));
-    }
+    crate::log::line(&format!("install: optional symbol prefetch started (pid {})", child.pid));
     Ok(())
 }
 

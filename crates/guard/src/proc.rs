@@ -146,6 +146,11 @@ impl Event {
             r
         }
     }
+
+    pub fn signal(&self) -> Result<(), String> {
+        // SAFETY: the handle is valid while self lives.
+        unsafe { SetEvent(self.0) }.map_err(|e| e.to_string())
+    }
 }
 
 impl Drop for Event {

@@ -131,6 +131,7 @@ fn cache_pdb(module_name: &str, image_path: &Path) -> Result<(PathBuf, PathBuf),
             .into_owned();
     let key = symbol_key(codeview.guid(), codeview.age());
     let cache = symbol_cache()?.join(&pdb_name).join(&key);
+    clean_downloads(&cache, &pdb_name, downloader_ended);
     let pdb_path = cache.join(&pdb_name);
     let manifest = cache.join("nickel-uwu-symbols.txt");
     let version = file_version(image_path).unwrap_or_else(|| "?".into());
@@ -192,6 +193,53 @@ fn file_version(path: &Path) -> Option<String> {
 fn symbol_cache() -> Result<PathBuf, String> {
     let root = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable")?;
     Ok(PathBuf::from(root).join("Nickel").join("symbols"))
+}
+
+/// Removes the terminated worker's incomplete downloads. Other shell or warm-up processes can
+/// be downloading into the same cache, so match the exact filename and process ID.
+pub fn clean_prefetch_downloads(pid: u32) {
+    let Ok(cache) = symbol_cache() else { return };
+    let Ok(modules) = cache.read_dir() else { return };
+    for module in modules.flatten() {
+        let Ok(versions) = module.path().read_dir() else { continue };
+        let name = module.file_name();
+        for version in versions.flatten() {
+            clean_downloads(&version.path(), &name.to_string_lossy(), |owner| owner == pid);
+        }
+    }
+}
+
+fn clean_downloads(directory: &Path, pdb: &str, is_abandoned: impl Fn(u32) -> bool) {
+    let Ok(files) = directory.read_dir() else { return };
+    for file in files.flatten() {
+        let name = file.file_name();
+        if name.to_str().and_then(|name| download_owner(name, pdb)).is_some_and(&is_abandoned) {
+            let _ = fs::remove_file(file.path());
+        }
+    }
+}
+
+fn download_owner(name: &str, pdb: &str) -> Option<u32> {
+    let owner_and_serial = name.strip_prefix(pdb)?.strip_prefix('.')?.strip_suffix(".download")?;
+    let (owner, serial) = owner_and_serial.split_once('.')?;
+    serial.parse::<u32>().ok()?;
+    owner.parse().ok()
+}
+
+fn downloader_ended(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    // SAFETY: the wait is nonblocking. An inaccessible process may still own the download.
+    unsafe {
+        match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            Ok(process) => {
+                let ended = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
+                let _ = CloseHandle(process);
+                ended
+            }
+            Err(error) => error.code() == ERROR_INVALID_PARAMETER.to_hresult(),
+        }
+    }
 }
 
 fn symbol_key(guid: [u8; 16], age: u32) -> String {
@@ -309,7 +357,16 @@ fn write_manifest(path: &Path, symbols: &HashMap<String, usize>) -> Result<(), S
 mod tests {
     use std::path::PathBuf;
 
-    use super::{address, symbol_key};
+    use super::{address, download_owner, symbol_key};
+
+    #[test]
+    fn partial_download_is_identified_by_pdb_and_pid() {
+        assert_eq!(download_owner("win.pdb.123.0.download", "win.pdb"), Some(123));
+        assert_eq!(download_owner("other.pdb.123.0.download", "win.pdb"), None);
+        assert_eq!(download_owner("win.pdb.123.download", "win.pdb"), None);
+        assert_eq!(download_owner("win.pdb.123.tmp.download", "win.pdb"), None);
+        assert_eq!(download_owner("win.pdb", "win.pdb"), None);
+    }
 
     #[test]
     fn formats_microsoft_symbol_store_key() {

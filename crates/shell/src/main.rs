@@ -3,6 +3,7 @@
 //! rest join it step by step.
 //!
 //! - `--ready-event <name>`: set that named event once the host is up (and the self-test passed).
+//! - `--staged-ready`: also signal native and immersive readiness on separate events.
 //! - `--guard <pid>`: the guard that started it; if it ends, explorust starts one that adopts it.
 //! - `--self-test`: before signalling ready, open Calculator and wait for its frame on screen.
 //! - `--prefetch-symbols`: populate this user's cache for the installed Windows build and exit.
@@ -31,9 +32,15 @@ mod guardwatch;
 #[cfg(target_os = "windows")]
 mod keyhost;
 #[cfg(target_os = "windows")]
+#[path = "../../guard/src/launch_timing.rs"]
+#[allow(dead_code)]
+mod launch_timing;
+#[cfg(target_os = "windows")]
 mod log;
 #[cfg(target_os = "windows")]
 mod minimized;
+#[cfg(target_os = "windows")]
+mod prefetch;
 mod problem;
 #[cfg(target_os = "windows")]
 mod run;
@@ -46,8 +53,11 @@ mod startup_rules;
 
 #[cfg(target_os = "windows")]
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--prefetch-symbols") {
-        std::process::exit(if uwp_host::prefetch() { 0 } else { 1 });
+    match std::env::args().nth(1).as_deref() {
+        Some("--prefetch-symbols") => std::process::exit(prefetch::run()),
+        Some("--download-symbols") => std::process::exit(if uwp_host::prefetch() { 0 } else { 1 }),
+        Some("--startup-apps") => std::process::exit(startup::run()),
+        _ => {}
     }
     // Before any COM call of the process (AppContainer hosts call back into twinui here).
     match comsec::init() {
