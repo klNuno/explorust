@@ -5,7 +5,7 @@ use crate::text::Strings;
 use crate::win::shell;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, POINT};
 use windows::Win32::Storage::EnhancedStorage::{PKEY_DateModified, PKEY_ItemNameDisplay, PKEY_ItemTypeText, PKEY_Size};
-use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW};
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -29,11 +29,14 @@ fn popup(hwnd: HWND, items: &[(u32, &str, bool)], at: POINT) -> u32 {
     }
 }
 
-pub fn sort(hwnd: HWND, v: &IFolderView2, s: &Strings, at: POINT) {
+pub fn sort(hwnd: HWND, v: &IFolderView2, s: &Strings, at: POINT) -> windows_core::Result<()> {
     let keys = [PKEY_ItemNameDisplay, PKEY_DateModified, PKEY_ItemTypeText, PKEY_Size];
     let mut cur = [SORTCOLUMN::default()];
     let _ = unsafe { v.GetSortColumns(&mut cur) };
-    let cur = cur[0];
+    let mut cur = cur[0];
+    if !keys.contains(&cur.propkey) {
+        cur = SORTCOLUMN { propkey: keys[0], direction: SORT_ASCENDING };
+    }
     let mut items: Vec<(u32, &str, bool)> =
         keys.iter().enumerate().map(|(i, k)| (i as u32 + 1, s.sort_by[i], cur.propkey == *k)).collect();
     items.push((0, "", false));
@@ -44,9 +47,9 @@ pub fn sort(hwnd: HWND, v: &IFolderView2, s: &Strings, at: POINT) {
         1..=4 => SORTCOLUMN { propkey: keys[pick as usize - 1], direction: cur.direction },
         10 => SORTCOLUMN { direction: SORT_ASCENDING, ..cur },
         11 => SORTCOLUMN { direction: SORT_DESCENDING, ..cur },
-        _ => return,
+        _ => return Ok(()),
     };
-    let _ = unsafe { v.SetSortColumns(&[col]) };
+    unsafe { v.SetSortColumns(&[col]) }
 }
 
 const VIEWS: [(FOLDERVIEWMODE, i32); 8] = [
@@ -60,7 +63,7 @@ const VIEWS: [(FOLDERVIEWMODE, i32); 8] = [
     (FVM_CONTENT, 32),
 ];
 
-pub fn view(hwnd: HWND, v: &IFolderView2, s: &Strings, at: POINT) {
+pub fn view(hwnd: HWND, v: &IFolderView2, s: &Strings, at: POINT) -> windows_core::Result<()> {
     let (mut mode, mut size) = (FVM_AUTO, 0);
     let _ = unsafe { v.GetViewModeAndIconSize(&mut mode, &mut size) };
     let current = VIEWS.iter().position(|&(m, sz)| m == mode && (m != FVM_ICON || sz == size));
@@ -69,29 +72,38 @@ pub fn view(hwnd: HWND, v: &IFolderView2, s: &Strings, at: POINT) {
     let pick = popup(hwnd, &items, at) as usize;
     if (1..=VIEWS.len()).contains(&pick) {
         let (m, sz) = VIEWS[pick - 1];
-        let _ = unsafe { v.SetViewModeAndIconSize(m, sz) };
+        return unsafe { v.SetViewModeAndIconSize(m, sz) };
     }
+    Ok(())
 }
 
 /// See more: select all, select none, properties.
-pub fn more(hwnd: HWND, v: &IFolderView2, sv: &IShellView, s: &Strings, at: POINT) {
+pub fn more(hwnd: HWND, v: &IFolderView2, sv: &IShellView, s: &Strings, at: POINT) -> windows_core::Result<()> {
     let items = [(1, s.select_all, false), (2, s.select_none, false), (0, "", false), (3, s.properties, false)];
     match popup(hwnd, &items, at) {
         pick @ (1 | 2) => unsafe {
-            let n = v.ItemCount(SVGIO_ALLVIEW).unwrap_or(0);
+            let n = v.ItemCount(SVGIO_ALLVIEW)?;
             let flag = if pick == 1 { SVSI_SELECT } else { SVSI_DESELECT };
             for i in 0..n {
-                let _ = v.SelectItem(i, flag.0 as u32);
+                v.SelectItem(i, flag.0 as u32)?;
             }
         },
         3 => {
-            let m = shell::selection_menu(v).or_else(|| shell::background_menu(sv));
+            let m = shell::selection_menu(sv).or_else(|| shell::background_menu(sv));
             if let Some(m) = m {
-                let _ = shell::invoke(&m, hwnd, "properties");
+                return shell::invoke(&m, sv, hwnd, "properties");
             }
         }
         _ => {}
     }
+    Ok(())
+}
+
+pub fn file_clipboard() -> bool {
+    static SHELL_ITEMS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let shell_items = *SHELL_ITEMS.get_or_init(|| unsafe { RegisterClipboardFormatW(windows_core::w!("Shell IDList Array")) });
+    // CF_HDROP is 15. Some shell namespace handlers provide only the native shell item format.
+    unsafe { IsClipboardFormatAvailable(15).is_ok() || (shell_items != 0 && IsClipboardFormatAvailable(shell_items).is_ok()) }
 }
 
 /// Unicode text on the clipboard.

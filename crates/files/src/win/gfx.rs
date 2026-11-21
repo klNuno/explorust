@@ -38,7 +38,6 @@ pub struct Shared {
     dxgi: IDXGIDevice,
     dxgi_factory: IDXGIFactory2,
     d2d: ID2D1Device,
-    pub factory: ID2D1Factory1,
     pub dcomp: IDCompositionDevice,
     pub dwrite: IDWriteFactory,
     pub fonts: Fonts,
@@ -99,7 +98,7 @@ impl Shared {
                 glyph14: format(&dwrite, ICON_FONT, 14.0, true)?,
                 glyph16: format(&dwrite, ICON_FONT, 16.0, true)?,
             };
-            Ok(Rc::new(Shared { dxgi, dxgi_factory, d2d, factory, dcomp, dwrite, fonts }))
+            Ok(Rc::new(Shared { dxgi, dxgi_factory, d2d, dcomp, dwrite, fonts }))
         }
     }
 }
@@ -109,13 +108,37 @@ pub struct Canvas {
     pub sh: Rc<Shared>,
     pub ctx: ID2D1DeviceContext,
     swap: IDXGISwapChain1,
-    _target: IDCompositionTarget,
-    _visual: IDCompositionVisual,
+    _target: Option<IDCompositionTarget>,
+    visual: IDCompositionVisual,
     pub dpi: f32,
 }
 
 impl Canvas {
     pub fn new(sh: Rc<Shared>, hwnd: HWND, w: u32, h: u32, dpi: f32) -> Result<Canvas> {
+        let mut root = Self::layer(sh, w, h, dpi)?;
+        unsafe {
+            let target = root.sh.dcomp.CreateTargetForHwnd(hwnd, true)?;
+            target.SetRoot(&root.visual)?;
+            root.sh.dcomp.Commit()?;
+            root._target = Some(target);
+        }
+        Ok(root)
+    }
+
+    pub fn add_layer(&self, w: u32, h: u32, dpi: f32) -> Result<Canvas> {
+        let layer = Self::layer(self.sh.clone(), w, h, dpi)?;
+        unsafe { self.visual.AddVisual(&layer.visual, true, None::<&IDCompositionVisual>)?; }
+        Ok(layer)
+    }
+
+    pub fn set_y(&self, y: i32) -> Result<()> {
+        unsafe {
+            self.visual.SetOffsetY2(y as f32)?;
+            self.sh.dcomp.Commit()
+        }
+    }
+
+    fn layer(sh: Rc<Shared>, w: u32, h: u32, dpi: f32) -> Result<Canvas> {
         unsafe {
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: w.max(1),
@@ -132,12 +155,9 @@ impl Canvas {
             let swap = sh.dxgi_factory.CreateSwapChainForComposition(&sh.dxgi, &desc, None)?;
             let ctx = sh.d2d.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
             ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            let target = sh.dcomp.CreateTargetForHwnd(hwnd, true)?;
             let visual = sh.dcomp.CreateVisual()?;
             visual.SetContent(&swap)?;
-            target.SetRoot(&visual)?;
-            sh.dcomp.Commit()?;
-            let c = Canvas { sh, ctx, swap, _target: target, _visual: visual, dpi };
+            let c = Canvas { sh, ctx, swap, _target: None, visual, dpi };
             c.bind()?;
             Ok(c)
         }

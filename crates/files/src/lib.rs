@@ -20,6 +20,7 @@ pub mod handler;
 pub mod handover;
 pub mod history;
 pub mod layout;
+mod scope;
 pub mod text;
 pub mod uri;
 
@@ -29,8 +30,15 @@ mod win;
 #[cfg(target_os = "windows")]
 pub use win::dark_mode_for_process;
 
+/// Opens an initial folder in isolation when running the standalone Files test application.
+/// With no path, the dev instance can serve the Files command bus as before.
+#[cfg(target_os = "windows")]
+pub fn run_dev(path: Option<&str>) {
+    win::run_with_initial(path);
+}
+
 /// Runs the component until shutdown.
 pub fn run() {
     #[cfg(target_os = "windows")]
-    win::run();
+    win::run_with_initial(None);
 }

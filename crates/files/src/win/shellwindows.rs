@@ -196,7 +196,7 @@ impl IServiceProvider_Impl for Browser_Impl {
             *out = std::ptr::null_mut();
             let (s, r) = (*service, *riid);
             note("service", s, r);
-            if s == SID_STopLevelBrowser || s == IShellBrowser::IID {
+            if s == SID_STopLevelBrowser || s == SID_SInPlaceBrowser || s == IShellBrowser::IID {
                 return self.QueryInterface(riid, out).ok();
             }
             // Anything else is the active tab's browser's to answer.

@@ -28,7 +28,8 @@ fn main() {
             }
         });
     }
-    files::run();
+    let path = std::env::args().skip_while(|arg| arg != "--path").nth(1);
+    files::run_dev(path.as_deref());
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -6,6 +6,7 @@ mod frame;
 mod gfx;
 mod log;
 mod menus;
+mod search;
 mod shell;
 mod shellwindows;
 mod tab;
@@ -92,24 +93,29 @@ pub(crate) fn open_window(place: &Pidl, at: Option<(i32, i32)>) {
 fn open(cmd: HWND, path: Option<&str>, select: bool, t0: Instant, queued_ms: u32) {
     let mut chosen = None;
     let place = match path {
-        Some(p) => match Pidl::parse(p) {
-            Some(pidl) if select || !pidl.is_folder() => match pidl.parent() {
+        Some(p) => match Pidl::parse_result(p) {
+            Ok(pidl) if select || !pidl.is_folder() => match pidl.parent() {
                 Some(parent) => {
                     chosen = Some(pidl);
                     Some(parent)
                 }
                 None => Some(pidl),
             },
-            Some(pidl) => Some(pidl),
-            None => {
-                log::line(&format!("open {p:?}: not found"));
+            Ok(pidl) => Some(pidl),
+            Err(error) => {
+                log::line(&format!("open {p:?}: navigation failed (HRESULT {:#010x}): {error}", error.code().0 as u32));
                 return;
             }
         },
         None => None,
     };
     let announced = place.clone().or_else(shell::home);
-    let spare = SPARE.with(|s| s.take());
+    let spare = SPARE.with(|s| {
+        let hwnd = s.get()?;
+        // An explicit destination can reuse a prepared Home view only after Home's completion
+        // was processed. Otherwise that old event would reveal the view ahead of the destination.
+        if place.is_none() || frame::ready(hwnd) { s.take() } else { None }
+    });
     let mut later = None;
     let (hwnd, from) = match spare {
         Some(h) => {
@@ -211,7 +217,7 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
-pub fn run() {
+pub fn run_with_initial(initial: Option<&str>) {
     let t0 = Instant::now();
     if let Err(e) = unsafe { OleInitialize(None) } {
         log::line(&format!("OleInitialize failed: {e}"));
@@ -228,7 +234,13 @@ pub fn run() {
     };
     let cmd = unsafe {
         let inst = GetModuleHandleW(None).unwrap_or_default();
-        let name = HSTRING::from(bus::class_of(bus::Owner::Files));
+        // A direct-path test can run beside the real Files part. Sharing its command class would
+        // make the shell's watchdog find this window instead of the one inside explorust.exe.
+        let name = if initial.is_some() {
+            HSTRING::from("explorust.FilesTestCommands")
+        } else {
+            HSTRING::from(bus::class_of(bus::Owner::Files))
+        };
         let class = WNDCLASSW {
             lpfnWndProc: Some(cmd_proc),
             hInstance: inst.into(),
@@ -265,6 +277,9 @@ pub fn run() {
     frame::init(sh, strings, cmd);
     log::line(&format!("files: listening, devices in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
     prepare_spare();
+    if let Some(path) = initial {
+        open(cmd, Some(path), false, Instant::now(), 0);
+    }
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {

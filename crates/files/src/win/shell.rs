@@ -4,15 +4,18 @@
 
 use std::ffi::c_void;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT};
-use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::Ole::IObjectWithSite;
+use windows::Win32::System::SystemServices::{SFGAO_BROWSABLE, SFGAO_FOLDER, SFGAO_LINK};
 use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, DestroyMenu, EnumChildWindows, GetClassNameW, SW_SHOWNORMAL, SendMessageW, WM_THEMECHANGED,
 };
-use windows_core::{BOOL, PCSTR, PCWSTR, PWSTR, Result, w};
+use windows_core::{BOOL, HSTRING, Interface, PCSTR, PCWSTR, PWSTR, Result, w};
 
 /// An ID list held as its bytes, terminator included: comparable, clonable, no COM memory.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -76,10 +79,9 @@ impl Pidl {
 
     /// Whether the item is a folder (ZIP folders included).
     pub fn is_folder(&self) -> bool {
-        use windows::Win32::System::SystemServices::SFGAO_FOLDER;
         self.item()
-            .and_then(|i| unsafe { i.GetAttributes(SFGAO_FOLDER) })
-            .map(|a| a.0 & SFGAO_FOLDER.0 != 0)
+            .and_then(|i| unsafe { i.GetAttributes(SFGAO_FOLDER | SFGAO_BROWSABLE) })
+            .map(|a| a.0 != 0)
             .unwrap_or(false)
     }
 
@@ -90,11 +92,40 @@ impl Pidl {
 
     /// Parses a path, a `shell:` name or a `search-ms:` URI.
     pub fn parse(name: &str) -> Option<Pidl> {
+        Self::parse_result(name).ok()
+    }
+
+    pub fn parse_result(name: &str) -> Result<Pidl> {
+        let root;
+        let name = if matches!(name.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic()) {
+            root = format!("{name}\\");
+            &root
+        } else {
+            name
+        };
         let w = shelldata::wide(name);
         let mut p = std::ptr::null_mut();
-        unsafe { SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut p, 0, None).ok()? };
-        Pidl::take(p)
+        unsafe { SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut p, 0, None)? };
+        Pidl::take(p).ok_or_else(windows_core::Error::empty)
     }
+}
+
+/// Folder links have an item of their own. Browse the target to avoid launching the folder verb.
+pub fn folder_target(item: &IShellItem) -> Option<Pidl> {
+    let flags = unsafe { item.GetAttributes(SFGAO_FOLDER | SFGAO_BROWSABLE | SFGAO_LINK).ok()? };
+    if (flags.0 & SFGAO_LINK.0) != 0 {
+        if let Ok(target) = unsafe { item.BindToHandler::<_, IShellItem>(None, &BHID_LinkTargetItem) } {
+            if let Some(pidl) = Pidl::of(&target).filter(Pidl::is_folder) {
+                return Some(pidl);
+            }
+        }
+    }
+    (flags.0 & (SFGAO_FOLDER | SFGAO_BROWSABLE).0 != 0).then(|| Pidl::of(item)).flatten()
+}
+
+pub fn single_selection(view: &IShellView) -> Option<IShellItem> {
+    let items: IShellItemArray = unsafe { view.GetItemObject(SVGIO_SELECTION).ok()? };
+    (unsafe { items.GetCount().ok()? } == 1).then(|| unsafe { items.GetItemAt(0).ok() }).flatten()
 }
 
 fn take_str(p: PWSTR) -> String {
@@ -146,12 +177,16 @@ pub fn home() -> Option<Pidl> {
 const CMIC_MASK_UNICODE: u32 = 0x4000;
 
 /// Invokes a canonical verb ("cut", "copy", "delete", "paste", "NewFolder", ...) on a context menu.
-pub fn invoke(menu: &IContextMenu, hwnd: HWND, verb: &str) -> Result<()> {
+pub fn invoke(menu: &IContextMenu, view: &IShellView, hwnd: HWND, verb: &str) -> Result<()> {
     let a: Vec<u8> = verb.bytes().chain(std::iter::once(0)).collect();
     let wv = shelldata::wide(verb);
     unsafe {
         let hmenu = CreatePopupMenu()?;
-        let _ = menu.QueryContextMenu(hmenu, 0, 1, 0x7fff, CMF_NORMAL);
+        let site = menu.cast::<IObjectWithSite>().ok();
+        if let Some(site) = &site {
+            let _ = site.SetSite(view);
+        }
+        let fill = menu.QueryContextMenu(hmenu, 0, 1, 0x7fff, CMF_NORMAL | CMF_CANRENAME);
         let info = CMINVOKECOMMANDINFOEX {
             cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
             fMask: CMIC_MASK_UNICODE,
@@ -162,25 +197,48 @@ pub fn invoke(menu: &IContextMenu, hwnd: HWND, verb: &str) -> Result<()> {
             ptInvoke: POINT::default(),
             ..Default::default()
         };
-        let r = menu.InvokeCommand(&info as *const _ as *const CMINVOKECOMMANDINFO);
+        let r = fill.ok().and_then(|()| menu.InvokeCommand(&info as *const _ as *const CMINVOKECOMMANDINFO));
         let _ = DestroyMenu(hmenu);
+        if let Some(site) = &site {
+            let _ = site.SetSite(None);
+        }
         r
     }
 }
 
-/// The context menu of the selected items of `view`, `None` when nothing is selected.
-pub fn selection_menu(view: &IFolderView2) -> Option<IContextMenu> {
+pub fn open_item(owner: HWND, item: &Pidl) -> Result<()> {
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_IDLIST,
+        hwnd: owner,
+        lpIDList: item.as_ptr().cast_mut().cast(),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info) }
+}
+
+pub fn new_folder(owner: HWND, folder: &IShellItem, name: &str) -> Result<()> {
     unsafe {
-        let items = view.GetSelection(false).ok()?;
-        if items.GetCount().ok()? == 0 {
-            return None;
+        let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
+        op.SetOwnerWindow(owner)?;
+        op.SetOperationFlags(FOF_RENAMEONCOLLISION | FOF_NOCONFIRMMKDIR)?;
+        op.NewItem(folder, FILE_ATTRIBUTE_DIRECTORY.0, &HSTRING::from(name), PCWSTR::null(), None::<&IFileOperationProgressSink>)?;
+        op.PerformOperations()?;
+        if op.GetAnyOperationsAborted()?.as_bool() {
+            return Err(windows::Win32::Foundation::E_ABORT.into());
         }
-        items.BindToHandler(None, &BHID_SFUIObject).ok()
+        Ok(())
     }
 }
 
+/// The context menu of the selected items of `view`, `None` when nothing is selected.
+pub fn selection_menu(view: &IShellView) -> Option<IContextMenu> {
+    unsafe { view.GetItemObject(SVGIO_SELECTION).ok() }
+}
+
 pub fn has_selection(view: &IFolderView2) -> bool {
-    unsafe { view.GetSelection(false).ok().and_then(|a| a.GetCount().ok()).unwrap_or(0) > 0 }
+    unsafe { view.ItemCount(SVGIO_SELECTION).unwrap_or(0) > 0 }
 }
 
 /// The folder background's context menu (paste, new folder).

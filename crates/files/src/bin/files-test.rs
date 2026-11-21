@@ -2,7 +2,8 @@
 //! Steps: `click|dclick|mclick|move:<x>,<y>` (screen pixels), `drag:<x1>,<y1>,<x2>,<y2>` (left
 //! button), `wait:<s>`, `select:<path>` (`SHOpenFolderAndSelectItems`, an app's "show in folder"),
 //! `exec:<path>` (`ShellExecuteEx` open, as the Run box does), `windows` (what the shell's window
-//! list reports for each window: its URL and its active view's folder). Results go to
+//! list reports for each window: its URL and its active view's folder), `frames` (visibility
+//! and DWM cloak state of Files windows), `maximize` (the foreground Files window). Results go to
 //! `files-test.log` beside the exe.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
@@ -106,8 +107,49 @@ mod win {
             "select" => select(rest),
             "exec" => exec(rest),
             "windows" => windows(),
+            "frames" => frames(),
+            "maximize" => maximize(),
             _ => "unknown step".into(),
         }
+    }
+
+    fn maximize() -> String {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            let mut class = [0u16; 64];
+            let len = GetClassNameW(hwnd, &mut class) as usize;
+            if String::from_utf16_lossy(&class[..len]) != "explorust.FilesWindow" {
+                return "Files does not have the foreground".into();
+            }
+            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+            "ok".into()
+        }
+    }
+
+    fn frames() -> String {
+        use windows::Win32::Foundation::{HWND, LPARAM};
+        use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+        use windows_core::BOOL;
+        unsafe extern "system" fn one(hwnd: HWND, data: LPARAM) -> BOOL {
+            unsafe {
+                let mut class = [0u16; 64];
+                let len = GetClassNameW(hwnd, &mut class) as usize;
+                if String::from_utf16_lossy(&class[..len]) != "explorust.FilesWindow" {
+                    return true.into();
+                }
+                let mut cloak = 0u32;
+                let result = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, (&mut cloak as *mut u32).cast(), 4);
+                let mut rect = Default::default();
+                let _ = GetWindowRect(hwnd, &mut rect);
+                let output = &mut *(data.0 as *mut Vec<String>);
+                output.push(format!("{:#x} visible={} cloak={cloak} {result:?} {rect:?}", hwnd.0 as usize, IsWindowVisible(hwnd).as_bool()));
+            }
+            true.into()
+        }
+
+        let mut output = Vec::<String>::new();
+        unsafe { let _ = EnumWindows(Some(one), LPARAM((&mut output as *mut Vec<String>) as isize)); }
+        output.join("; ")
     }
 
     fn select(path: &str) -> String {

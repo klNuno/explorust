@@ -1,47 +1,47 @@
-//! Geometry of the chrome (tab strip, navigation bar, command bar) at 100% scale, measured on
-//! his File Explorer by `crates/explorer-proto` (`.agents/explorer-result.md`), and what a point
-//! in it hits. Everything below `CHROME_H` belongs to Windows' own view.
+//! Geometry and hit targets of our chrome at 100% scale.
 
-pub const TABSTRIP_H: f32 = 40.0;
-pub const NAVBAR_BOTTOM: f32 = 80.0;
-pub const CMDBAR_BOTTOM: f32 = 135.0;
+pub const TABSTRIP_H: f32 = 44.0;
+pub const NAVBAR_BOTTOM: f32 = 92.0;
+pub const CMDBAR_BOTTOM: f32 = 139.0;
 /// Height of the chrome, the command bar's bottom line included.
-pub const CHROME_H: f32 = 136.0;
+pub const CHROME_H: f32 = CMDBAR_BOTTOM + 1.0;
+pub const STATUS_H: f32 = 30.0;
+pub const STATUS_DETAILS_FROM_RIGHT: f32 = 52.0;
+pub const STATUS_ICONS_FROM_RIGHT: f32 = 20.0;
 
-pub const TAB_X: f32 = 9.0;
+pub const TAB_X: f32 = 12.0;
 pub const TAB_Y: f32 = 8.0;
-pub const TAB_W: f32 = 237.0;
-pub const TAB_MIN_W: f32 = 100.0;
-pub const TAB_RADIUS: f32 = 8.0;
+pub const TAB_W: f32 = 212.0;
+pub const TAB_MIN_W: f32 = 108.0;
+pub const TAB_RADIUS: f32 = 7.0;
+pub const TAB_GAP: f32 = 4.0;
 pub const TAB_CY: f32 = 24.0;
 pub const TAB_ICON_DX: f32 = 8.0;
 pub const TAB_TEXT_DX: f32 = 34.0;
 pub const TAB_CLOSE_FROM_RIGHT: f32 = 17.5;
-pub const NEW_TAB_DX: f32 = 25.0;
+pub const NEW_TAB_DX: f32 = 22.0;
 /// Caption buttons, width and centers from the right edge: minimize, maximize, close.
 pub const CAPTION_W: f32 = 46.0;
 pub const CAPTION_CX: [f32; 3] = [115.0, 69.0, 23.0];
-pub const CAPTION_CY: f32 = 16.0;
+pub const CAPTION_CY: f32 = 20.0;
 
-pub const NAV_BTN_CX: [f32; 4] = [28.0, 76.0, 124.0, 172.0];
-pub const NAV_BTN_W: f32 = 40.0;
-pub const NAV_CY: f32 = 64.0;
-pub const BOX_TOP: f32 = 48.0;
+pub const NAV_BTN_CX: [f32; 4] = [28.0, 68.0, 108.0, 148.0];
+pub const NAV_BTN_W: f32 = 36.0;
+pub const NAV_CY: f32 = 68.0;
+pub const BOX_TOP: f32 = 52.0;
 pub const BOX_H: f32 = 32.0;
-pub const BOX_RADIUS: f32 = 4.0;
-/// Address box: left edge, inset of its right edge from the window's right edge.
-pub const ADDR: (f32, f32) = (202.0, 315.0);
-pub const ADDR_ICON_CX: f32 = 223.0;
-pub const CRUMB_FIRST_CHEVRON_CX: f32 = 253.0;
-pub const CRUMB_GAP: f32 = 21.0;
-/// Search box insets from the right edge: left, right.
-pub const SEARCH: (f32, f32) = (306.0, 12.0);
+pub const BOX_RADIUS: f32 = 6.0;
+pub const ADDR_X: f32 = 176.0;
+pub const ADDR_ICON_CX: f32 = 194.0;
+pub const CRUMB_FIRST_CHEVRON_CX: f32 = 218.0;
+pub const CRUMB_GAP: f32 = 17.0;
+pub const RIGHT_PAD: f32 = 12.0;
 pub const SEARCH_TEXT_PAD: f32 = 15.0;
 pub const SEARCH_GLYPH_FROM_RIGHT: f32 = 32.0;
 
-pub const CMD_CY: f32 = 112.0;
-pub const CMD_SEPS: [f32; 3] = [122.0, 414.0, 616.0];
-pub const CMD_BTN_W: f32 = 40.0;
+pub const CMD_CY: f32 = 116.0;
+pub const CMD_SEPS: [f32; 2] = [115.0, 320.0];
+pub const CMD_BTN_W: f32 = 34.0;
 pub const CMD_H: f32 = 32.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +51,6 @@ pub enum Cmd {
     Copy,
     Paste,
     Rename,
-    Share,
     Delete,
     Sort,
     View,
@@ -60,21 +59,20 @@ pub enum Cmd {
 }
 
 /// Icon buttons of the command bar: command, glyph, center x.
-pub const CMD_ICONS: [(Cmd, char, f32); 6] = [
-    (Cmd::Cut, '\u{E8C6}', 148.0),
-    (Cmd::Copy, '\u{E8C8}', 196.0),
-    (Cmd::Paste, '\u{E77F}', 243.0),
-    (Cmd::Rename, '\u{E8AC}', 291.0),
-    (Cmd::Share, '\u{E72D}', 339.0),
-    (Cmd::Delete, '\u{E74D}', 388.0),
+pub const CMD_ICONS: [(Cmd, char, f32); 5] = [
+    (Cmd::Cut, '\u{E8C6}', 140.0),
+    (Cmd::Copy, '\u{E8C8}', 178.0),
+    (Cmd::Paste, '\u{E77F}', 216.0),
+    (Cmd::Rename, '\u{E8AC}', 254.0),
+    (Cmd::Delete, '\u{E74D}', 292.0),
 ];
 /// Labelled buttons: command, glyph, glyph cx, label x, chevron cx, left, right.
 pub const CMD_LABELLED: [(Cmd, char, f32, f32, f32, f32, f32); 3] = [
-    (Cmd::New, '\u{ECC8}', 26.0, 43.0, 101.0, 8.0, 114.0),
-    (Cmd::Sort, '\u{E8CB}', 438.0, 455.0, 488.0, 422.0, 504.0),
-    (Cmd::View, '\u{E8FD}', 528.0, 544.0, 596.0, 512.0, 608.0),
+    (Cmd::New, '\u{E8F4}', 27.0, 44.0, 0.0, 10.0, 107.0),
+    (Cmd::Sort, '\u{E8CB}', 341.0, 358.0, 390.0, 324.0, 403.0),
+    (Cmd::View, '\u{E8FD}', 422.0, 439.0, 488.0, 405.0, 500.0),
 ];
-pub const CMD_MORE_CX: f32 = 641.0;
+pub const CMD_MORE_CX: f32 = 522.0;
 /// Details pane toggle, from the right edge: glyph cx, label x, left edge.
 pub const CMD_DETAILS: (f32, f32, f32) = (77.0, 61.0, 95.0);
 
@@ -88,6 +86,10 @@ pub enum Hit {
     Tab(usize),
     TabClose(usize),
     NewTab,
+    TabsBack,
+    TabsForward,
+    StatusDetails,
+    StatusIcons,
     Back,
     Forward,
     Up,
@@ -99,10 +101,65 @@ pub enum Hit {
     Cmd(Cmd),
 }
 
+pub fn status_hit(x: f32, w: f32) -> Hit {
+    if within(x, w - STATUS_DETAILS_FROM_RIGHT, 30.0) {
+        Hit::StatusDetails
+    } else if within(x, w - STATUS_ICONS_FROM_RIGHT, 30.0) {
+        Hit::StatusIcons
+    } else {
+        Hit::None
+    }
+}
+
 /// Width of each tab when `n` tabs share a window `w` wide, as Explorer shrinks them.
-pub fn tab_width(w: f32, n: usize) -> f32 {
-    let room = w - TAB_X - CAPTION_CX[0] - CAPTION_W / 2.0 - 2.0 * NEW_TAB_DX;
-    (room / n.max(1) as f32).clamp(TAB_MIN_W, TAB_W)
+pub struct TabStrip {
+    pub visible: std::ops::Range<usize>,
+    pub width: f32,
+    pub plus: f32,
+    pub left: Option<f32>,
+    pub right: Option<f32>,
+}
+
+pub fn tab_strip(w: f32, n: usize, active: usize) -> TabStrip {
+    let room = w - TAB_X - 3.0 * CAPTION_W - 2.0 * NEW_TAB_DX;
+    let overflow = n as f32 * TAB_MIN_W > room;
+    let room = room - if overflow { 64.0 } else { 0.0 };
+    let count = ((room / TAB_MIN_W) as usize).clamp(1, n.max(1));
+    let width = (room / count as f32).min(TAB_W);
+    let start = (active + 1).saturating_sub(count);
+    let end = (start + count).min(n);
+    let plus = TAB_X + (end - start) as f32 * width + NEW_TAB_DX;
+    TabStrip {
+        visible: start..end,
+        width,
+        plus,
+        left: (start > 0).then_some(plus + 30.0),
+        right: (end < n).then_some(plus + 60.0),
+    }
+}
+
+pub fn search_left(w: f32) -> f32 {
+    w - (w * 0.28).clamp(140.0, 292.0) - RIGHT_PAD
+}
+
+pub fn compact_commands(w: f32) -> bool {
+    w < 660.0
+}
+
+pub fn command_more_x(w: f32) -> f32 {
+    if compact_commands(w) { 425.0 } else { CMD_MORE_CX }
+}
+
+pub fn label_bounds(w: f32, cmd: Cmd, center: f32, left: f32, right: f32) -> (f32, f32, f32) {
+    if compact_commands(w) {
+        match cmd {
+            Cmd::Sort => (342.0, 325.0, 359.0),
+            Cmd::View => (384.0, 367.0, 401.0),
+            _ => (center, left, right),
+        }
+    } else {
+        (center, left, right)
+    }
 }
 
 fn within(v: f32, center: f32, width: f32) -> bool {
@@ -111,7 +168,7 @@ fn within(v: f32, center: f32, width: f32) -> bool {
 
 /// What the point (x, y) hits in a window `w` wide with `tabs` tabs; `crumbs` are the x spans of
 /// the breadcrumb's items as last drawn.
-pub fn hit(x: f32, y: f32, w: f32, tabs: usize, crumbs: &[(f32, f32)]) -> Hit {
+pub fn hit(x: f32, y: f32, w: f32, tabs: usize, active: usize, crumbs: &[(f32, f32)]) -> Hit {
     if x < 0.0 || y < 0.0 || x >= w || y >= CHROME_H {
         return Hit::None;
     }
@@ -121,24 +178,29 @@ pub fn hit(x: f32, y: f32, w: f32, tabs: usize, crumbs: &[(f32, f32)]) -> Hit {
                 return h;
             }
         }
-        let tw = tab_width(w, tabs);
-        if y >= TAB_Y {
-            for i in 0..tabs {
-                let x0 = TAB_X + i as f32 * tw;
-                if x >= x0 && x < x0 + tw {
-                    let close = x0 + tw - TAB_CLOSE_FROM_RIGHT;
+        let strip = tab_strip(w, tabs, active);
+        if y >= TAB_Y && y < TABSTRIP_H - 4.0 {
+            for (slot, i) in strip.visible.enumerate() {
+                let x0 = TAB_X + slot as f32 * strip.width;
+                if x >= x0 && x < x0 + strip.width - TAB_GAP {
+                    let close = x0 + strip.width - TAB_GAP - TAB_CLOSE_FROM_RIGHT;
                     return if within(x, close, 24.0) { Hit::TabClose(i) } else { Hit::Tab(i) };
                 }
             }
-            let plus = TAB_X + tabs as f32 * tw + NEW_TAB_DX;
-            if within(x, plus, 36.0) {
+            if within(x, strip.plus, 32.0) {
                 return Hit::NewTab;
+            }
+            if strip.left.is_some_and(|x0| within(x, x0, 28.0)) {
+                return Hit::TabsBack;
+            }
+            if strip.right.is_some_and(|x0| within(x, x0, 28.0)) {
+                return Hit::TabsForward;
             }
         }
         return Hit::Caption;
     }
     if y < NAVBAR_BOTTOM {
-        if y < BOX_TOP - 4.0 {
+        if y < BOX_TOP || y >= BOX_TOP + BOX_H {
             return Hit::None;
         }
         for (i, h) in [Hit::Back, Hit::Forward, Hit::Up, Hit::Refresh].into_iter().enumerate() {
@@ -146,13 +208,14 @@ pub fn hit(x: f32, y: f32, w: f32, tabs: usize, crumbs: &[(f32, f32)]) -> Hit {
                 return h;
             }
         }
-        if x >= ADDR.0 && x < w - ADDR.1 {
+        let search = search_left(w);
+        if x >= ADDR_X && x < search - 8.0 {
             if let Some(i) = crumbs.iter().position(|&(a, b)| x >= a && x < b) {
                 return Hit::Crumb(i);
             }
             return Hit::Address;
         }
-        if x >= w - SEARCH.0 && x < w - SEARCH.1 {
+        if x >= search && x < w - RIGHT_PAD {
             return Hit::Search;
         }
         return Hit::None;
@@ -165,15 +228,17 @@ pub fn hit(x: f32, y: f32, w: f32, tabs: usize, crumbs: &[(f32, f32)]) -> Hit {
             return Hit::Cmd(c);
         }
     }
-    for (c, _, _, _, _, l, r) in CMD_LABELLED {
+    for (c, _, cx, _, _, l, r) in CMD_LABELLED {
+        let (_, l, r) = label_bounds(w, c, cx, l, r);
         if x >= l && x < r {
             return Hit::Cmd(c);
         }
     }
-    if within(x, CMD_MORE_CX, CMD_BTN_W) {
+    if within(x, command_more_x(w), CMD_BTN_W) {
         return Hit::Cmd(Cmd::More);
     }
-    if x >= w - CMD_DETAILS.2 && x < w - 8.0 {
+    let details_width = if compact_commands(w) { 40.0 } else { CMD_DETAILS.2 };
+    if x >= w - details_width && x < w - 8.0 {
         return Hit::Cmd(Cmd::Details);
     }
     Hit::None
@@ -205,46 +270,56 @@ mod tests {
 
     #[test]
     fn caption_buttons() {
-        assert_eq!(hit(W - 23.0, 16.0, W, 1, &[]), Hit::Close);
-        assert_eq!(hit(W - 69.0, 10.0, W, 1, &[]), Hit::Max);
-        assert_eq!(hit(W - 115.0, 2.0, W, 1, &[]), Hit::Min);
-        assert_eq!(hit(700.0, 20.0, W, 1, &[]), Hit::Caption);
+        assert_eq!(hit(W - 23.0, 16.0, W, 1, 0, &[]), Hit::Close);
+        assert_eq!(hit(W - 69.0, 10.0, W, 1, 0, &[]), Hit::Max);
+        assert_eq!(hit(W - 115.0, 2.0, W, 1, 0, &[]), Hit::Min);
+        assert_eq!(hit(700.0, 20.0, W, 1, 0, &[]), Hit::Caption);
     }
 
     #[test]
     fn tabs_and_new_tab() {
-        assert_eq!(hit(100.0, 24.0, W, 1, &[]), Hit::Tab(0));
-        assert_eq!(hit(228.5, 24.0, W, 1, &[]), Hit::TabClose(0));
-        assert_eq!(hit(271.0, 24.0, W, 1, &[]), Hit::NewTab);
-        assert_eq!(hit(300.0, 24.0, W, 2, &[]), Hit::Tab(1));
-        assert_eq!(hit(100.0, 4.0, W, 1, &[]), Hit::Caption);
+        assert_eq!(hit(100.0, 24.0, W, 1, 0, &[]), Hit::Tab(0));
+        assert_eq!(hit(202.5, 24.0, W, 1, 0, &[]), Hit::TabClose(0));
+        assert_eq!(hit(246.0, 24.0, W, 1, 0, &[]), Hit::NewTab);
+        assert_eq!(hit(300.0, 24.0, W, 2, 0, &[]), Hit::Tab(1));
+        assert_eq!(hit(100.0, 4.0, W, 1, 0, &[]), Hit::Caption);
     }
 
     #[test]
     fn tabs_shrink_but_not_below_the_minimum() {
-        assert_eq!(tab_width(W, 1), TAB_W);
-        assert!(tab_width(W, 6) < TAB_W);
-        assert_eq!(tab_width(W, 40), TAB_MIN_W);
+        assert_eq!(tab_strip(W, 1, 0).width, TAB_W);
+        assert!(tab_strip(W, 6, 0).width < TAB_W);
+        assert!(tab_strip(W, 40, 0).width >= TAB_MIN_W);
+    }
+
+    #[test]
+    fn tab_strip_keeps_new_tab_clear_of_caption_at_any_tab_count() {
+        let w = 520.0;
+        let tabs = 40;
+        let strip = tab_strip(w, tabs, tabs - 1);
+        assert!(strip.visible.contains(&(tabs - 1)));
+        assert!(strip.plus + 16.0 < w - 3.0 * CAPTION_W);
+        assert_eq!(hit(strip.plus, TAB_CY, w, tabs, tabs - 1, &[]), Hit::NewTab);
     }
 
     #[test]
     fn nav_bar() {
-        assert_eq!(hit(28.0, 64.0, W, 1, &[]), Hit::Back);
-        assert_eq!(hit(172.0, 64.0, W, 1, &[]), Hit::Refresh);
-        assert_eq!(hit(300.0, 64.0, W, 1, &[(264.0, 320.0)]), Hit::Crumb(0));
-        assert_eq!(hit(600.0, 64.0, W, 1, &[(264.0, 320.0)]), Hit::Address);
-        assert_eq!(hit(W - 100.0, 64.0, W, 1, &[]), Hit::Search);
+        assert_eq!(hit(28.0, 64.0, W, 1, 0, &[]), Hit::Back);
+        assert_eq!(hit(148.0, 68.0, W, 1, 0, &[]), Hit::Refresh);
+        assert_eq!(hit(300.0, 64.0, W, 1, 0, &[(264.0, 320.0)]), Hit::Crumb(0));
+        assert_eq!(hit(600.0, 64.0, W, 1, 0, &[(264.0, 320.0)]), Hit::Address);
+        assert_eq!(hit(W - 100.0, 64.0, W, 1, 0, &[]), Hit::Search);
     }
 
     #[test]
     fn command_bar() {
-        assert_eq!(hit(148.0, 112.0, W, 1, &[]), Hit::Cmd(Cmd::Cut));
-        assert_eq!(hit(388.0, 112.0, W, 1, &[]), Hit::Cmd(Cmd::Delete));
-        assert_eq!(hit(450.0, 112.0, W, 1, &[]), Hit::Cmd(Cmd::Sort));
-        assert_eq!(hit(560.0, 112.0, W, 1, &[]), Hit::Cmd(Cmd::View));
-        assert_eq!(hit(W - 60.0, 112.0, W, 1, &[]), Hit::Cmd(Cmd::Details));
-        assert_eq!(hit(800.0, 112.0, W, 1, &[]), Hit::None);
-        assert_eq!(hit(800.0, 200.0, W, 1, &[]), Hit::None);
+        assert_eq!(hit(148.0, 112.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Cut));
+        assert_eq!(hit(292.0, 116.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Delete));
+        assert_eq!(hit(375.0, 116.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Sort));
+        assert_eq!(hit(460.0, 116.0, W, 1, 0, &[]), Hit::Cmd(Cmd::View));
+        assert_eq!(hit(W - 60.0, 112.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Details));
+        assert_eq!(hit(800.0, 112.0, W, 1, 0, &[]), Hit::None);
+        assert_eq!(hit(800.0, 200.0, W, 1, 0, &[]), Hit::None);
     }
 
     #[test]
