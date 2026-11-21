@@ -6,7 +6,7 @@
 use super::actions::{self, Launch};
 use super::scene::{RightView, Scene, Slot};
 use super::side::{self, Asks, Ctx, Side};
-use super::{jumplist, menu, popup, settings, trayhost, winx};
+use super::{context, jumplist, menu, popup, settings, trayhost, winx};
 use super::taskband::{self as band, Taskband};
 use crate::settings::{self as S, Settings};
 use super::thumbs::ThumbFlyout;
@@ -84,6 +84,7 @@ enum Effect {
     WinX,
     /// The jump list of slot n.
     JumpList(usize),
+    Context(context::Kind, i32, i32),
 }
 
 struct Bar {
@@ -280,7 +281,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             }
         }
         let t0 = Instant::now();
-        let pins = items::taskbar_pins();
+        let pins = items::resolved_taskbar_pins();
         let mut model = Model::default();
         model.pins = pins.iter().map(|p| p.key.clone()).collect();
         let mut exes = HashMap::new();
@@ -476,6 +477,10 @@ fn run_effect(e: Effect) {
                 let _ = with_bar(|b| b.jump_pick(i, p, &recent));
             }
         }
+        Effect::Context(kind, x, y) => {
+            with_bar(|b| b.close_thumbs());
+            context::show(hwnd, x, y, kind);
+        }
         Effect::Quit => {
             teardown();
             // SAFETY: ends this thread's loop.
@@ -600,6 +605,9 @@ impl Bar {
         if let Some(t) = a.topmost {
             self.effects.push(Effect::Topmost(t));
         }
+        if let Some((kind, x, y)) = a.menu {
+            self.effects.push(Effect::Context(kind, x, y));
+        }
     }
 
     /// Lays the right side out for the current clock and icons, and loads new tray icon images.
@@ -622,7 +630,7 @@ impl Bar {
         let k = self.scale();
         let x = (lp.0 & 0xffff) as i16 as f32 / k;
         let y = (lp.0 >> 16 & 0xffff) as i16 as f32 / k;
-        self.side.layout.hit(x, y)
+        (0.0..G::BAR_H).contains(&y).then(|| self.side.layout.hit(x, y)).flatten()
     }
 
     fn paint(&mut self) {
@@ -1288,6 +1296,11 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
                     b.effects.push(if i == 0 { Effect::WinX } else { Effect::JumpList(i) });
                     return LRESULT(0);
                 }
+                let wr = b.window_rect();
+                let x = wr.left + (lp.0 & 0xffff) as i16 as i32;
+                if (wr.left..wr.right).contains(&x) && (0..wr.bottom - wr.top).contains(&((lp.0 >> 16) as i16 as i32)) {
+                    b.effects.push(Effect::Context(context::Kind::Taskbar, x, wr.top));
+                }
             }
             let (hw, m, k) = b.ctx();
             let cx = Ctx { hwnd: hw, monitor: m, scale: k, theme: &b.theme };
@@ -1523,7 +1536,10 @@ fn popup_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT
             let (x, y) = ((lp.0 & 0xffff) as i16 as i32, (lp.0 >> 16 & 0xffff) as i16 as i32);
             with_bar(|b| {
                 if b.side.is_flyout(hwnd) {
-                    b.side.flyout_mouse(msg, x, y, &b.theme);
+                    if let Some((sx, _)) = b.side.flyout_mouse(msg, x, y, &b.theme) {
+                        let y = b.window_rect().top;
+                        b.effects.push(Effect::Context(context::Kind::Explorust, sx, y));
+                    }
                 }
                 LRESULT(0)
             })

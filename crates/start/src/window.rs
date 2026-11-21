@@ -23,12 +23,13 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, INPUT, INPUT_MOUSE, SendInput, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_APPS, VK_BACK, VK_DOWN, VK_ESCAPE, VK_LEFT,
+    GetKeyState, INPUT, INPUT_MOUSE, ReleaseCapture, SendInput, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_APPS, VK_DOWN, VK_ESCAPE, VK_LEFT,
     VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_core::{HSTRING, PCWSTR, PWSTR, w};
 
+mod field;
 mod search;
 
 const WM_LOADED: u32 = WM_APP + 1;
@@ -101,7 +102,7 @@ fn create() -> windows_core::Result<()> {
         let cursor = LoadCursorW(None, IDC_ARROW)?;
         let wc = WNDCLASSW { lpfnWndProc: Some(cmd_proc), hInstance: inst.into(), lpszClassName: PCWSTR(cmd_class.as_ptr()), ..Default::default() };
         RegisterClassW(&wc);
-        let wc = WNDCLASSW { lpfnWndProc: Some(menu_proc), hInstance: inst.into(), lpszClassName: MENU_CLASS, hCursor: cursor, ..Default::default() };
+        let wc = WNDCLASSW { style: CS_DBLCLKS, lpfnWndProc: Some(menu_proc), hInstance: inst.into(), lpszClassName: MENU_CLASS, hCursor: cursor, ..Default::default() };
         RegisterClassW(&wc);
         let cmd = CreateWindowExW(WINDOW_EX_STYLE(0), &cmd_class, w!(""), WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(inst.into()), None)?;
         bus::listen(cmd);
@@ -270,12 +271,14 @@ fn toggle(search: bool, msg_time: i32) {
 
 fn open(search: bool, msg_time: i32) {
     let t0 = Instant::now();
+    search::reset_input();
     // SAFETY: tick count and window queries.
     let (queued, prev) = unsafe { ((GetTickCount() as i32).wrapping_sub(msg_time), GetForegroundWindow()) };
     let Some((hwnd, scale, drew)) = with(|s| {
         s.reset();
         if search {
             s.search_focus = true;
+            s.focus = Hit::Search;
             s.dirty = true;
         }
         let drew = s.dirty;
@@ -336,6 +339,7 @@ fn hide(restore: bool, why: &str) {
         return;
     };
     let hwnd = menu_hwnd();
+    end_search_drag();
     cloak(hwnd, true);
     // SAFETY: hands the foreground back to the window that had it, when we still hold it. On a
     // helper thread: in g1 the call never returned for a UWP frame (ApplicationFrameWindow) and
@@ -408,6 +412,15 @@ fn click(x: f32, y: f32) {
     if let Some(hit) = with(|s| s.hit(x, y)) {
         activate(hit);
     }
+}
+
+fn end_search_drag() -> bool {
+    if with(|s| std::mem::take(&mut s.search_drag)) != Some(true) {
+        return false;
+    }
+    // SAFETY: releases this thread's capture after dropping the state borrow.
+    let _ = unsafe { ReleaseCapture() };
+    true
 }
 
 fn activate(hit: Hit) {
@@ -571,6 +584,9 @@ fn context_on(hit: Hit, x: f32, y: f32) {
 }
 
 fn key(vk: u16) {
+    if field::key(vk) {
+        return;
+    }
     enum Act {
         None,
         Hide,
@@ -578,7 +594,6 @@ fn key(vk: u16) {
         Context(Hit),
         Search(usize),
         SearchContext,
-        Back,
     }
     let act = with(|s| {
         if !s.shown {
@@ -614,7 +629,6 @@ fn key(vk: u16) {
                 s.move_selection(if v == VK_DOWN.0 { 1 } else { -1 });
                 Act::None
             }
-            v if v == VK_BACK.0 && !s.query.is_empty() => Act::Back,
             v if v == VK_NEXT.0 && s.view == View::Main => {
                 s.page = (s.page + 1).min(s.pages() - 1);
                 s.dirty = true;
@@ -636,7 +650,6 @@ fn key(vk: u16) {
                 search::context(i, b.x + 40.0, b.y + b.h / 2.0);
             }
         }
-        Some(Act::Back) => search::backspace(),
         Some(Act::Activate(h)) => activate(h),
         Some(Act::Context(h)) => {
             if let Some(b) = with(|s| s.box_of(h)).flatten() {
@@ -743,16 +756,40 @@ unsafe extern "system" fn menu_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
             return LRESULT(0);
         }
         WM_CHAR => {
-            search::ch(wp.0 as u32);
+            search::ch(wp.0 as u16);
+            return LRESULT(0);
+        }
+        WM_DWMCOLORIZATIONCOLORCHANGED => {
+            with(|s| s.refresh_accent());
+            if with(|s| s.shown) == Some(true) {
+                redraw();
+            }
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            let (x, y) = dips(lp, scale);
+            if field::press(x, y, msg == WM_LBUTTONDBLCLK) {
+                if msg == WM_LBUTTONDOWN {
+                    // SAFETY: capture our own window to follow a selection outside the field.
+                    unsafe { SetCapture(h) };
+                }
+                return LRESULT(0);
+            }
+        }
+        WM_CAPTURECHANGED => {
+            with(|s| s.search_drag = false);
             return LRESULT(0);
         }
         WM_MOUSEMOVE => {
+            let (x, y) = dips(lp, scale);
+            if field::drag(x) {
+                return LRESULT(0);
+            }
             if !TRACKING.with(|t| t.replace(true)) {
                 let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
                 // SAFETY: asks for WM_MOUSELEAVE on our window.
                 let _ = unsafe { TrackMouseEvent(&mut tme) };
             }
-            hover(Some(dips(lp, scale)));
+            hover(Some((x, y)));
             return LRESULT(0);
         }
         WM_MOUSELEAVE => {
@@ -762,6 +799,10 @@ unsafe extern "system" fn menu_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
         }
         WM_LBUTTONUP => {
             let (x, y) = dips(lp, scale);
+            field::drag(x);
+            if end_search_drag() {
+                return LRESULT(0);
+            }
             click(x, y);
             return LRESULT(0);
         }

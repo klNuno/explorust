@@ -34,6 +34,19 @@ fn valid_pidl(p: &[u8]) -> bool {
     false
 }
 
+/// File name of the shortcut represented by a filesystem pin.
+pub fn shortcut_name(name: &str) -> Option<&str> {
+    const EXT: &str = ".lnk";
+    if name.get(name.len().checked_sub(EXT.len())?..)?.eq_ignore_ascii_case(EXT) {
+        return Some(name);
+    }
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".tmp")?;
+    let (original, suffix) = stem.rsplit_once("~rf")?;
+    (original.ends_with(EXT) && !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| &name[..original.len()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +81,14 @@ mod tests {
         assert_eq!(pin_pidls(&blob).len(), 1);
         assert!(pin_pidls(&[]).is_empty());
         assert!(pin_pidls(&[0, 2, 0, 0, 0, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn safe_save_pin_points_to_the_original_shortcut() {
+        assert_eq!(shortcut_name("Mullvad Browser.lnk~RF21949e.TMP"), Some("Mullvad Browser.lnk"));
+        assert_eq!(shortcut_name("Accshift.LNK"), Some("Accshift.LNK"));
+        assert_eq!(shortcut_name("Tombstones"), None);
+        assert_eq!(shortcut_name("random.TMP"), None);
+        assert_eq!(shortcut_name("brouillon.lnk~RFnotes.TMP"), None);
     }
 }

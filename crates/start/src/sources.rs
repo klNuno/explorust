@@ -6,8 +6,8 @@ use crate::settings::{self, RawSetting};
 use crate::{log, search};
 use std::path::PathBuf;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
-use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, SHLoadIndirectString, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows_core::{HSTRING, PCWSTR};
@@ -137,7 +137,9 @@ pub fn shell_execute(file: &str, verb: Option<&str>, params: Option<&str>) -> Re
     unsafe { ShellExecuteExW(&mut sei) }.map_err(|e| format!("ShellExecuteEx: {e}"))
 }
 
-/// Puts text on the clipboard (the calculator's result).
+const CF_UNICODETEXT: u32 = 13;
+
+/// Puts text on the clipboard.
 pub fn copy_text(owner: HWND, text: &str) -> bool {
     let w: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
     // SAFETY: the clipboard owns the global memory once SetClipboardData succeeds.
@@ -152,7 +154,7 @@ pub fn copy_text(owner: HWND, text: &str) -> bool {
             if !p.is_null() {
                 std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
                 let _ = GlobalUnlock(g);
-                ok = SetClipboardData(13, Some(HANDLE(g.0))).is_ok(); // CF_UNICODETEXT
+                ok = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(g.0))).is_ok();
             }
             if !ok {
                 let _ = GlobalFree(Some(HGLOBAL(g.0)));
@@ -160,5 +162,27 @@ pub fn copy_text(owner: HWND, text: &str) -> bool {
         }
         let _ = CloseClipboard();
         ok
+    }
+}
+
+/// Reads the clipboard's Unicode text, bounded by the actual allocation.
+pub fn clipboard_text(owner: HWND) -> Option<String> {
+    // SAFETY: we own the clipboard open until CloseClipboard, and read only the locked allocation.
+    unsafe {
+        OpenClipboard(Some(owner)).ok()?;
+        let text = GetClipboardData(CF_UNICODETEXT).ok().and_then(|handle| {
+            let handle = HGLOBAL(handle.0);
+            let ptr = GlobalLock(handle).cast::<u16>();
+            if ptr.is_null() {
+                return None;
+            }
+            let units = std::slice::from_raw_parts(ptr, GlobalSize(handle) / size_of::<u16>());
+            let count = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+            let text = String::from_utf16_lossy(&units[..count]);
+            let _ = GlobalUnlock(handle);
+            Some(text)
+        });
+        let _ = CloseClipboard();
+        text
     }
 }

@@ -1,7 +1,6 @@
 //! What a button does to windows and apps: activate, minimize, launch through the shell.
 
-use super::log;
-use shelldata::wide;
+use super::{log, winx};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -12,7 +11,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, PostMessageW, SC_MINIMIZE, SC_RESTORE,
     SW_SHOWNORMAL, SetForegroundWindow, SwitchToThisWindow, WM_SYSCOMMAND,
 };
-use windows_core::{PCWSTR, w};
 
 /// How to start an app.
 #[derive(Clone, Debug)]
@@ -23,6 +21,8 @@ pub enum Launch {
     Aumid(String),
     /// An exe path.
     Path(String),
+    /// An exe path with a fixed command-line argument.
+    Command(String, &'static str),
 }
 
 /// Starts the app on a short-lived STA thread, so a slow shell verb never blocks the bar.
@@ -50,18 +50,8 @@ unsafe fn run_launch(what: &Launch) -> bool {
                 CoTaskMemFree(Some(pidl as _));
                 ok
             }
-            Launch::Path(path) => {
-                let f = wide(path);
-                let mut sei = SHELLEXECUTEINFOW {
-                    cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-                    fMask: SEE_MASK_FLAG_NO_UI,
-                    lpVerb: w!("open"),
-                    lpFile: PCWSTR(f.as_ptr()),
-                    nShow: SW_SHOWNORMAL.0,
-                    ..Default::default()
-                };
-                ShellExecuteExW(&mut sei).is_ok()
-            }
+            Launch::Path(path) => winx::open(path, None, None),
+            Launch::Command(path, arg) => winx::open(path, None, Some(arg)),
         }
     }
 }

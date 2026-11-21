@@ -3,6 +3,7 @@
 mod actions;
 mod appbars;
 mod bar;
+mod context;
 mod jumplist;
 mod log;
 mod menu;

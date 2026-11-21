@@ -17,9 +17,10 @@ use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::Win32::UI::Shell::{
     FOLDERID_AppsFolder, IShellItem, IShellItem2, KF_FLAG_DEFAULT, SHCreateItemFromIDList, SHCreateItemInKnownFolder,
-    SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
+    SHParseDisplayName, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_FILESYSPATH, SIGDN_NORMALDISPLAY,
 };
 use windows_core::{PCWSTR, PWSTR};
+use std::{collections::HashSet, path::Path};
 
 /// A taskbar pin: its identity, display name, PIDL (to launch it) and shell item (for its icon).
 pub struct PinItem {
@@ -44,6 +45,74 @@ pub fn taskbar_pins() -> Vec<PinItem> {
             Some(PinItem { key, name, pidl, item })
         })
         .collect()
+}
+
+/// Resolves taskband pins in registry order. The shortcut directory supplies the backing
+/// files for filesystem PIDLs. Its contents alone cannot distinguish pins from leftovers.
+pub fn resolved_taskbar_pins() -> Vec<PinItem> {
+    resolved_taskbar_pins_from_blob(&taskband_blob())
+}
+
+pub fn resolved_taskbar_pins_from_blob(blob: &[u8]) -> Vec<PinItem> {
+    let mut seen = HashSet::new();
+    crate::taskband::pin_pidls(blob).into_iter()
+        .filter_map(resolve_pin)
+        .filter(|pin| seen.insert(pin.key.clone()))
+        .collect()
+}
+
+fn resolve_pin(mut pidl: Vec<u8>) -> Option<PinItem> {
+    // SAFETY: pin_pidls supplies validated ITEMIDLIST buffers.
+    let mut item: IShellItem2 = unsafe { SHCreateItemFromIDList(pidl.as_ptr().cast()) }.ok()?;
+    // An AppsFolder PIDL has no filesystem path and stays in its original namespace.
+    // The parsing-name fallback catches a stale filesystem PIDL even if SIGDN_FILESYSPATH fails.
+    let path = take(unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) })
+        .or_else(|| take(unsafe { item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) }))
+        .filter(|path| Path::new(path).is_absolute());
+    if let Some(path) = path.as_deref() {
+        let path = Path::new(path);
+        let name = path.file_name()?.to_str()?;
+        let original = crate::taskband::shortcut_name(name)?;
+        let shortcut = path.with_file_name(original);
+        if !shortcut.is_file() {
+            return None;
+        }
+        if original != name {
+            // Reparse the actual link so identity, image and launch all use the same item.
+            pidl = parse_pidl(shortcut.to_str()?)?;
+            item = unsafe { SHCreateItemFromIDList(pidl.as_ptr().cast()) }.ok()?;
+        }
+    }
+    if let Some(target) = take(unsafe { item.GetString(&PKEY_Link_TargetParsingPath) }) {
+        let target = Path::new(&target);
+        // A virtual or advertised target can be valid without a regular file. Access-denied
+        // paths (including WindowsApps) likewise do not establish that a target is missing.
+        if target.is_absolute() && matches!(target.metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+            let id = take(unsafe { item.GetString(&PKEY_AppUserModel_ID) });
+            if id.as_deref().and_then(apps_folder_item).is_none() {
+                return None;
+            }
+        }
+    }
+    let key = item_key(&item)?;
+    let name = take(unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) })?;
+    let item = windows_core::Interface::cast(&item).ok()?;
+    Some(PinItem { key, name, pidl, item })
+}
+
+fn parse_pidl(path: &str) -> Option<Vec<u8>> {
+    use windows::Win32::UI::Shell::ILGetSize;
+    let path = wide(path);
+    let mut pidl = std::ptr::null_mut();
+    // SAFETY: the shell returns a CoTaskMemAlloc PIDL. Copy it before releasing it.
+    unsafe {
+        SHParseDisplayName(PCWSTR(path.as_ptr()), None, &mut pidl, 0, None).ok()?;
+        let bytes = (!pidl.is_null()).then(|| {
+            std::slice::from_raw_parts(pidl.cast::<u8>(), ILGetSize(Some(pidl)) as usize).to_vec()
+        });
+        CoTaskMemFree(Some(pidl.cast()));
+        bytes
+    }
 }
 
 /// The identity a pin is matched on (lowercase).

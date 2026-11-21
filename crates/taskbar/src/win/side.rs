@@ -4,7 +4,7 @@
 //! hands it its mouse events, WM_COPYDATA and status messages.
 
 use super::appbars::{AppBarHost, to_rect};
-use super::log;
+use super::{context, log};
 use super::popup::{self, Flyout, Popup};
 use super::status::{Status, Watch};
 use super::trayhost::{self, TrayHost};
@@ -30,6 +30,7 @@ pub struct Asks {
     pub work_area: bool,
     pub post: Option<bus::Command>,
     pub topmost: Option<bool>,
+    pub menu: Option<(context::Kind, i32, i32)>,
 }
 
 pub struct Side {
@@ -45,6 +46,7 @@ pub struct Side {
     tip: Option<Popup>,
     /// The tray icon told NIN_POPUPOPEN, to tell it NIN_POPUPCLOSE.
     popup_open: Option<usize>,
+    logo: Option<context::Logo>,
 }
 
 /// Where the bar is, for the side's coordinates.
@@ -74,8 +76,16 @@ impl Side {
         let watch = Watch::new(hwnd, status_msg);
         let status = watch.read();
         log::line(&format!("status: {status:?}"));
+        let mut tray = TrayHost::new();
+        let logo = context::Logo::new();
+        if let Some(logo) = &logo {
+            let _ = tray.tray.apply(&logo.registration(hwnd), false);
+            log::line("explorust tray icon registered in the overflow");
+        } else {
+            log::line("explorust tray icon could not be loaded");
+        }
         Side {
-            tray: TrayHost::new(),
+            tray,
             appbars: AppBarHost::new(),
             watch: Some(watch),
             status,
@@ -86,6 +96,7 @@ impl Side {
             flyout_closed: None,
             tip: None,
             popup_open: None,
+            logo,
         }
     }
 
@@ -178,6 +189,10 @@ impl Side {
         }
     }
 
+    fn is_logo(&self, index: usize) -> bool {
+        self.logo.as_ref().is_some_and(|logo| logo.matches(self.tray.tray.icons[index].hicon))
+    }
+
     fn cursor() -> (i32, i32) {
         let mut p = windows::Win32::Foundation::POINT::default();
         // SAFETY: reads the cursor position.
@@ -259,10 +274,21 @@ impl Side {
         }
         if let Some(i) = self.icon_at(hit) {
             let (x, y) = Self::cursor();
-            trayhost::forward(&self.tray.tray.icons[i], if right_button { Event::RightUp } else { Event::LeftUp }, x, y);
+            if self.is_logo(i) {
+                a.menu = Some((context::Kind::Explorust, x, cx.bar_rect().top));
+            } else {
+                trayhost::forward(&self.tray.tray.icons[i], if right_button { Event::RightUp } else { Event::LeftUp }, x, y);
+            }
             return a;
         }
         if right_button {
+            let kind = match hit {
+                Some(Hit::Clock) => context::Kind::Clock,
+                Some(Hit::QuickSettings) => context::Kind::QuickSettings,
+                Some(Hit::ShowDesktop) => context::Kind::ShowDesktop,
+                _ => context::Kind::Taskbar,
+            };
+            a.menu = Some((kind, Self::cursor().0, cx.bar_rect().top));
             return a;
         }
         match hit {
@@ -341,17 +367,17 @@ impl Side {
         }
     }
 
-    /// Mouse input in the flyout (client px); returns true when it closed.
-    pub fn flyout_mouse(&mut self, msg: u32, x: i32, y: i32, theme: &Theme) -> bool {
+    /// Mouse input in the flyout (client px); returns the anchor of the explorust menu.
+    pub fn flyout_mouse(&mut self, msg: u32, x: i32, y: i32, theme: &Theme) -> Option<(i32, i32)> {
         use windows::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP};
-        let Some(f) = self.flyout.as_mut() else { return false };
+        let f = self.flyout.as_mut()?;
         let cell = f.hit(x, y);
         let Some(i) = cell.and_then(|c| f.icons.get(c).copied()) else {
             if f.hover.take().is_some() {
                 let h: Vec<isize> = f.icons.iter().map(|&i| self.tray.tray.icons[i].hicon).collect();
                 f.draw(theme, &h);
             }
-            return false;
+            return None;
         };
         let (sx, sy) = f.cell_center(cell.unwrap_or(0));
         let icon = self.tray.tray.icons[i].clone();
@@ -368,17 +394,20 @@ impl Side {
             WM_LBUTTONUP => Event::LeftUp,
             WM_RBUTTONDOWN => Event::RightDown,
             WM_RBUTTONUP => Event::RightUp,
-            _ => return false,
+            _ => return None,
         };
+        if self.is_logo(i) && matches!(ev, Event::LeftUp | Event::RightUp) {
+            self.close_flyout();
+            return Some((sx, sy));
+        }
         trayhost::forward(&icon, ev, sx, sy);
         if matches!(ev, Event::LeftUp | Event::RightUp) {
             log::line(&format!("flyout click {ev:?} on {:#x}/{}", icon.hwnd, icon.uid));
             if ev == Event::LeftUp {
                 self.close_flyout();
-                return true;
             }
         }
-        false
+        None
     }
 
     /// The foreground changed: tell the AppBars whether a window now covers the monitor.

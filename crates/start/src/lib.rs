@@ -13,6 +13,9 @@ pub mod search;
 pub mod settings;
 pub mod strings;
 
+#[cfg(any(target_os = "windows", test))]
+mod edit;
+
 #[cfg(target_os = "windows")]
 mod apps;
 #[cfg(target_os = "windows")]

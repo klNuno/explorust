@@ -80,7 +80,7 @@ fn run(act: Act) {
     unsafe { CoUninitialize() };
 }
 
-fn open(file: &str, verb: Option<&str>, args: Option<&str>) -> bool {
+pub(super) fn open(file: &str, verb: Option<&str>, args: Option<&str>) -> bool {
     let f = HSTRING::from(file);
     let v = verb.map(HSTRING::from);
     let a = args.map(HSTRING::from);

@@ -1,7 +1,7 @@
 //! Start's state and its drawing: Direct2D on the composition swap chain of `render`, DirectWrite
 //! text in Segoe UI Variable, Segoe Fluent Icons glyphs, shell icons as D2D bitmaps.
 
-use crate::apps::App;
+use crate::{apps::App, edit::Edit};
 use crate::layout::{self as L, Hit, Rect};
 use crate::model::{self, Line};
 use crate::recent::Recent;
@@ -15,13 +15,14 @@ use windows::Win32::Graphics::Direct2D::{
     ID2D1Brush, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TRIMMING,
     DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_WRAP, IDWriteTextFormat,
 };
 use windows_core::{Interface, Result};
 use windows_numerics::{Matrix3x2, Vector2};
 
 mod results;
+mod search_field;
 pub use results::{Act, FileEntry, Found};
 
 const WHITE: Color = rgba(255, 255, 255, 1.0);
@@ -74,6 +75,9 @@ pub struct Start {
     label_left: IDWriteTextFormat,
     header: IDWriteTextFormat,
     body: IDWriteTextFormat,
+    search_text: IDWriteTextFormat,
+    selection_color: Color,
+    search_offset: f32,
     glyph: IDWriteTextFormat,
     glyph_small: IDWriteTextFormat,
     title: IDWriteTextFormat,
@@ -89,6 +93,8 @@ pub struct Start {
     pub page: usize,
     pub scroll: f32,
     pub query: String,
+    pub edit: Edit,
+    pub search_drag: bool,
     pub found: Found,
     /// Count and oldest message time of text keys waiting for a frame.
     pub pending_search_keys: Option<(u32, u32)>,
@@ -136,6 +142,7 @@ impl Start {
         let label_left = trimmed(&text, text.format(ui, 12.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Leading)?)?;
         let header = text.format(ui, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, Align::Leading)?;
         let body = trimmed(&text, text.format(ui, 14.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Leading)?)?;
+        let search_text = text.format(ui, 14.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Leading)?;
         let glyph = text.format("Segoe Fluent Icons", 16.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?;
         let glyph_small = text.format("Segoe Fluent Icons", 8.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?;
         let title = trimmed(&text, text.format("Segoe UI Variable Display", 20.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, Align::Center)?)?;
@@ -152,6 +159,9 @@ impl Start {
             label_left,
             header,
             body,
+            search_text,
+            selection_color: search_field::accent(),
+            search_offset: 0.0,
             glyph,
             glyph_small,
             title,
@@ -167,6 +177,8 @@ impl Start {
             page: 0,
             scroll: 0.0,
             query: String::new(),
+            edit: Edit::default(),
+            search_drag: false,
             found: Found::default(),
             pending_search_keys: None,
             app_index: Vec::new(),
@@ -462,6 +474,8 @@ impl Start {
             self.page = 0;
             self.scroll = 0.0;
             self.query.clear();
+            self.edit = Edit::default();
+            self.search_offset = 0.0;
             self.found.clear();
             self.hover = Hit::None;
             self.dirty = true;
@@ -514,17 +528,6 @@ impl Start {
         }
     }
 
-    fn text_width(&self, f: &IDWriteTextFormat, s: &str) -> f32 {
-        let w: Vec<u16> = s.encode_utf16().collect();
-        // SAFETY: a throwaway layout to measure the string.
-        unsafe {
-            let Ok(l) = self.text.factory.CreateTextLayout(&w, f, 10000.0, 100.0) else { return 0.0 };
-            let mut m = DWRITE_TEXT_METRICS::default();
-            let _ = l.GetMetrics(&mut m);
-            m.widthIncludingTrailingWhitespace
-        }
-    }
-
     pub fn draw(&mut self) -> Result<()> {
         self.surface.begin();
         // SAFETY: inside BeginDraw.
@@ -548,25 +551,6 @@ impl Start {
         self.dirty = false;
         self.pending_search_keys = None;
         Ok(())
-    }
-
-    fn draw_search(&self) {
-        let b = L::SEARCH;
-        self.fill(&b, L::SEARCH_RADIUS, rgba(0, 0, 0, 0.28));
-        self.stroke(&b, L::SEARCH_RADIUS, rgba(255, 255, 255, 0.09));
-        let base = b.y + 21.0;
-        self.txt(&self.glyph, GLYPH_SEARCH, b.x + 9.0, b.x + 37.0, b.y + 23.0, SECONDARY);
-        let tx = b.x + 44.0;
-        if self.query.is_empty() {
-            self.txt(&self.body, self.s.search, tx, b.right() - 16.0, base, TERTIARY);
-        } else {
-            self.txt(&self.body, &self.query, tx, b.right() - 16.0, base, WHITE);
-        }
-        if self.view == View::Search || self.search_focus {
-            let cx = tx + self.text_width(&self.body, &self.query) + 1.0;
-            let caret = Rect::new(cx.floor(), b.y + 7.0, 1.0, 18.0);
-            self.fill(&caret, 0.0, WHITE);
-        }
     }
 
     fn header_button(&self, baseline: f32, width: f32, label: &str, back: bool, hot: bool) {

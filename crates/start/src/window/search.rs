@@ -9,7 +9,7 @@ use crate::scene::{Act, View};
 use crate::search::{self, Kind};
 use crate::sources::{self, Setting};
 use crate::{apps, log, power};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
@@ -29,6 +29,7 @@ thread_local! {
     static KEY_AT: RefCell<Option<Instant>> = const { RefCell::new(None) };
     /// The generation whose first MFT rows were timed, and the key to rows on screen times.
     static MFT_TIMED: RefCell<(u64, Vec<f32>)> = const { RefCell::new((0, Vec::new())) };
+    static HIGH_SURROGATE: Cell<Option<u16>> = const { Cell::new(None) };
 }
 
 /// A text key (letter, digit, space, backspace) is waiting in this thread's queue: its own
@@ -81,26 +82,29 @@ pub fn settings_loaded(v: Vec<Setting>) {
     });
 }
 
-/// A typed character: the query grows and the results answer in the same frame.
-pub fn ch(c: u32) {
-    // A character that adds no text still shows the frame its key down left for it.
-    let Some(c) = char::from_u32(c).filter(|c| !c.is_control()) else {
-        return super::redraw();
+/// A typed UTF-16 unit from WM_CHAR. Search answers once for a supplementary character.
+pub fn ch(unit: u16) {
+    if (0xd800..=0xdbff).contains(&unit) {
+        HIGH_SURROGATE.set(Some(unit));
+        return;
+    }
+    let lead = HIGH_SURROGATE.take();
+    let c = if (0xdc00..=0xdfff).contains(&unit) {
+        lead.and_then(|lead| char::decode_utf16([lead, unit]).next()?.ok())
+    } else {
+        char::from_u32(u32::from(unit))
     };
-    let label = c.to_string();
-    answer(&label, |q| {
-        let mut q = q.to_string();
-        q.push(c);
-        q
-    });
+    if let Some(c) = c.filter(|c| !c.is_control()) {
+        let mut buffer = [0; 4];
+        let text = c.encode_utf8(&mut buffer);
+        answer(text, |edit, query| edit.replace(query, text));
+    } else {
+        super::redraw();
+    }
 }
 
-pub fn backspace() {
-    answer("backspace", |q| {
-        let mut q = q.to_string();
-        q.pop();
-        q
-    });
+pub fn reset_input() {
+    HIGH_SURROGATE.set(None);
 }
 
 fn qpc() -> i64 {
@@ -174,7 +178,7 @@ fn wait_mft_rows(hwnd: HWND, generation: u64, t0: Instant) -> bool {
     false
 }
 
-fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
+pub(super) fn answer(key: &str, edit: impl FnOnce(&mut crate::edit::Edit, &str) -> String) {
     let mut freq = 0;
     // SAFETY: writes the frequency into a local.
     let _ = unsafe { QueryPerformanceFrequency(&mut freq) };
@@ -184,7 +188,17 @@ fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
     let queued = unsafe { (GetTickCount() as i32).wrapping_sub(GetMessageTime()) };
     let t0 = Instant::now();
     // The pipe query goes out first, so the service answers while apps and settings rank.
-    let Some((q, generation, hwnd)) = with(|s| s.shown.then(|| (edit(&s.query), s.found.generation + 1, s.hwnd))).flatten() else {
+    let Some((q, generation, hwnd)) = with(|s| {
+        if !s.shown {
+            return None;
+        }
+        let q = edit(&mut s.edit, &s.query);
+        s.search_focus = true;
+        s.focus = crate::layout::Hit::Search;
+        s.dirty = true;
+        (q != s.query).then_some((q, s.found.generation + 1, s.hwnd))
+    }).flatten() else {
+        super::redraw();
         return;
     };
     MFT.with(|i| {
@@ -201,7 +215,7 @@ fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
     let Some(ranked) = with(|s| {
         let g = s.set_query(q.clone());
         debug_assert_eq!(g, generation);
-        s.search_focus = true;
+        s.focus = crate::layout::Hit::Search;
         t0.elapsed().as_secs_f32() * 1000.0
     }) else {
         return;
