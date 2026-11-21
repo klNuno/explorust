@@ -7,7 +7,6 @@ use crate::win::{frame, log};
 use crate::win::shell::{self, Pidl};
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::rc::Rc;
 use std::time::Instant;
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOINTERFACE, HWND, LPARAM, RECT, S_FALSE, WPARAM};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IServiceProvider, IServiceProvider_Impl};
@@ -84,7 +83,6 @@ impl IExplorerBrowserEvents_Impl for Events_Impl {
 struct Site {
     hwnd: HWND,
     id: usize,
-    details: Rc<Cell<bool>>,
 }
 
 impl IServiceProvider_Impl for Site_Impl {
@@ -136,8 +134,6 @@ impl IExplorerPaneVisibility_Impl for Site_Impl {
         let off = (EPS_DEFAULT_OFF.0 | EPS_FORCE.0) as u32;
         Ok(if ep == EP_NavPane {
             on
-        } else if ep == EP_DetailsPane {
-            if self.details.get() { on } else { off }
         } else {
             // Commands bar, ribbon, preview pane, the Windows 7 query pane: ours or none.
             off
@@ -151,10 +147,10 @@ pub struct Browser {
 }
 
 impl Browser {
-    fn new(hwnd: HWND, id: usize, rc: RECT, details: Rc<Cell<bool>>, searching: bool) -> Result<Self> {
+    fn new(hwnd: HWND, id: usize, rc: RECT, searching: bool) -> Result<Self> {
         unsafe {
             let eb: IExplorerBrowser = CoCreateInstance(&ExplorerBrowser, None, CLSCTX_INPROC_SERVER)?;
-            let site: IServiceProvider = Site { hwnd, id, details }.into();
+            let site: IServiceProvider = Site { hwnd, id }.into();
             eb.SetOptions(EBO_SHOWFRAMES | EBO_NOBORDER | EBO_NOTRAVELLOG)?;
             let fs = FOLDERSETTINGS { ViewMode: FVM_DETAILS.0 as u32, fFlags: FWF_NOWEBVIEW.0 as u32 };
             let events: IExplorerBrowserEvents = Events { hwnd, id, searching, started: Cell::new(None) }.into();
@@ -221,10 +217,10 @@ pub struct Tab {
 }
 
 impl Tab {
-    pub fn new(hwnd: HWND, id: usize, rc: RECT, details: Rc<Cell<bool>>) -> Result<Self> {
+    pub fn new(hwnd: HWND, id: usize, rc: RECT) -> Result<Self> {
         Ok(Self {
             id,
-            host: Browser::new(hwnd, id, rc, details, false)?,
+            host: Browser::new(hwnd, id, rc, false)?,
             results: None,
             history: History::new(),
             title: String::new(),
@@ -250,9 +246,9 @@ impl Tab {
         }
     }
 
-    pub fn search_browser(&mut self, hwnd: HWND, rc: RECT, details: Rc<Cell<bool>>, index: bool) -> Result<&Browser> {
+    pub fn search_browser(&mut self, hwnd: HWND, rc: RECT, index: bool) -> Result<&Browser> {
         if self.results.as_ref().is_none_or(|(mode, _)| *mode != index) {
-            let browser = Browser::new(hwnd, self.id, rc, details, true)?;
+            let browser = Browser::new(hwnd, self.id, rc, true)?;
             self.results = Some((index, browser));
         }
         Ok(&self.results.as_ref().unwrap().1)

@@ -7,6 +7,7 @@ use crate::layout::{self as L, Cmd, Hit};
 use crate::text::{self, Strings};
 use crate::win::gfx::{Canvas, rect};
 use render::{Color, rgba};
+use render::style::Material;
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 
 const TITLE_LAYER: Color = rgba(25, 27, 30, 0.70);
@@ -35,6 +36,7 @@ pub struct TabView<'a> {
 
 pub struct View<'a> {
     pub w: f32,
+    pub material: Material,
     pub tabs: Vec<TabView<'a>>,
     pub active: usize,
     pub can_back: bool,
@@ -57,6 +59,14 @@ pub struct View<'a> {
 }
 
 impl View<'_> {
+    fn layer(&self, color: Color) -> Color {
+        match self.material {
+            Material::Oled => rgba(0, 0, 0, 1.0),
+            Material::Transparent | Material::Acrylic => rgba(0, 0, 0, 0.0),
+            Material::Windows | Material::Mica => color,
+        }
+    }
+
     fn state(&self, h: Hit) -> Option<Color> {
         if self.pressed == h {
             Some(PRESSED)
@@ -81,7 +91,7 @@ pub fn draw(c: &Canvas, v: &View) -> Vec<(f32, f32)> {
 }
 
 fn tab_strip(c: &Canvas, v: &View) {
-    c.fill(rect(0.0, 0.0, v.w, L::TABSTRIP_H), TITLE_LAYER);
+    c.fill(rect(0.0, 0.0, v.w, L::TABSTRIP_H), v.layer(TITLE_LAYER));
     let strip = L::tab_strip(v.w, v.tabs.len(), v.active);
     let width = strip.width - L::TAB_GAP;
     for (slot, i) in strip.visible.enumerate() {
@@ -131,7 +141,7 @@ fn tab_button(c: &Canvas, v: &View, hit: Hit, glyph: char, x: f32, width: f32) {
 
 fn nav_bar(c: &Canvas, v: &View) -> Vec<(f32, f32)> {
     let w = v.w;
-    c.fill(rect(0.0, L::TABSTRIP_H, w, L::NAVBAR_BOTTOM - L::TABSTRIP_H), LAYER);
+    c.fill(rect(0.0, L::TABSTRIP_H, w, L::NAVBAR_BOTTOM - L::TABSTRIP_H), v.layer(LAYER));
     let buttons = [
         ('\u{E72B}', Hit::Back, v.can_back),
         ('\u{E72A}', Hit::Forward, v.can_forward),
@@ -222,7 +232,7 @@ fn editor(c: &Canvas, e: &LineEdit, x0: f32, x1: f32, baseline: f32, hint: &str,
 
 fn command_bar(c: &Canvas, v: &View) {
     let w = v.w;
-    c.fill(rect(0.0, L::NAVBAR_BOTTOM, w, L::CMDBAR_BOTTOM - L::NAVBAR_BOTTOM), LAYER);
+    c.fill(rect(0.0, L::NAVBAR_BOTTOM, w, L::CMDBAR_BOTTOM - L::NAVBAR_BOTTOM), v.layer(LAYER));
     c.fill(rect(0.0, L::CMDBAR_BOTTOM, w, 1.0), CMDBAR_LINE);
     let cy = L::CMD_CY;
     let b = L::baseline(cy, 12.0);

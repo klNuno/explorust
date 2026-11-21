@@ -7,10 +7,12 @@ use crate::history::Move;
 use crate::layout::{self as L, Cmd, Hit};
 use crate::text::Strings;
 use crate::win::chrome::{self, TabView};
+use crate::win::details::Pane;
 use crate::win::gfx::{Canvas, Shared};
 use crate::win::shell::{self, Pidl};
 use crate::win::tab::{self, Tab};
 use crate::win::{log, menus, search, shellwindows};
+use render::style::{self, Native, Part, WindowStyle};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -26,7 +28,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::System::Com::IServiceProvider;
 use windows::Win32::UI::Shell::{
-    IShellView, SIGDN_DESKTOPABSOLUTEEDITING,
+    IShellView, SIGDN_DESKTOPABSOLUTEEDITING, SVGIO_SELECTION,
     SVSI_DESELECTOTHERS, SVSI_ENSUREVISIBLE, SVSI_FOCUSED, SVSI_SELECT, SVUIA_ACTIVATE_FOCUS,
 };
 use windows_core::Interface;
@@ -56,7 +58,7 @@ pub struct Frame {
     search_focus: bool,
     search_timer: bool,
     search_worker: Option<search::Worker>,
-    details: Rc<Cell<bool>>,
+    details: Option<Pane>,
     s: &'static Strings,
     icons: HashMap<usize, ID2D1Bitmap1>,
     window_active: bool,
@@ -138,7 +140,8 @@ pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("File Explorer"),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            // DWM still paints caption buttons for WS_SYSMENU when maximized.
+            (WS_OVERLAPPEDWINDOW & !(WS_CAPTION | WS_SYSMENU)) | WS_CLIPCHILDREN,
             x,
             y,
             1100,
@@ -153,8 +156,9 @@ pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
         let k = scale(hwnd);
         let on: i32 = 1;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &on as *const _ as _, 4);
-        let kind = DWMSBT_MAINWINDOW;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &kind as *const _ as _, 4);
+        style::bind(hwnd, Part::Files, WindowStyle {
+            native: Native::Mica, border: DWMWA_COLOR_DEFAULT, corner: DWMWCP_DEFAULT, popup: false,
+        });
         shell::allow_dark(hwnd);
         let rc = client(hwnd);
         let chrome_height = (L::CHROME_H * k).ceil() as u32;
@@ -179,7 +183,7 @@ pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
             search_focus: false,
             search_timer: false,
             search_worker: None,
-            details: Rc::new(Cell::new(false)),
+            details: None,
             s,
             icons: HashMap::new(),
             window_active: false,
@@ -394,7 +398,30 @@ impl Frame {
 
     fn view_rect(&self) -> RECT {
         let r = client(self.hwnd);
-        RECT { left: 0, top: self.chrome_px(), right: r.right, bottom: r.bottom.max(self.chrome_px()) }
+        let right = if self.details.is_some() { self.detail_rect().left } else { r.right };
+        RECT { left: 0, top: self.chrome_px(), right, bottom: r.bottom.max(self.chrome_px()) }
+    }
+
+    fn detail_rect(&self) -> RECT {
+        let mut bounds = client(self.hwnd);
+        let scale = self.scale();
+        let width = (bounds.right as f32 / scale * 0.3).clamp(180.0, 280.0);
+        bounds.left = (bounds.right - (width * scale).round() as i32).max(0);
+        bounds.top = self.chrome_px();
+        bounds
+    }
+
+    fn toggle_details(&mut self) -> windows_core::Result<()> {
+        if let Some(pane) = self.details.as_ref() {
+            self.canvas.remove_layer(&pane.canvas)?;
+            self.details = None;
+        } else {
+            self.details = Some(Pane::new(&self.canvas, self.detail_rect(), self.scale())?);
+        }
+        if let Some(tab) = self.tab() {
+            tab.set_rect(self.view_rect());
+        }
+        Ok(())
     }
 
     fn tab(&self) -> Option<&Tab> {
@@ -408,7 +435,7 @@ impl Frame {
     fn add_tab(&mut self, place: &Pidl) -> windows_core::Result<()> {
         let id = self.next_id;
         self.next_id += 1;
-        let t = Tab::new(self.hwnd, id, self.view_rect(), self.details.clone())?;
+        let t = Tab::new(self.hwnd, id, self.view_rect())?;
         t.browse(place)?;
         if let Some(old) = self.tab() {
             old.show(false);
@@ -422,7 +449,7 @@ impl Frame {
     fn add_background_tab(&mut self, place: &Pidl) -> windows_core::Result<()> {
         let id = self.next_id;
         self.next_id += 1;
-        let t = Tab::new(self.hwnd, id, self.view_rect(), self.details.clone())?;
+        let t = Tab::new(self.hwnd, id, self.view_rect())?;
         t.show(false);
         t.browse(place)?;
         self.tabs.insert(self.active + 1, t);
@@ -511,10 +538,11 @@ impl Frame {
         let t = self.tabs.get(self.active);
         let folder_view = t.and_then(|t| t.folder_view());
         let ready = folder_view.is_some();
-        let selection = folder_view.as_ref().is_some_and(shell::has_selection);
+        let selected = folder_view.as_ref().map_or(0, |view| unsafe { view.ItemCount(SVGIO_SELECTION).unwrap_or(0) });
         let create = t.is_some_and(|t| t.path.is_some() && t.query.is_empty());
         let view = chrome::View {
             w,
+            material: style::current(Part::Files).material,
             tabs,
             active: self.active,
             can_back: t.is_some_and(|t| t.history.can_back() || !t.query.is_empty()),
@@ -526,11 +554,11 @@ impl Frame {
             search_focus: self.search_focus,
             hover: self.hover,
             pressed: self.pressed,
-            selection,
+            selection: selected > 0,
             paste: ready && create && menus::file_clipboard(),
             create,
             ready,
-            details: self.details.get(),
+            details: self.details.is_some(),
             window_active: self.window_active,
             maximized: unsafe { IsZoomed(self.hwnd) }.as_bool(),
             s: self.s,
@@ -541,6 +569,16 @@ impl Frame {
             log::line(&format!("draw failed: {e}"));
         }
         self.spans = spans;
+        if let Some(pane) = self.details.as_mut() {
+            let detail_item = match selected {
+                0 => t.and_then(|tab| tab.item.clone()),
+                1 => t.and_then(Tab::shell_view).as_ref().and_then(shell::single_selection),
+                _ => None,
+            };
+            if let Err(error) = pane.draw(detail_item.as_ref(), selected, self.s) {
+                log::line(&format!("details draw failed: {error}"));
+            }
+        }
     }
 
     fn layout(&mut self) {
@@ -553,6 +591,12 @@ impl Frame {
         self.laid_out = now;
         if let Err(e) = self.canvas.resize(r.right as u32, (L::CHROME_H * k).ceil() as u32, 96.0 * k) {
             log::line(&format!("resize failed: {e}"));
+        }
+        let details = self.detail_rect();
+        if let Some(pane) = self.details.as_mut() {
+            if let Err(error) = pane.place(details, k) {
+                log::line(&format!("details resize failed: {error}"));
+            }
         }
         self.extend_frame();
         if let Some(t) = self.tab() {
@@ -755,26 +799,7 @@ impl Frame {
                     Ok(())
                 }
             }
-            Cmd::Details => {
-                self.details.set(!self.details.get());
-                if !t.query.is_empty() {
-                    let active = &mut self.tabs[self.active];
-                    active.dismiss_results(true);
-                    active.generation = active.generation.wrapping_add(1);
-                    self.submit_search();
-                    return;
-                }
-                let browser = &t.browser().eb;
-                unsafe {
-                    use windows::Win32::UI::Shell::{EBO_ALWAYSNAVIGATE, SBSP_SAMEBROWSER};
-                    browser.GetOptions().and_then(|options| {
-                        browser.SetOptions(options | EBO_ALWAYSNAVIGATE)?;
-                        let result = t.history.current().map_or(Ok(()), |p| browser.BrowseToIDList(p.as_ptr(), SBSP_SAMEBROWSER));
-                        let _ = browser.SetOptions(options);
-                        result
-                    })
-                }
-            }
+            Cmd::Details => self.toggle_details(),
         };
         log::line(&format!("command {c:?}: {r:?}"));
     }
@@ -993,7 +1018,7 @@ impl Frame {
         };
         let result = response.results.and_then(|hits| {
             let indexed = matches!(hits, search::Results::Indexed(_));
-            let browser = t.search_browser(hwnd, rect, self.details.clone(), indexed)?;
+            let browser = t.search_browser(hwnd, rect, indexed)?;
             search::present(browser, hits)
         });
         match result {

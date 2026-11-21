@@ -3,8 +3,8 @@
 //! button), `wait:<s>`, `select:<path>` (`SHOpenFolderAndSelectItems`, an app's "show in folder"),
 //! `exec:<path>` (`ShellExecuteEx` open, as the Run box does), `windows` (what the shell's window
 //! list reports for each window: its URL and its active view's folder), `frames` (visibility
-//! and DWM cloak state of Files windows), `maximize` (the foreground Files window). Results go to
-//! `files-test.log` beside the exe.
+//! and DWM cloak state of Files windows), `activate:<x>,<y>` (click a verified Files window),
+//! `maximize` (the foreground Files window). Results go to `files-test.log` beside the exe.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -31,7 +31,7 @@ fn main() {
 #[cfg(target_os = "windows")]
 mod win {
     use std::time::Duration;
-    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Foundation::{HWND, POINT};
     use windows::Win32::System::Com::*;
     use windows::Win32::System::Variant::VARIANT;
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -69,6 +69,27 @@ mod win {
         }
     }
 
+    fn is_files(hwnd: HWND) -> bool {
+        let mut class = [0u16; 64];
+        let len = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+        String::from_utf16_lossy(&class[..len]) == "explorust.FilesWindow"
+    }
+
+    fn activate(x: i32, y: i32) -> String {
+        goto(x, y);
+        let hwnd = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };
+        if !is_files(hwnd) {
+            return "activation point is covered by another window".into();
+        }
+        mouse(MOUSEEVENTF_LEFTDOWN);
+        mouse(MOUSEEVENTF_LEFTUP);
+        if unsafe { GetForegroundWindow() } == hwnd {
+            "ok".into()
+        } else {
+            "Files did not get the foreground".into()
+        }
+    }
+
     pub fn step(arg: &str) -> String {
         let (verb, rest) = arg.split_once(':').unwrap_or((arg, ""));
         let n = nums(rest);
@@ -78,6 +99,9 @@ mod win {
                 "ok".into()
             }
             "move" | "click" | "dclick" | "mclick" if n.len() == 2 => {
+                if verb != "move" && !is_files(unsafe { GetForegroundWindow() }) {
+                    return "Files does not have the foreground".into();
+                }
                 goto(n[0], n[1]);
                 let (down, up) = if verb == "mclick" {
                     (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP)
@@ -108,6 +132,7 @@ mod win {
             "exec" => exec(rest),
             "windows" => windows(),
             "frames" => frames(),
+            "activate" if n.len() == 2 => activate(n[0], n[1]),
             "maximize" => maximize(),
             _ => "unknown step".into(),
         }
@@ -116,9 +141,7 @@ mod win {
     fn maximize() -> String {
         unsafe {
             let hwnd = GetForegroundWindow();
-            let mut class = [0u16; 64];
-            let len = GetClassNameW(hwnd, &mut class) as usize;
-            if String::from_utf16_lossy(&class[..len]) != "explorust.FilesWindow" {
+            if !is_files(hwnd) {
                 return "Files does not have the foreground".into();
             }
             let _ = ShowWindow(hwnd, SW_MAXIMIZE);
@@ -127,14 +150,12 @@ mod win {
     }
 
     fn frames() -> String {
-        use windows::Win32::Foundation::{HWND, LPARAM};
+        use windows::Win32::Foundation::LPARAM;
         use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
         use windows_core::BOOL;
         unsafe extern "system" fn one(hwnd: HWND, data: LPARAM) -> BOOL {
             unsafe {
-                let mut class = [0u16; 64];
-                let len = GetClassNameW(hwnd, &mut class) as usize;
-                if String::from_utf16_lossy(&class[..len]) != "explorust.FilesWindow" {
+                if !is_files(hwnd) {
                     return true.into();
                 }
                 let mut cloak = 0u32;
