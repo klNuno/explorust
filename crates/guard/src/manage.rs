@@ -70,13 +70,21 @@ pub fn install() -> u32 {
         Err(e) => say(&format!("install: notification helper package not installed ({e}); toasts are polled")),
     }
     folders::viewer(&dir, true);
-    if elevated && let Some(sid) = account::own_sid() {
-        if let Err(e) = reg::add_machine_user(&sid) {
-            say(&format!("install: users list: {e}"));
+    // The users list keeps the shared files while any account still starts the guard: without this
+    // account in it, an uninstall from another account could remove them under it.
+    let owner = if elevated {
+        match account::own_sid() {
+            Some(sid) => reg::add_machine_user(&sid).map_err(|e| format!("users list: {e}")),
+            None => Err("users list: this account's SID is unknown".to_string()),
         }
-    }
-    if let Err(e) = reg::set_shell(&format!("\"{}\"", guard.display())) {
+    } else {
+        Ok(())
+    };
+    if let Err(e) = owner.and_then(|()| reg::set_shell(&format!("\"{}\"", guard.display()))) {
         say(&format!("install failed: {e}"));
+        // This user's registrations point into the files: they go first.
+        folders::viewer(&dir, false);
+        remove_package();
         if elevated && fresh {
             undo_machine();
         }
@@ -220,7 +228,8 @@ pub fn restore() -> u32 {
     let mine = !install::elevated() || account::is_session_user();
     let user = if mine { restore_user().map(|_| ()) } else { Ok(()) };
     let back = bring_back_explorer();
-    if mine {
+    // Only once the shell is off for good and explorer answers: the package is explorust's.
+    if mine && user.is_ok() && back.is_ok() {
         remove_package();
     }
     let machine = match (&user, &back, install::elevated()) {

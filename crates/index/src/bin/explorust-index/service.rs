@@ -3,6 +3,7 @@
 
 use crate::{log, pipe, server};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, HANDLE, NO_ERROR};
 use windows::Win32::UI::WindowsAndMessaging::{DBT_DEVTYP_DEVICEINTERFACE, DEV_BROADCAST_DEVICEINTERFACE_W, DEVICE_NOTIFY_SERVICE_HANDLE, RegisterDeviceNotificationW};
@@ -18,6 +19,7 @@ use windows::Win32::System::Services::{
 use windows_core::{HSTRING, PCWSTR, PWSTR};
 
 static STATUS: OnceLock<isize> = OnceLock::new();
+static STOPPING: AtomicBool = AtomicBool::new(false);
 
 fn report(state: SERVICE_STATUS_CURRENT_STATE) {
     let Some(&h) = STATUS.get() else { return };
@@ -56,15 +58,23 @@ unsafe extern "system" fn handler(ctrl: u32, event: u32, _: *mut core::ffi::c_vo
             NO_ERROR.0
         }
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
-            log::line("service: stop");
+            // Once: a second STOP or a SHUTDOWN during the stop only gets its answer.
+            if STOPPING.swap(true, Ordering::SeqCst) {
+                return NO_ERROR.0;
+            }
             report(SERVICE_STOP_PENDING);
             // The handler answers first: ending the process inside it breaks the SCM's call, and
             // `sc stop` or Restart-Service then report that the service cannot be stopped.
-            let _ = std::thread::Builder::new().name("index-stop".into()).spawn(|| {
+            let stop = || {
+                log::line("service: stop");
                 std::thread::sleep(Duration::from_millis(100));
                 report(SERVICE_STOPPED);
                 std::process::exit(0);
-            });
+            };
+            if std::thread::Builder::new().name("index-stop".into()).spawn(stop).is_err() {
+                report(SERVICE_STOPPED);
+                std::process::exit(0);
+            }
             NO_ERROR.0
         }
         SERVICE_CONTROL_INTERROGATE => NO_ERROR.0,
