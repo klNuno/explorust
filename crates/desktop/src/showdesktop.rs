@@ -98,16 +98,18 @@ pub fn press(progman: Option<HWND>) {
             log::line(&format!("show desktop: minimized {} windows ({keys} through explorust-keys), desktop focused {fg:?}", ws.len()));
         }
         Action::Restore(ws) => {
-            let mut keys = 0;
-            // One coordinator keeps the order: with an elevated window in the batch, every window
-            // goes through the keys host's queue, bottom first, so each lands above the one before.
+            // With an elevated window, the helper raises everything bottom first and then gives
+            // the foreground to the top window in the same batch, even when that window is ordinary.
             let via_keys = ws.iter().any(|&id| bus::above_me(hwnd(id)));
+            if via_keys && bus::keys_pipe::restore_batch(&ws) {
+                log::line(&format!("show desktop: queued {} restores and top activation through explorust-keys", ws.len()));
+                return;
+            }
+            if via_keys {
+                log::line("show desktop: keys batch unavailable, restoring locally");
+            }
             for &id in &ws {
                 let h = hwnd(id);
-                if via_keys && bus::post(bus::Command::Restore, id) {
-                    keys += 1;
-                    continue;
-                }
                 // SAFETY: restore without activation, then raise it above the ones restored before.
                 unsafe {
                     let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
@@ -120,10 +122,8 @@ pub fn press(progman: Option<HWND>) {
                     }
                 }
             }
-            let top = ws.last().copied();
-            // The keys host can give the foreground to an elevated window; this process cannot.
-            let fg = top.map(|t| if bus::above_me(hwnd(t)) && bus::post(bus::Command::Activate, t) { true } else { unsafe { SetForegroundWindow(hwnd(t)) }.as_bool() });
-            log::line(&format!("show desktop: restored {} windows ({keys} through explorust-keys), top focused {fg:?}", ws.len()));
+            let fg = ws.last().map(|&t| unsafe { SetForegroundWindow(hwnd(t)) }.as_bool());
+            log::line(&format!("show desktop: restored {} windows locally, top focused {fg:?}", ws.len()));
         }
         Action::Nothing => log::line("show desktop: nothing to do"),
     }

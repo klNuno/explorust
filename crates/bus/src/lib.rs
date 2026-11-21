@@ -3,12 +3,16 @@
 //! explorust process and across processes, so a component's dev exe in the guest gets the real
 //! hotkeys of the running shell.
 //!
-//! A component creates its message window with `class_of(owner)` as class name and calls
+//! Keys commands use a named pipe checked against the shell and helper processes. Other
+//! components create a message window with `class_of(owner)` as class name and call
 //! `listen(hwnd)` once; its window procedure turns `MSG_COMMAND` (wParam = `Command as u32`,
 //! lParam = an optional argument) into the action.
 
 /// The message every component window accepts: `WM_APP + 0x100`.
 pub const MSG_COMMAND: u32 = 0x8000 + 0x100;
+
+#[cfg(any(target_os = "windows", test))]
+pub mod keys_pipe;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -137,8 +141,7 @@ pub enum Owner {
     Files,
     /// explorust's own command window, which runs the shell actions.
     Shell,
-    /// The keyboard hook's command window (explorust-keys.exe, or explorust when the hook runs
-    /// in-process), which activates windows for the parts.
+    /// The keyboard hook host (explorust-keys.exe, or explorust when the hook runs in-process).
     Keys,
 }
 
@@ -245,6 +248,12 @@ mod win {
 
     /// Posts `cmd` to one owner, whoever answers it by default (used for `Shutdown`).
     pub fn post_to(owner: Owner, cmd: Command, arg: isize) -> bool {
+        if owner == Owner::Keys {
+            return keys_pipe::encode(cmd, arg).is_some_and(|record| keys_pipe::post(&record));
+        }
+        if cmd.owner() == Owner::Keys {
+            return false;
+        }
         let Some(h) = target(owner) else { return false };
         // SAFETY: posting to a window found above; a stale handle only makes the call fail.
         unsafe { PostMessageW(Some(h), MSG_COMMAND, WPARAM(cmd as usize), LPARAM(arg)) }.is_ok()

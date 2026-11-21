@@ -58,17 +58,24 @@ fn log(msg: &str) {
 }
 
 /// Installs the hook on a thread of its own, which then pumps messages for it, and the activation
-/// window (`crate::activate`) on another. Returns once both are in place, or the reason the hook is
-/// not (a missing activation window is only logged: the parts then activate by themselves).
+/// pipe on another. Returns once the hook is in place, or the reason it is not.
 /// `log` writes one line to the host's log.
 pub fn spawn(log_line: fn(&str)) -> Result<(), String> {
+    spawn_for_shell(std::process::id(), log_line)
+}
+
+/// Installs the hook in the external keys host for the shell that launched it.
+pub fn spawn_for_shell(shell: u32, log_line: fn(&str)) -> Result<(), String> {
     let _ = LOG.set(log_line);
     let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
     if std::fs::read_to_string(base.join("explorust").join("parts-off.txt")).is_ok_and(|s| s.lines().any(|l| l.trim() == "altmask")) {
         ALT_MASK_OFF.store(true, Relaxed);
         log("altmask: off (parts-off.txt), Alt up after Alt+Tab reaches the app");
     }
-    if let Err(e) = crate::activate::spawn() {
+    if let Err(e) = crate::pipe::spawn(shell) {
+        log(&e);
+    }
+    if let Err(e) = crate::activate::spawn_refusal_window() {
         log(&e);
     }
     let (tx, rx) = std::sync::mpsc::sync_channel(1);

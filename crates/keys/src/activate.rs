@@ -1,9 +1,7 @@
-//! The keys host's command window (`bus::Owner::Keys`): it brings the window a part names to the
-//! foreground. explorust runs at medium integrity and cannot move the foreground off an elevated
-//! window to a UWP frame; explorust-keys.exe has UI access, so the switcher and the taskbar post
-//! `Command::Activate` here. The window lives on a thread of its own: a target that hangs in
-//! SetForegroundWindow must never stall the keyboard hook.
+//! Window actions executed by the authenticated keys pipe. The old message window only logs
+//! rejected commands so it cannot grant window control to an unauthenticated sender.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -12,18 +10,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_MOUSE, SendInput,
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowExW, GA_ROOT,
     GWL_EXSTYLE, GetAncestor, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId,
-    HWND_MESSAGE, IsWindowVisible, WS_EX_TOOLWINDOW,
+    HWND_MESSAGE, ISMEX_NOSEND, InSendMessageEx, IsHungAppWindow, IsWindowVisible, WS_EX_TOOLWINDOW,
     HWND_TOP, IsIconic, IsWindow, MSG, RegisterClassW, SW_RESTORE, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos, ShowWindow, ShowWindowAsync, SwitchToThisWindow,
     WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
-/// Starts the command window's thread. Returns once the window exists, or the reason it does not.
-pub fn spawn() -> Result<(), String> {
+/// Starts the message-only window that records the rejection of old window commands.
+pub fn spawn_refusal_window() -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
-        .name("keys-activate".into())
+        .name("keys-legacy-window".into())
         .spawn(move || {
             let class = HSTRING::from(bus::class_of(bus::Owner::Keys));
             // SAFETY: registers a class and creates a message-only window owned by this thread,
@@ -41,14 +39,10 @@ pub fn spawn() -> Result<(), String> {
                     WINDOW_EX_STYLE(0), &class, w!(""), WINDOW_STYLE(0), 0, 0, 0, 0,
                     Some(HWND_MESSAGE), None, Some(inst.into()), None,
                 );
-                let hwnd = match hwnd {
-                    Ok(h) => h,
-                    Err(e) => {
-                        let _ = tx.send(Err(format!("activation window not created: {e}")));
-                        return;
-                    }
-                };
-                bus::listen(hwnd);
+                if let Err(e) = hwnd {
+                    let _ = tx.send(Err(format!("keys legacy window not created: {e}")));
+                    return;
+                }
                 let _ = tx.send(Ok(()));
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -56,46 +50,79 @@ pub fn spawn() -> Result<(), String> {
                 }
             }
         })
-        .map_err(|e| format!("activation thread: {e}"))?;
-    rx.recv().map_err(|_| "activation thread ended".to_string())?
+        .map_err(|e| format!("keys legacy window thread: {e}"))?;
+    rx.recv().map_err(|_| "keys legacy window thread ended".to_string())?
 }
 
 unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    static SEEN: AtomicU8 = AtomicU8::new(0);
     if msg == bus::MSG_COMMAND {
-        if let Some((bus::Command::Activate, h)) = bus::decode(wp, lp) {
-            let target = HWND(h as _);
-            let t = Instant::now();
-            let (frame, how) = activate(target);
-            crate::hook::log_line(&format!(
-                "activate {:?} ({}): {how} in {:.1} ms",
-                title(frame),
-                class(frame),
-                t.elapsed().as_secs_f32() * 1000.0
-            ));
-        } else if let Some((cmd @ (bus::Command::Minimize | bus::Command::Restore), h)) = bus::decode(wp, lp) {
-            let target = HWND(h as _);
-            let min = cmd == bus::Command::Minimize;
-            // The bus is open to any sender of this desktop: only what show desktop does is done,
-            // to a visible top-level window, and a restore only to a minimized one.
-            if let Err(why) = show_desktop_target(target, min) {
-                crate::hook::log_line(&format!("{} refused for {:?} ({}): {why}", if min { "minimize" } else { "restore" }, title(target), class(target)));
-                return LRESULT(0);
+        if bus::decode(wp, lp).is_some_and(|(cmd, _)| cmd.owner() == bus::Owner::Keys) {
+            // Window messages expose no authenticated sender. Log once per delivery kind.
+            let sent = unsafe { InSendMessageEx(None) } != ISMEX_NOSEND;
+            let flag = 1 << u8::from(sent);
+            if SEEN.fetch_or(flag, Ordering::Relaxed) & flag == 0 {
+                let kind = if sent { "sent" } else { "posted" };
+                crate::hook::log_line(&format!("keys: refused {kind} window command"));
             }
-            // SAFETY: async requests on a checked handle; a stale one only fails them, a hung
-            // target never stalls this thread.
-            let ok = unsafe {
-                let ok = ShowWindowAsync(target, if min { SW_SHOWMINNOACTIVE } else { SW_SHOWNOACTIVATE }).as_bool();
-                if !min {
-                    let _ = SetWindowPos(target, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-                }
-                ok
-            };
-            crate::hook::log_line(&format!("{} {:?} ({}) for show desktop: {ok}", if min { "minimize" } else { "restore" }, title(target), class(target)));
         }
         return LRESULT(0);
     }
     // SAFETY: default handling for everything else.
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+pub(crate) fn run(command: bus::Command, window: isize) {
+    use bus::Command::{Activate, Minimize, Restore};
+    let h = HWND(window as _);
+    match command {
+        Activate => {
+            let start = Instant::now();
+            let (frame, how) = activate(h);
+            crate::hook::log_line(&format!(
+                "activate {:?} ({}): {how} in {:.1} ms",
+                title(frame),
+                class(frame),
+                start.elapsed().as_secs_f32() * 1000.0
+            ));
+        }
+        Minimize | Restore => {
+            let min = command == Minimize;
+            let action = if min { "minimize" } else { "restore" };
+            if let Err(why) = show_desktop_target(h, min) {
+                crate::hook::log_line(&format!(
+                    "{action} refused for {:?} ({}): {why}", title(h), class(h)
+                ));
+                return;
+            }
+            let ok = if min {
+                // SAFETY: an async minimize on a checked window.
+                unsafe { ShowWindowAsync(h, SW_SHOWMINNOACTIVE) }.as_bool()
+            } else {
+                restore(h)
+            };
+            crate::hook::log_line(&format!(
+                "{action} {:?} ({}) for show desktop: {ok}", title(h), class(h)
+            ));
+        }
+        _ => {}
+    }
+}
+
+fn restore(h: HWND) -> bool {
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+    // SAFETY: the caller checked this top-level window. Responsive targets are raised before
+    // the next command, preserving Z-order across their independent input queues.
+    unsafe {
+        if IsHungAppWindow(h).as_bool() {
+            let queued = ShowWindowAsync(h, SW_SHOWNOACTIVATE).as_bool();
+            let raised = SetWindowPos(h, Some(HWND_TOP), 0, 0, 0, 0, flags | SWP_ASYNCWINDOWPOS);
+            return queued && raised.is_ok();
+        }
+        let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+        let raised = SetWindowPos(h, Some(HWND_TOP), 0, 0, 0, 0, flags);
+        raised.is_ok() && !IsIconic(h).as_bool()
+    }
 }
 
 /// A window show desktop may minimize or restore: a visible top-level window, not a tool window,
@@ -180,6 +207,10 @@ pub fn activate(target: HWND) -> (HWND, &'static str) {
             let _ = AllowSetForegroundWindow(pid);
         }
         if IsIconic(h).as_bool() {
+            if IsHungAppWindow(h).as_bool() {
+                let _ = ShowWindowAsync(h, SW_RESTORE);
+                return (h, "restore queued (hung)");
+            }
             // The window's own restore, with its animation; it activates too.
             let _ = ShowWindow(h, SW_RESTORE);
         }

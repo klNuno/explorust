@@ -5,7 +5,7 @@
 //! reach it over elevated windows. That exe starts nothing: Win+R, Win+I and the other shell
 //! actions are posted to explorust (`Command::ShellAction`), so every app keeps a plain token.
 //! Ctrl+Alt+Shift+F12, the guard's escape, is caught here too and sets the guard's fallback event.
-//! The same host answers `Command::Activate` (window class `explorust.keys`): the parts ask it to
+//! The same host answers `Command::Activate` over a named pipe: the parts ask it to
 //! bring a window forward, which explorust alone cannot do over an elevated window.
 
 pub mod chords;
@@ -14,4 +14,6 @@ mod activate;
 #[cfg(target_os = "windows")]
 mod hook;
 #[cfg(target_os = "windows")]
-pub use hook::spawn;
+mod pipe;
+#[cfg(target_os = "windows")]
+pub use hook::{spawn, spawn_for_shell};

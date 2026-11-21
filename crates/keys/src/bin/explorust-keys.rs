@@ -2,7 +2,7 @@
 //! this exe carries UI access (`uiAccess="true"`, signed, in Program Files). explorust starts it
 //! with `--shell <pid>`; it ends when that explorust ends or sets `Local\explorust-keys-quit-<pid>`.
 //! It starts no process: shell actions are posted to explorust. It also answers `Command::Activate`
-//! (class `explorust.keys`), so the parts bring windows forward over elevated ones. Log: `%LOCALAPPDATA%\explorust\hotkeys.log`.
+//! over a named pipe, so the parts bring windows forward over elevated ones. Log: `%LOCALAPPDATA%\explorust\hotkeys.log`.
 //!
 //! Exit codes: 0 explorust ended or asked it to stop, 2 bad arguments, 3 another instance kept the
 //! session's mutex, 4 the hook was refused.
@@ -90,7 +90,7 @@ mod win {
                 return 0;
             };
             let quit = OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(format!(r"Local\explorust-keys-quit-{shell}")));
-            if let Err(e) = keys::spawn(line) {
+            if let Err(e) = keys::spawn_for_shell(shell, line) {
                 line(&format!("{e}: exiting"));
                 return 4;
             }
