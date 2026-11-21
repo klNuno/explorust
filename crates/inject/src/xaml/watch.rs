@@ -43,6 +43,9 @@ pub struct State {
     /// The window's own backdrop, one record per application (a Window can be reported again),
     /// put back newest first by [`undo`].
     kept: Vec<super::backdrop::Kept>,
+    /// Windows whose backdrop this watch set: a Window reported again keeps its one record and
+    /// its one activation handler.
+    windows: Vec<InstanceHandle>,
 }
 
 /// An effective property value: its index in the property chain, its value as text (a
@@ -135,13 +138,16 @@ impl Watch_Impl {
         }
         if ty == "Windows.UI.Xaml.Window"
             && let Some(what) = &self.rules.backdrop
+            && !lock(&self.st).windows.contains(&el.Handle)
         {
             let t = Instant::now();
             let r = super::backdrop::apply(&self.diag, el.Handle, what);
             let us = t.elapsed().as_micros();
             match r {
                 Ok((s, k)) => {
-                    lock(&self.st).kept.push(k);
+                    let mut st = lock(&self.st);
+                    st.kept.push(k);
+                    st.windows.push(el.Handle);
                     report::line(format!("{label}: system backdrop {s} in {us} us, {} ms after advise", self.t0.elapsed().as_millis()));
                 }
                 Err(e) => report::line(format!("{label}: system backdrop not set: {e}")),

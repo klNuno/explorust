@@ -60,7 +60,9 @@ pub struct Table {
     /// Links lookups running on this table, and the records the journal touched while one ran:
     /// a lookup's result for such a record is stale.
     watchers: usize,
-    touched: std::collections::HashSet<u32>,
+    /// Record -> the touch count when the journal last changed it; `touches` counts them.
+    touched: std::collections::HashMap<u32, u64>,
+    touches: u64,
 }
 
 /// What a record holds, compared across a hard link lookup made without the lock (compaction
@@ -143,13 +145,19 @@ impl Table {
     /// The journal changed `rec` (called for every record it applies).
     pub fn touch(&mut self, rec: u32) {
         if self.watchers > 0 {
-            self.touched.insert(rec);
+            self.touches += 1;
+            self.touched.insert(rec, self.touches);
         }
     }
 
-    /// The journal changed `rec` while a links lookup ran.
-    pub fn touched(&self, rec: u32) -> bool {
-        self.touched.contains(&rec)
+    /// Where the journal stands, for a lookup to snapshot with its records.
+    pub fn touches(&self) -> u64 {
+        self.touches
+    }
+
+    /// The journal changed `rec` after a lookup's snapshot taken at `since`.
+    pub fn touched_since(&self, rec: u32, since: u64) -> bool {
+        self.touched.get(&rec).is_some_and(|&n| n > since)
     }
 
     pub fn recheck_links(&mut self, rec: u32) {
@@ -663,14 +671,17 @@ mod tests {
         // A lookup snapshots the pruned file, then the journal deletes it.
         t.watch_touches(true);
         let was = t.state(50);
+        let since = t.touches();
         t.touch(50);
         t.remove(50);
         assert_ne!(t.state(50), was, "a deleted pruned record is free, not pruned");
-        assert!(t.touched(50) && !t.touched(33));
+        assert!(t.touched_since(50, since) && !t.touched_since(33, since));
+        // A lookup that starts after the change reads the new state: not stale for it.
+        assert!(!t.touched_since(50, t.touches()));
         t.watch_touches(false);
-        assert!(!t.touched(50), "the set ends with the last lookup");
+        assert!(!t.touched_since(50, since), "the set ends with the last lookup");
         t.touch(33);
-        assert!(!t.touched(33), "no lookup running: nothing kept");
+        assert!(!t.touched_since(33, 0), "no lookup running: nothing kept");
     }
 
     #[test]

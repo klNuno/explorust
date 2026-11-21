@@ -141,9 +141,9 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -
         t.watch_touches(true);
     }
     for chunk in frns.chunks(256) {
-        let before: Vec<RecState> = {
+        let (before, since): (Vec<RecState>, u64) = {
             let t = table.read().unwrap_or_else(|p| p.into_inner());
-            chunk.iter().map(|&f| t.state((f & ((1 << 48) - 1)) as u32)).collect()
+            (chunk.iter().map(|&f| t.state((f & ((1 << 48) - 1)) as u32)).collect(), t.touches())
         };
         let mut found = Vec::new();
         for (&frn, was) in chunk.iter().zip(before) {
@@ -160,7 +160,7 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -
             break;
         }
         for (rec, was, links) in found {
-            if t.state(rec) != was || t.touched(rec) {
+            if t.state(rec) != was || t.touched_since(rec, since) {
                 continue;
             }
             match links.into_iter().find(|(p, _)| !t.pruned_parent(*p)) {
