@@ -1,20 +1,29 @@
 //! Settings' look from inside its XAML: a TAP (the XAML diagnostics extension point that Visual
 //! Studio's Live Visual Tree uses) in `explorust_inject.dll`, loaded into SystemSettings.exe when
 //! explorust calls `InitializeXamlDiagnosticsEx` on it ([`attach`]), only when
-//! `settings-style.txt` exists. The TAP watches Settings' visual tree and applies the file's rules:
-//! element backgrounds and the window's system backdrop ([`rules`]). Kill switch: a line
-//! `settingsxaml` (or `inject`) in `parts-off.txt`.
+//! a style or dump is requested. The TAP follows Settings' visual tree and applies rule edits on
+//! its live connection: element backgrounds and the window's system backdrop ([`rules`]). Kill
+//! switch: a line `settingsxaml` (or `inject`) in `parts-off.txt`.
 
 pub mod rules;
+
+#[cfg(any(target_os = "windows", test))]
+mod state;
 
 #[cfg(target_os = "windows")]
 mod abi;
 #[cfg(target_os = "windows")]
-mod backdrop;
-#[cfg(target_os = "windows")]
 pub mod attach;
 #[cfg(target_os = "windows")]
+mod backdrop;
+#[cfg(target_os = "windows")]
+mod config;
+#[cfg(target_os = "windows")]
+mod property;
+#[cfg(target_os = "windows")]
 pub mod report;
+#[cfg(target_os = "windows")]
+mod session;
 #[cfg(target_os = "windows")]
 mod tap;
 #[cfg(target_os = "windows")]

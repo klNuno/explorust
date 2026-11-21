@@ -1,26 +1,15 @@
-//! The TAP object Settings loads when explorust calls `InitializeXamlDiagnosticsEx` on it: the
-//! XAML runtime asks this DLL's class factory for `CLSID_TAP`, then hands the object its
-//! diagnostics site (`IObjectWithSite::SetSite`). From the site: the rules (the initialization
-//! data) and the visual tree service, advised from a thread of our own (advising on the thread
-//! that called `SetSite` blocks the runtime).
-//!
-//! One watch runs per process: a TAP loaded again (explorust restarted, its rules changed, or the
-//! TAP switched off, then loaded with no rules) first unadvises the previous watch and, on the UI
-//! thread, clears the Backgrounds it set and gives the window its own backdrop back.
+//! COM entry points for the Settings diagnostics TAP. The runtime supplies the diagnostics
+//! site through IObjectWithSite; a process-wide worker handles changes in call order.
 
-use super::abi::*;
-use super::report;
-use super::rules::Rules;
-use super::watch::{self, Watch};
+use super::session;
+use super::state::SiteChange;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use windows::UI::Core::{CoreDispatcher, CoreDispatcherPriority, DispatchedHandler};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Foundation::{CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, S_FALSE};
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, IClassFactory, IClassFactory_Impl};
+use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::System::Ole::{IObjectWithSite, IObjectWithSite_Impl};
-use windows_core::{BOOL, GUID, HRESULT, IInspectable, IUnknown, Interface, Ref, implement};
+use windows_core::{BOOL, GUID, HRESULT, IUnknown, Interface, Ref, implement};
 
 #[unsafe(no_mangle)]
 /// # Safety
@@ -76,22 +65,14 @@ static TAPS: AtomicU64 = AtomicU64::new(0);
 impl IObjectWithSite_Impl for Tap_Impl {
     fn SetSite(&self, site: Ref<IUnknown>) -> windows_core::Result<()> {
         let site = site.cloned();
-        *self.site.lock().unwrap_or_else(|e| e.into_inner()) = site.clone();
-        let r = match site {
-            Some(s) => start(&s, self.id),
-            // The runtime lets go of the TAP: its watch, if still the active one, stops and its
-            // changes are undone, after any attach in flight (same lock).
-            None => {
-                let id = self.id;
-                spawn(move || {
-                    let _swap = SWAP.lock().unwrap_or_else(|e| e.into_inner());
-                    stop_active(Instant::now(), Some(id));
-                })
-            }
-        };
-        if let Err(e) = r {
-            report::line(format!("tap: not started: {e}"));
-        }
+        let mut current = self.site.lock().unwrap_or_else(|e| e.into_inner());
+        session::enqueue(match site.as_ref() {
+            Some(s) => SiteChange::Attach(self.id, session::Site(s.clone())),
+            None => SiteChange::Detach(self.id),
+        })?;
+        let previous = std::mem::replace(&mut *current, site);
+        drop(current);
+        drop(previous);
         Ok(())
     }
 
@@ -102,132 +83,4 @@ impl IObjectWithSite_Impl for Tap_Impl {
             None => Err(E_FAIL.into()),
         }
     }
-}
-
-/// Moves a COM pointer to the advise thread; the diagnostics service is free-threaded.
-struct Send<T>(T);
-// SAFETY: see above; XAML's own tools advise from a second thread the same way.
-unsafe impl<T> std::marker::Send for Send<T> {}
-
-/// The watch advised in this process.
-struct Session {
-    svc: IVisualTreeService,
-    diag: IXamlDiagnostics,
-    cb: IVisualTreeServiceCallback2,
-    st: Arc<Mutex<watch::State>>,
-    tap: u64,
-}
-
-static ACTIVE: Mutex<Option<Send<Session>>> = Mutex::new(None);
-/// Held while one TAP undoes the previous watch and advises its own.
-static SWAP: Mutex<()> = Mutex::new(());
-
-fn spawn(f: impl FnOnce() + std::marker::Send + 'static) -> windows_core::Result<()> {
-    std::thread::Builder::new().name("explorust-xaml".into()).spawn(f).map(|_| ()).map_err(|_| E_FAIL.into())
-}
-
-/// Unadvises the running watch (only when TAP `only` advised it, if given), then undoes its
-/// changes on the UI thread and waits for that. Called with `SWAP` held.
-fn stop_active(t0: Instant, only: Option<u64>) {
-    let s = {
-        let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-        if only.is_some_and(|id| active.as_ref().is_some_and(|a| a.0.tap != id)) {
-            return;
-        }
-        active.take()
-    };
-    let Some(Send(s)) = s else { return };
-    // SAFETY: COM on this thread; the callback was advised on this service.
-    let hr = unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        s.svc.UnadviseVisualTreeChange(s.cb.as_raw())
-    };
-    let mut raw = std::ptr::null_mut();
-    // SAFETY: an out pointer; the reference is owned by `IInspectable` below.
-    let dispatcher = unsafe { s.diag.GetDispatcher(&mut raw) }
-        .ok()
-        .and_then(|()| (!raw.is_null()).then(|| unsafe { IInspectable::from_raw(raw) }).ok_or(E_FAIL.into()))
-        .and_then(|i| i.cast::<CoreDispatcher>());
-    let (tx, rx) = std::sync::mpsc::channel();
-    // Claimed by whichever comes first: the queued undo, or this thread giving up on it, so an
-    // undo that runs late never lands over the next watch's styling.
-    let claim = Arc::new(AtomicBool::new(false));
-    let moved = Send((s.st.clone(), s.svc.clone(), tx, claim.clone()));
-    let queued = dispatcher.and_then(|d| {
-        d.RunAsync(
-            CoreDispatcherPriority::Normal,
-            &DispatchedHandler::new(move || {
-                // The whole wrapper is moved in (Send), not its fields one by one.
-                let m = &moved;
-                let (st, svc, tx, claim) = &m.0;
-                if !claim.swap(true, Ordering::AcqRel) {
-                    let _ = tx.send(watch::undo(st, svc));
-                }
-                Ok(())
-            }),
-        )
-    });
-    let undone = match queued {
-        Ok(_) => match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(u) => u,
-            // Running already: let it finish (bounded) rather than style over it.
-            Err(_) if claim.swap(true, Ordering::AcqRel) => {
-                rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| "undo still running after 10 s".into())
-            }
-            Err(_) => "UI thread did not answer in 5 s, undo cancelled".into(),
-        },
-        Err(e) => format!("no UI dispatcher: {e}"),
-    };
-    report::line(format!("tap: previous watch unadvised {:#010x}, {undone}, in {} ms", hr.0, t0.elapsed().as_millis()));
-}
-
-fn start(site: &IUnknown, tap: u64) -> windows_core::Result<()> {
-    let t0 = Instant::now();
-    let diag: IXamlDiagnostics = site.cast()?;
-    let svc: IVisualTreeService = site.cast()?;
-    let mut data: *mut u16 = std::ptr::null_mut();
-    // SAFETY: an out BSTR we free.
-    let text = unsafe {
-        let hr = diag.GetInitializationData(&mut data);
-        let t = if hr.is_ok() { bstr(data) } else { String::new() };
-        SysFreeString(data);
-        t
-    };
-    let rules = Rules::parse(&text);
-    report::line(format!(
-        "tap: site set in pid {}, {} rules, dump {}",
-        std::process::id(),
-        rules.len(),
-        rules.dump
-    ));
-    let idle = rules.idle();
-    let (w, st) = Watch::new(svc.clone(), diag.clone(), rules, t0);
-    let cb: IVisualTreeServiceCallback2 = w.into();
-    let moved = Send(Session { svc, diag, cb, st, tap });
-    spawn(move || {
-        let m = moved;
-        let swap = SWAP.lock().unwrap_or_else(|e| e.into_inner());
-        stop_active(t0, None);
-        if idle {
-            report::line("tap: no rules, Settings keeps its own look".into());
-            return;
-        }
-        let s = m.0;
-        // SAFETY: COM on this thread; the callback lives as long as the service holds it.
-        let hr = unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            s.svc.AdviseVisualTreeChange(s.cb.as_raw())
-        };
-        report::line(format!("tap: advise {:#010x} in {} ms", hr.0, t0.elapsed().as_millis()));
-        let st = s.st.clone();
-        if hr.is_ok() {
-            *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Send(s));
-        }
-        drop(swap);
-        // The first burst reports the existing tree; send what the dump holds after it.
-        for wait in [2, 6, 20] {
-            std::thread::sleep(Duration::from_secs(wait));
-            watch::flush(&st, t0);
-        }
-    })
 }

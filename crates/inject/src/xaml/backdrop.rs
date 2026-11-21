@@ -5,14 +5,14 @@
 //! (the controller swaps Mica for its inactive color when the window loses focus).
 
 use super::abi::{IXamlDiagnostics, InstanceHandle};
-use super::rules::argb;
 use super::report;
+use super::rules::argb;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Foundation::TypedEventHandler;
 use windows::UI::Color;
 use windows::UI::Composition::{CompositionBrush, Compositor, ICompositionSupportsSystemBackdrop};
 use windows::UI::Core::{CoreDispatcherPriority, CoreWindow, DispatchedHandler, WindowActivatedEventArgs};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use windows_core::{IInspectable, Interface};
 
 /// What [`restore`] needs to give the window its own backdrop back: the old brush and the
@@ -23,6 +23,11 @@ pub struct Kept {
     window: Option<CoreWindow>,
     token: i64,
     live: Arc<AtomicBool>,
+}
+impl Kept {
+    pub fn pause(&self) {
+        self.live.store(false, Ordering::SeqCst);
+    }
 }
 // SAFETY: made and used on Settings' UI thread (the tree callback and that window's dispatcher);
 // other threads only move it.
@@ -45,12 +50,18 @@ pub fn apply(diag: &IXamlDiagnostics, h: InstanceHandle, what: &str) -> Result<(
     let new: Option<CompositionBrush> = match what {
         "none" => None,
         _ => {
-            let c: Compositor = old.as_ref().ok_or("no compositor: the window has no backdrop yet")?.Compositor().map_err(|e| e.to_string())?;
+            let c: Compositor = old
+                .as_ref()
+                .ok_or("no compositor: the window has no backdrop yet")?
+                .Compositor()
+                .map_err(|e| e.to_string())?;
             Some(if what == "host" {
                 c.CreateHostBackdropBrush().and_then(|b| b.cast()).map_err(|e| e.to_string())?
             } else {
                 let [a, r, g, b] = argb(what).ok_or_else(|| format!("bad backdrop {what}"))?;
-                c.CreateColorBrushWithColor(Color { A: a, R: r, G: g, B: b }).and_then(|b| b.cast()).map_err(|e| e.to_string())?
+                c.CreateColorBrushWithColor(Color { A: a, R: r, G: g, B: b })
+                    .and_then(|b| b.cast())
+                    .map_err(|e| e.to_string())?
             })
         }
     };
@@ -63,19 +74,28 @@ pub fn apply(diag: &IXamlDiagnostics, h: InstanceHandle, what: &str) -> Result<(
             (None, 0, "not kept")
         }
     };
-    Ok((format!("{old_name} -> {what}, {kept}"), Kept { target, old, window, token, live }))
+    Ok((
+        format!("{old_name} -> {what}, {kept}"),
+        Kept {
+            target,
+            old,
+            window,
+            token,
+            live,
+        },
+    ))
 }
 
-/// On the UI thread: revokes the activation handler and puts Settings' brush back.
-pub fn restore(k: Kept) -> String {
-    k.live.store(false, Ordering::SeqCst);
+/// On the UI thread: revokes the activation handler and puts Settings' brush back. The caller
+/// retains this record if either operation fails.
+pub fn restore(k: &mut Kept) -> windows_core::Result<String> {
+    k.pause();
     if let Some(w) = &k.window {
-        let _ = w.RemoveActivated(k.token);
+        w.RemoveActivated(k.token)?;
+        k.window = None;
     }
-    match k.target.SetSystemBackdrop(k.old.as_ref()) {
-        Ok(()) => format!("system backdrop {} again", k.old.as_ref().map_or("null".into(), name)),
-        Err(e) => format!("system backdrop not restored: {e}"),
-    }
+    k.target.SetSystemBackdrop(k.old.as_ref())?;
+    Ok(format!("system backdrop {} again", k.old.as_ref().map_or("null".into(), name)))
 }
 
 /// The window's backdrop and the brush we want there, used on the UI thread only.
@@ -107,7 +127,10 @@ fn keep(target: ICompositionSupportsSystemBackdrop, brush: Option<CompositionBru
                 let now = want.0.SystemBackdrop().ok();
                 if now.as_ref().map(Interface::as_raw) != want.1.as_ref().map(Interface::as_raw) {
                     want.0.SetSystemBackdrop(want.1.as_ref())?;
-                    report::line(format!("system backdrop: Settings put {} back, ours set again", now.as_ref().map_or("null".into(), name)));
+                    report::line(format!(
+                        "system backdrop: Settings put {} back, ours set again",
+                        now.as_ref().map_or("null".into(), name)
+                    ));
                 }
                 Ok(())
             }),
@@ -118,5 +141,7 @@ fn keep(target: ICompositionSupportsSystemBackdrop, brush: Option<CompositionBru
 }
 
 fn name(b: &CompositionBrush) -> String {
-    b.cast::<IInspectable>().and_then(|i| i.GetRuntimeClassName()).map_or("?".into(), |n| n.to_string())
+    b.cast::<IInspectable>()
+        .and_then(|i| i.GetRuntimeClassName())
+        .map_or("?".into(), |n| n.to_string())
 }

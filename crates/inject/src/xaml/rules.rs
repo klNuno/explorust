@@ -1,8 +1,8 @@
 //! What the TAP changes in Settings, from `%LOCALAPPDATA%\explorust\settings-style.txt`: plain
 //! logic, tested on any OS. There are no built-in rules: without the file Settings is left alone.
 //!
-//! The loader sends the rules to the TAP as the initialization data of
-//! `InitializeXamlDiagnosticsEx`: one rule per line, `Type#Name`, `Type` or `#Name`, optionally
+//! The TAP reads the rules from its configuration directory: one rule per line, `Type#Name`,
+//! `Type` or `#Name`, optionally
 //! followed by `= <color>` (a XAML color: `Transparent`, `#80202020`; Transparent when left out); a
 //! comment starts with `# ` (hash, space), blank lines are skipped. A type matches the element's
 //! full type name or its last segment (`Grid` matches `Windows.UI.Xaml.Controls.Grid`). A line
@@ -67,7 +67,11 @@ impl Rules {
             if ty.is_empty() && name.is_empty() {
                 continue;
             }
-            r.list.push(Rule { ty: some(ty), name: some(name), color: color.to_string() });
+            r.list.push(Rule {
+                ty: some(ty),
+                name: some(name),
+                color: color.to_string(),
+            });
         }
         r
     }
@@ -76,7 +80,7 @@ impl Rules {
         self.list.len()
     }
 
-    /// Nothing to do: the TAP only undoes what a previous one in the process set.
+    /// No style or tree dump is requested.
     pub fn idle(&self) -> bool {
         self.list.is_empty() && !self.dump && self.backdrop.is_none()
     }
@@ -149,5 +153,4 @@ mod tests {
         assert_eq!(Rules::parse("!backdrop  #40FF0000 \n").backdrop.as_deref(), Some("#40FF0000"));
         assert_eq!(Rules::parse("!backdrop\n#A\n").backdrop, None);
     }
-
 }

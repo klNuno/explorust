@@ -1,282 +1,287 @@
-//! The TAP's tree watch: the diagnostics service reports every element of Settings' visual tree
-//! (the existing ones first, then each one added); an element a rule names gets a brush of the
-//! rule's color (transparent by default) as its local `Background`, so the backdrop explorust gives
-//! Settings' frame shows through.
+//! Settings' XAML tree and the values this TAP owns. Tree notifications keep live handles so
+//! a config edit can restyle Settings without advising the diagnostics service again.
 
 use super::abi::*;
+use super::backdrop;
+use super::property;
 use super::report;
 use super::rules::Rules;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use windows_core::{HRESULT, implement};
 
-/// Tree lines sent by the dump at most.
 const DUMP_MAX: usize = 6000;
-/// Dump lines per `WM_COPYDATA`.
 const BATCH: usize = 60;
-/// `PropertyChainValue::MetadataBits`: the value is another element's handle, or null.
-const IS_VALUE_HANDLE: i64 = 0x1;
-const IS_VALUE_NULL: i64 = 0x20;
-/// `BaseValueSourceLocal` (xamlom.h).
-const BASE_VALUE_SOURCE_LOCAL: i32 = 4;
 
 #[implement(IVisualTreeServiceCallback2)]
 pub struct Watch {
-    svc: IVisualTreeService,
-    diag: IXamlDiagnostics,
-    rules: Rules,
-    t0: Instant,
-    st: Arc<Mutex<State>>,
-}
-
-#[derive(Default)]
-pub struct State {
-    brushes: HashMap<String, InstanceHandle>,
-    depth: HashMap<InstanceHandle, u32>,
-    seen: usize,
-    dumped: usize,
-    cleared: usize,
-    buf: Vec<String>,
-    /// Backgrounds this watch set (element, property index), cleared by [`undo`].
-    set: Vec<(InstanceHandle, u32)>,
-    /// The window's own backdrop, one record per application (a Window can be reported again),
-    /// put back newest first by [`undo`].
-    kept: Vec<super::backdrop::Kept>,
-    /// Windows whose backdrop this watch set: a Window reported again keeps its one record and
-    /// its one activation handler.
-    windows: Vec<InstanceHandle>,
-}
-
-/// An effective property value: its index in the property chain, its value as text (a
-/// handle's number when `handle`) and the value's type.
-struct Prop {
-    index: u32,
-    value: String,
-    ty: String,
-    handle: bool,
-    /// Set locally (a value or a binding Settings gave the element), not by a style.
-    local: bool,
+    tree: Arc<Tree>,
 }
 
 impl Watch {
-    /// The watch and its state, which a timer thread flushes with [`flush`].
-    pub fn new(svc: IVisualTreeService, diag: IXamlDiagnostics, rules: Rules, t0: Instant) -> (Watch, Arc<Mutex<State>>) {
-        let st = Arc::new(Mutex::new(State::default()));
-        (Watch { svc, diag, rules, t0, st: st.clone() }, st)
+    pub fn new(tree: Arc<Tree>) -> Self {
+        Self { tree }
     }
 }
 
-fn lock(st: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
-    st.lock().unwrap_or_else(|e| e.into_inner())
+pub struct Tree {
+    svc: IVisualTreeService,
+    diag: IXamlDiagnostics,
+    t0: Instant,
+    state: Mutex<State>,
 }
 
-/// Sends what the dump still holds and a count (called from a timer thread after the first burst).
-pub fn flush(st: &Mutex<State>, t0: Instant) {
-    let (lines, seen, cleared) = {
-        let mut st = lock(st);
-        (std::mem::take(&mut st.buf), st.seen, st.cleared)
-    };
-    report::send(&lines);
-    report::line(format!("tree so far: {seen} elements seen, {cleared} backgrounds set, {} ms after advise", t0.elapsed().as_millis()));
+// SAFETY: the diagnostics interfaces are free-threaded. Element and backdrop operations are
+// only performed by the tree callbacks and the diagnostics UI dispatcher. The worker flushes logs.
+unsafe impl Send for Tree {}
+unsafe impl Sync for Tree {}
+
+struct State {
+    rules: Option<Arc<Rules>>,
+    nodes: HashMap<InstanceHandle, Node>,
+    sequence: usize,
+    dumped: usize,
+    buf: Vec<String>,
+    brushes: HashMap<String, InstanceHandle>,
+    backgrounds: HashMap<InstanceHandle, Background>,
+    windows: HashMap<InstanceHandle, backdrop::Kept>,
 }
 
-/// On Settings' UI thread, once the watch is unadvised: clears the Backgrounds it set and gives
-/// the window its own backdrop back; a line for the log.
-pub fn undo(st: &Mutex<State>, svc: &IVisualTreeService) -> String {
-    let (set, kept) = {
-        let mut st = lock(st);
-        (std::mem::take(&mut st.set), std::mem::take(&mut st.kept))
-    };
-    let mut cleared = 0;
-    for (h, i) in &set {
-        // SAFETY: handles and indexes this service gave; a gone element only fails the call.
-        if unsafe { svc.ClearProperty(*h, *i) }.is_ok() {
-            cleared += 1;
+#[derive(Clone)]
+struct Node {
+    ty: String,
+    name: String,
+    children: u32,
+    depth: u32,
+    sequence: usize,
+}
+
+impl Node {
+    fn label(&self) -> String {
+        let short = self.ty.rsplit('.').next().unwrap_or(&self.ty);
+        if self.name.is_empty() {
+            short.into()
+        } else {
+            format!("{short}#{}", self.name)
         }
     }
-    let backdrop = if kept.is_empty() {
-        "system backdrop untouched".to_string()
-    } else {
-        // Newest first: the oldest record holds Settings' own brush and is put back last.
-        let mut line = String::new();
-        for k in kept.into_iter().rev() {
-            line = super::backdrop::restore(k);
-        }
-        line
-    };
-    format!("{cleared} of {} backgrounds cleared, {backdrop}", set.len())
 }
 
-impl Watch_Impl {
-    fn added(&self, rel: &ParentChildRelation, el: &VisualElement) {
-        let ty = bstr(el.Type);
-        let name = bstr(el.Name);
-        let short = ty.rsplit('.').next().unwrap_or(&ty).to_string();
-        let label = if name.is_empty() { short.clone() } else { format!("{short}#{name}") };
-        let depth = {
-            let mut st = lock(&self.st);
-            let d = if rel.Parent == 0 { 0 } else { st.depth.get(&rel.Parent).map_or(0, |d| d + 1) };
-            st.depth.insert(el.Handle, d);
-            st.seen += 1;
-            d
+#[derive(Clone, Copy)]
+struct Background {
+    index: u32,
+    brush: InstanceHandle,
+}
+
+impl Tree {
+    pub fn new(svc: IVisualTreeService, diag: IXamlDiagnostics, t0: Instant) -> Self {
+        Self {
+            svc,
+            diag,
+            t0,
+            state: Mutex::new(State {
+                rules: None,
+                nodes: HashMap::new(),
+                sequence: 0,
+                dumped: 0,
+                buf: Vec::new(),
+                brushes: HashMap::new(),
+                backgrounds: HashMap::new(),
+                windows: HashMap::new(),
+            }),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn flush(&self) {
+        let lines = std::mem::take(&mut self.state().buf);
+        report::send(&lines);
+    }
+
+    pub fn pause(&self) {
+        let mut state = self.state();
+        state.rules = None;
+        for kept in state.windows.values() {
+            kept.pause();
+        }
+    }
+
+    /// Called on the UI thread. Keep any values whose restoration failed so the worker can retry.
+    /// Without a desired style this is the final rollback of an unadvised watch.
+    pub fn update(&self, rules: Option<&Arc<Rules>>) -> bool {
+        self.pause();
+        if !self.restore() {
+            return false;
+        }
+        self.state().brushes.clear();
+        if let Some(rules) = rules {
+            let mut nodes = {
+                let mut state = self.state();
+                state.dumped = 0;
+                state.rules = Some(rules.clone());
+                state.nodes.iter().map(|(&h, n)| (h, n.clone())).collect::<Vec<_>>()
+            };
+            nodes.sort_unstable_by_key(|(_, node)| node.sequence);
+            for (h, node) in nodes {
+                if self.state().nodes.get(&h).is_some_and(|n| n.sequence == node.sequence) {
+                    self.apply(h, &node, rules);
+                }
+            }
+            self.flush();
+            report::line(format!("tap: live rules now {}, dump {}, pid {}", rules.len(), rules.dump, std::process::id()));
+        }
+        true
+    }
+
+    fn restore(&self) -> bool {
+        let backgrounds = self.state().backgrounds.clone();
+        let mut cleared = 0;
+        for (h, owned) in backgrounds {
+            match self.clear_background(h, owned) {
+                Ok(did_clear) => {
+                    cleared += usize::from(did_clear);
+                    self.state().backgrounds.remove(&h);
+                }
+                Err(e) => report::line(format!("tap: Background restore failed {:#010x}, will retry", e.0)),
+            }
+        }
+        // Do not hold a mutex across calls into XAML, which may invoke tree callbacks.
+        let windows = std::mem::take(&mut self.state().windows);
+        for (h, mut kept) in windows {
+            match backdrop::restore(&mut kept) {
+                Ok(line) => report::line(line),
+                Err(e) => {
+                    self.state().windows.insert(h, kept);
+                    report::line(format!("tap: system backdrop restore failed, will retry: {e}"));
+                }
+            }
+        }
+        let state = self.state();
+        let complete = state.backgrounds.is_empty() && state.windows.is_empty();
+        drop(state);
+        report::line(format!("tap: {cleared} backgrounds cleared, rollback complete {complete}"));
+        complete
+    }
+
+    fn clear_background(&self, h: InstanceHandle, owned: Background) -> Result<bool, HRESULT> {
+        let Some(bg) = property::get(&self.svc, h, "Background", Some(owned.brush))? else {
+            return Ok(false);
         };
-        if self.rules.dump && lock(&self.st).dumped < DUMP_MAX {
-            // The service is not called with the lock held: a call may report tree changes.
-            let bg = match self.background(el.Handle) {
-                Ok(Some(b)) => format!(" bg={}", self.describe(&b)),
-                _ => String::new(),
-            };
-            let line = format!("tree {}{label} [{}]{bg}", " ".repeat(depth.min(60) as usize), el.NumChildren);
-            let out = {
-                let mut st = lock(&self.st);
-                st.dumped += 1;
-                st.buf.push(line);
-                if st.buf.len() >= BATCH { std::mem::take(&mut st.buf) } else { Vec::new() }
-            };
-            report::send(&out);
+        if bg.value.index != owned.index || !bg.ownership.can_clear() {
+            return Ok(false);
         }
-        if ty == "Windows.UI.Xaml.Window"
-            && let Some(what) = &self.rules.backdrop
-            && !lock(&self.st).windows.contains(&el.Handle)
+        // SAFETY: the property chain still contains the local brush we set.
+        unsafe { self.svc.ClearProperty(h, owned.index) }.ok()?;
+        Ok(true)
+    }
+
+    fn added(&self, rel: &ParentChildRelation, el: &VisualElement) {
+        let (node, rules) = {
+            let mut state = self.state();
+            if state.nodes.contains_key(&el.Handle) {
+                return;
+            }
+            let depth = state.nodes.get(&rel.Parent).map_or(0, |parent| parent.depth + 1);
+            let node = Node {
+                ty: bstr(el.Type),
+                name: bstr(el.Name),
+                children: el.NumChildren,
+                depth,
+                sequence: state.sequence,
+            };
+            state.sequence += 1;
+            state.nodes.insert(el.Handle, node.clone());
+            (node, state.rules.clone())
+        };
+        if let Some(rules) = rules {
+            self.apply(el.Handle, &node, &rules);
+        }
+    }
+
+    fn apply(&self, h: InstanceHandle, node: &Node, rules: &Rules) {
+        let label = node.label();
+        if rules.dump && self.state().dumped < DUMP_MAX {
+            let bg = property::get(&self.svc, h, "Background", None)
+                .ok()
+                .flatten()
+                .map_or(String::new(), |p| format!(" bg={}", property::describe(&self.svc, &p.value)));
+            let line = format!("tree {}{label} [{}]{bg}", " ".repeat(node.depth.min(60) as usize), node.children);
+            let mut state = self.state();
+            state.dumped += 1;
+            state.buf.push(line);
+            if state.buf.len() >= BATCH {
+                let out = std::mem::take(&mut state.buf);
+                drop(state);
+                report::send(&out);
+            }
+        }
+        if node.ty == "Windows.UI.Xaml.Window"
+            && let Some(what) = &rules.backdrop
+            && !self.state().windows.contains_key(&h)
         {
-            let t = Instant::now();
-            let r = super::backdrop::apply(&self.diag, el.Handle, what);
-            let us = t.elapsed().as_micros();
-            match r {
-                Ok((s, k)) => {
-                    let mut st = lock(&self.st);
-                    st.kept.push(k);
-                    st.windows.push(el.Handle);
-                    report::line(format!("{label}: system backdrop {s} in {us} us, {} ms after advise", self.t0.elapsed().as_millis()));
+            match backdrop::apply(&self.diag, h, what) {
+                Ok((message, kept)) => {
+                    self.state().windows.insert(h, kept);
+                    report::line(format!("{label}: system backdrop {message}"));
                 }
                 Err(e) => report::line(format!("{label}: system backdrop not set: {e}")),
             }
         }
-        if let Some(color) = self.rules.color(&ty, &name) {
-            let t = Instant::now();
-            let r = self.set_background(el.Handle, color);
-            let us = t.elapsed().as_micros();
-            match r {
-                Ok(i) => {
-                    let n = {
-                        let mut st = lock(&self.st);
-                        st.cleared += 1;
-                        st.cleared
-                    };
-                    report::line(format!(
-                        "{label}: Background {color} (property {i}) in {us} us, {n} so far, {} ms after advise",
-                        self.t0.elapsed().as_millis()
-                    ));
-                }
+        if let Some(color) = rules.color(&node.ty, &node.name) {
+            match self.set_background(h, color) {
+                Ok(i) => report::line(format!(
+                    "{label}: Background {color} (property {i}) {} ms after advise",
+                    self.t0.elapsed().as_millis()
+                )),
                 Err(e) => report::line(format!("{label}: Background not set: {e}")),
             }
         }
     }
 
     fn removed(&self, el: &VisualElement) {
-        let mut st = lock(&self.st);
-        st.depth.remove(&el.Handle);
-        st.set.retain(|(h, _)| *h != el.Handle);
+        let mut state = self.state();
+        state.nodes.remove(&el.Handle);
+        state.backgrounds.remove(&el.Handle);
     }
 
-    /// Sets the element's local `Background` to a shared brush of that color; the property's index.
     fn set_background(&self, h: InstanceHandle, color: &str) -> Result<u32, String> {
-        let bg = self.background(h)?.ok_or("no Background property")?;
-        // Undo clears what the rule set: a local value or binding of Settings' own would be lost.
-        if bg.local {
-            return Err("set locally by Settings, left alone".into());
+        let bg = property::get(&self.svc, h, "Background", None)
+            .map_err(|hr| format!("GetPropertyValuesChain {:#010x}", hr.0))?
+            .ok_or("no Background property")?;
+        if !bg.ownership.can_set() {
+            return Err("local value or binding left alone".into());
         }
         let brush = self.brush(color)?;
-        // SAFETY: handles from this service; the index came from the element's own chain.
-        let hr = unsafe { self.svc.SetProperty(h, brush, bg.index) };
+        // SAFETY: handles from this service; the index is from the element's property chain.
+        let hr = unsafe { self.svc.SetProperty(h, brush, bg.value.index) };
         if hr.is_err() {
-            // A TAP loaded again into a Settings process that already had one gets 0x80070490
-            // here although the element and a fresh brush resolve (xaml-2); a new process does not.
             return Err(format!("SetProperty {:#010x}", hr.0));
         }
-        let mut st = lock(&self.st);
-        if !st.set.contains(&(h, bg.index)) {
-            st.set.push((h, bg.index));
+        let mut state = self.state();
+        if state.nodes.contains_key(&h) {
+            state.backgrounds.insert(h, Background { index: bg.value.index, brush });
         }
-        Ok(bg.index)
+        Ok(bg.value.index)
     }
 
     fn brush(&self, color: &str) -> Result<InstanceHandle, String> {
-        if let Some(b) = lock(&self.st).brushes.get(color) {
-            return Ok(*b);
+        if let Some(&b) = self.state().brushes.get(color) {
+            return Ok(b);
         }
         let ty = Bstr::new("Windows.UI.Xaml.Media.SolidColorBrush");
         let v = Bstr::new(color);
-        let mut b: InstanceHandle = 0;
+        let mut b = 0;
         // SAFETY: two live BSTRs and an out handle.
         let hr = unsafe { self.svc.CreateInstance(ty.0, v.0, &mut b) };
         if hr.is_err() || b == 0 {
             return Err(format!("CreateInstance(SolidColorBrush {color}) {:#010x}", hr.0));
         }
-        lock(&self.st).brushes.insert(color.to_string(), b);
+        self.state().brushes.insert(color.into(), b);
         Ok(b)
-    }
-
-    /// A Background for the dump: `SolidColorBrush(#FFF3F3F3)`, `AcrylicBrush`, `null`.
-    fn describe(&self, b: &Prop) -> String {
-        let short = b.ty.rsplit('.').next().unwrap_or(&b.ty).to_string();
-        if !b.handle {
-            return if short.is_empty() { b.value.clone() } else { format!("{short}({})", b.value) };
-        }
-        let color = b.value.parse::<InstanceHandle>().ok().and_then(|h| self.property(h, "Color").ok().flatten());
-        match color {
-            Some(c) => format!("{short}({})", c.value),
-            None => short,
-        }
-    }
-
-    fn background(&self, h: InstanceHandle) -> Result<Option<Prop>, String> {
-        self.property(h, "Background")
-    }
-
-    /// An element's effective property (the chain entry not overridden by another source), or None
-    /// when it has no such property.
-    fn property(&self, h: InstanceHandle, prop: &str) -> Result<Option<Prop>, String> {
-        let (mut ns, mut np) = (0u32, 0u32);
-        let mut sources: *mut PropertyChainSource = std::ptr::null_mut();
-        let mut values: *mut PropertyChainValue = std::ptr::null_mut();
-        // SAFETY: out pointers to locals; the arrays and their BSTRs are freed below.
-        let hr = unsafe { self.svc.GetPropertyValuesChain(h, &mut ns, &mut sources, &mut np, &mut values) };
-        if hr.is_err() {
-            return Err(format!("GetPropertyValuesChain {:#010x}", hr.0));
-        }
-        let mut found: Option<(bool, Prop)> = None;
-        // SAFETY: the service returned `np` values and `ns` sources in CoTaskMem arrays.
-        unsafe {
-            for i in 0..np as usize {
-                let v = &*values.add(i);
-                if bstr(v.PropertyName) == prop {
-                    let effective = v.Overridden == 0;
-                    if found.as_ref().is_none_or(|(e, _)| !e && effective) {
-                        let null = v.MetadataBits & IS_VALUE_NULL != 0;
-                        let value = if null { "null".to_string() } else { bstr(v.Value) };
-                        let handle = !null && v.MetadataBits & IS_VALUE_HANDLE != 0;
-                        let src = v.PropertyChainIndex as usize;
-                        let local = src < ns as usize && (*sources.add(src)).Source == BASE_VALUE_SOURCE_LOCAL;
-                        found = Some((effective, Prop { index: v.Index, value, ty: bstr(v.ValueType), handle, local }));
-                    }
-                }
-                for s in [v.Type, v.DeclaringType, v.ValueType, v.ItemType, v.Value, v.PropertyName] {
-                    SysFreeString(s);
-                }
-            }
-            for i in 0..ns as usize {
-                let s = &*sources.add(i);
-                SysFreeString(s.TargetType);
-                SysFreeString(s.Name);
-                SysFreeString(s.SrcInfo.FileName as *mut u16);
-                SysFreeString(s.SrcInfo.Hash as *mut u16);
-            }
-            CoTaskMemFree(values as *const _);
-            CoTaskMemFree(sources as *const _);
-        }
-        Ok(found.map(|(_, b)| b))
     }
 }
 
@@ -284,9 +289,9 @@ impl IVisualTreeServiceCallback_Impl for Watch_Impl {
     unsafe fn OnVisualTreeChange(&self, relation: ParentChildRelation, element: VisualElement, mutation: VisualMutationType) -> HRESULT {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if mutation == ADD {
-                self.added(&relation, &element);
+                self.tree.added(&relation, &element);
             } else {
-                self.removed(&element);
+                self.tree.removed(&element);
             }
         }));
         HRESULT(0)
