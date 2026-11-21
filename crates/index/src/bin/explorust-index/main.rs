@@ -9,7 +9,11 @@
 #[cfg(target_os = "windows")]
 mod log;
 #[cfg(target_os = "windows")]
+mod metadata;
+#[cfg(target_os = "windows")]
 mod pipe;
+#[cfg(any(target_os = "windows", test))]
+mod retry;
 #[cfg(target_os = "windows")]
 mod server;
 #[cfg(target_os = "windows")]

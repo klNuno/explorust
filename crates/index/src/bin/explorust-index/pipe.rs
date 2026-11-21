@@ -137,8 +137,8 @@ pub fn serve(handler: Handler) {
         let _ = std::thread::Builder::new().name("index-client".into()).spawn(move || {
             // SAFETY: the File takes the instance handle and closes it when the client leaves.
             let mut f = unsafe { File::from_raw_handle(raw as _) };
-            while let Ok((q, max)) = proto::read_request(&mut f) {
-                if proto::write_reply(&mut f, &hd(&q, max)).is_err() {
+            while let Ok((q, max, version)) = proto::read_request(&mut f) {
+                if proto::write_reply(&mut f, &hd(&q, max), version).is_err() {
                     break;
                 }
             }

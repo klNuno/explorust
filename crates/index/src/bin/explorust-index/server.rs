@@ -4,7 +4,7 @@
 use crate::{log, pipe, volume};
 use fsindex::fold;
 use fsindex::proto::{Hit, Reply};
-use fsindex::table::Table;
+use fsindex::table::{SortKey, Table};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
@@ -36,7 +36,12 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
             let (n, bytes) = (t.len(), t.bytes());
             *vol.table.write().unwrap_or_else(|p| p.into_inner()) = t;
             log::line(&format!("{letter}: MFT read: {n} names in {ms:.0} ms, table {:.1} MB ({:.1} bytes a name)", bytes as f64 / 1048576.0, bytes as f64 / n.max(1) as f64));
-            links_later(letter, pruned, vol.clone(), id);
+            if !pruned.is_empty() {
+                match v.duplicate() {
+                    Ok(handle) => links_later(letter, handle, pruned, vol.clone(), id),
+                    Err(e) => log::line(&format!("{letter}: hard links: duplicate volume handle failed: {e}")),
+                }
+            }
             if first {
                 let _ = loaded.send(());
                 first = false;
@@ -65,19 +70,19 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
 
 /// Looks up the outside names of the pruned files on a background thread of its own, so the
 /// follower starts at once (the lookup opens each file by id).
-fn links_later(letter: char, frns: Vec<u64>, vol: Arc<Vol>, id: u64) {
-    if frns.is_empty() {
-        return;
-    }
+fn links_later(letter: char, handle: volume::Volume, frns: Vec<u64>, vol: Arc<Vol>, id: u64) {
     let _ = std::thread::Builder::new().name(format!("index-{letter}-links")).spawn(move || {
         // SAFETY: lowers this thread's CPU and I/O priority for the lookup.
         let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
         let t0 = Instant::now();
-        let Ok(v) = volume::Volume::open(letter) else { return };
-        let (looked, added, failed) = volume::add_links(v.handle(), &frns, &vol.table, id);
-        let failed = failed.len();
-        vol.table.write().unwrap_or_else(|p| p.into_inner()).shrink();
-        let (bytes, names) = vol.table.read().map(|t| (t.bytes(), t.len())).unwrap_or((0, 0));
+        let (looked, added, failed) = volume::add_links(handle.handle(), &frns, &vol.table, id);
+        let mut table = vol.table.write().unwrap_or_else(|p| p.into_inner());
+        if table.id() != id {
+            return;
+        }
+        table.shrink();
+        let (bytes, names) = (table.bytes(), table.len());
+        drop(table);
         log::line(&format!(
             "{letter}: hard links: {looked} files inside WinSxS looked up in {:.0} ms, {added} names outside it added, {failed} not opened; {names} names, table {:.1} MB",
             t0.elapsed().as_secs_f64() * 1000.0,
@@ -89,7 +94,7 @@ fn links_later(letter: char, frns: Vec<u64>, vol: Arc<Vol>, id: u64) {
 fn answer(vols: &[Arc<Vol>], q: &str, max: u16) -> Reply {
     let t = Instant::now();
     let fq = fold::fold(q.trim());
-    let mut all: Vec<(u64, Hit)> = Vec::new();
+    let mut all: Vec<(SortKey, Hit)> = Vec::new();
     let mut names = 0;
     for v in vols {
         let tb = v.table.read().unwrap_or_else(|p| p.into_inner());
@@ -97,7 +102,7 @@ fn answer(vols: &[Arc<Vol>], q: &str, max: u16) -> Reply {
         // A few extra: some hits have no path (a folder of theirs is metadata).
         for f in tb.query(&fq, max as usize + 8) {
             if let Some(path) = tb.path(f.rec, &v.root) {
-                all.push((f.key, Hit { path, folder: tb.is_dir(f.rec), noisy: f.noisy(), rank: f.rank() }));
+                all.push((f.key, Hit { path, folder: tb.is_dir(f.rec), noisy: f.noisy(), rank: f.rank(), modified: f.modified() }));
             }
         }
     }

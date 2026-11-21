@@ -29,9 +29,6 @@ thread_local! {
     static KEY_AT: RefCell<Option<Instant>> = const { RefCell::new(None) };
     /// The generation whose first MFT rows were timed, and the key to rows on screen times.
     static MFT_TIMED: RefCell<(u64, Vec<f32>)> = const { RefCell::new((0, Vec::new())) };
-    /// Keys whose frame was left to a newer key already queued: how many, and the message time
-    /// of the oldest (the next frame is timed from it).
-    static COALESCED: RefCell<Option<(u32, u32)>> = const { RefCell::new(None) };
 }
 
 /// A text key (letter, digit, space, backspace) is waiting in this thread's queue: its own
@@ -88,7 +85,6 @@ pub fn settings_loaded(v: Vec<Setting>) {
 pub fn ch(c: u32) {
     // A character that adds no text still shows the frame its key down left for it.
     let Some(c) = char::from_u32(c).filter(|c| !c.is_control()) else {
-        forget_coalesced();
         return super::redraw();
     };
     let label = c.to_string();
@@ -97,12 +93,6 @@ pub fn ch(c: u32) {
         q.push(c);
         q
     });
-}
-
-/// Keys whose frame was left to a queued key: dropped once a frame shows them some other way
-/// (a character that adds no text, Start closing), so the next key times only itself.
-pub fn forget_coalesced() {
-    COALESCED.with(|c| c.borrow_mut().take());
 }
 
 pub fn backspace() {
@@ -219,23 +209,26 @@ fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
     // SAFETY: the time of the key message being handled.
     let msg_time = unsafe { GetMessageTime() } as u32;
     if text_key_queued(hwnd) {
-        let n = COALESCED.with(|c| {
-            let mut c = c.borrow_mut();
-            let e = c.get_or_insert((0, msg_time));
+        let n = with(|s| {
+            let e = s.pending_search_keys.get_or_insert((0, msg_time));
             e.0 += 1;
             e.0
-        });
+        })
+        .unwrap_or(0);
         log::line(&format!("search key {key} \"{q}\": queue {} ms, ranked {ranked:.2} ms, frame left to the queued key ({n} so far)", queued.max(0)));
         return;
     }
-    let coalesced = COALESCED.with(|c| c.borrow_mut().take());
     let rows = !q.trim().is_empty() && wait_mft_rows(hwnd, generation, t0);
     let waited = t0.elapsed().as_secs_f32() * 1000.0;
-    let Some((apps, settings, calc, files_n)) = with(|s| {
+    let Some(Some((coalesced, apps, settings, calc, files_n))) = with(|s| {
+        let coalesced = s.pending_search_keys;
         if let Err(e) = s.draw() {
+            let pending = s.pending_search_keys.get_or_insert((0, msg_time));
+            pending.0 += 1;
             log::line(&format!("search key: draw failed: {e}"));
+            return None;
         }
-        (s.found.apps.len(), s.found.settings.len(), s.found.calc.is_some(), s.found.files.len())
+        Some((coalesced, s.found.apps.len(), s.found.settings.len(), s.found.calc.is_some(), s.found.files.len()))
     }) else {
         return;
     };
@@ -292,11 +285,9 @@ fn apply_files(b: Batch, draw: bool) {
     let shown = with(|s| {
         let entries = to_entries(s, b.hits);
         let ok = if icons { s.update_files(b.generation, entries) } else { s.add_files(b.generation, entries, b.done) };
-        if ok
-            && draw
-            && let Err(e) = s.draw()
-        {
+        if ok && draw && let Err(e) = s.draw() {
             log::line(&format!("search files: draw failed: {e}"));
+            return None;
         }
         ok.then(|| (s.query.clone(), s.found.generation))
     })

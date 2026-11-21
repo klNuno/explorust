@@ -324,13 +324,13 @@ fn open(search: bool, msg_time: i32) {
 }
 
 fn hide(restore: bool, why: &str) {
-    search::forget_coalesced();
     let Some(Some(prev)) = with(|s| {
         if !s.shown {
             return None;
         }
         s.shown = false;
         s.menu_open = false;
+        s.pending_search_keys = None;
         Some(s.prev_fg)
     }) else {
         return;

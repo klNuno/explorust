@@ -7,6 +7,7 @@
 
 use crate::fold;
 use memchr::memmem;
+use std::cmp::Reverse;
 
 pub const SEP: u8 = b'\n';
 /// The root directory's MFT record number on NTFS.
@@ -32,9 +33,8 @@ const PRUNED: Slot = Slot { parent: NONE, name: NONE };
 /// Folders whose contents are left out of the table: the component store holds a large share of a
 /// Windows volume's names (long ones), none of them anything a user opens.
 const PRUNE_NAMES: [&str; 1] = ["winsxs"];
-/// In `meta`: the name's record or a folder of it is noisy; the other bits are the last USN of
-/// the file shifted right 16 bits (larger is more recent).
-const META_NOISY: u32 = 1 << 31;
+/// In `meta`: the name or a folder of it is noisy; the remaining bits hold last write time.
+const META_NOISY: u64 = 1 << 63;
 
 /// Folder names whose contents rank after everything else (Windows Search leaves them out).
 const NOISY_NAMES: [&str; 9] = ["windows", "appdata", "$recycle.bin", "winsxs", "node_modules", ".git", "programdata", "system volume information", "target"];
@@ -46,7 +46,7 @@ pub struct Table {
     fold: Vec<u8>,
     starts: Vec<u32>,
     recs: Vec<u32>,
-    meta: Vec<u32>,
+    meta: Vec<u64>,
     live: usize,
     dead: usize,
     /// Records of the folders named in PRUNE_NAMES (their contents are not kept).
@@ -79,23 +79,26 @@ static TABLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// A match before its path is built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Found {
-    /// Sort key: noisy, then rank (0 name prefix, 1 word prefix, 2 inside), then most recent.
-    pub key: u64,
+    pub key: SortKey,
     pub rec: u32,
 }
 
 impl Found {
     pub fn rank(&self) -> u8 {
-        ((self.key >> 32) & 0xFF) as u8
+        self.key.0 & 3
     }
     pub fn noisy(&self) -> bool {
-        self.key >> 40 != 0
+        self.key.0 >= 4
+    }
+
+    pub fn modified(&self) -> u64 {
+        let (_, Reverse(modified)) = self.key;
+        modified
     }
 }
 
-fn key(noisy: bool, rank: u8, usn: u32) -> u64 {
-    ((noisy as u64) << 40) | ((rank as u64) << 32) | (u32::MAX - usn) as u64
-}
+/// Clean before noisy, then match rank, then newest first at full FILETIME precision.
+pub type SortKey = (u8, Reverse<u64>);
 
 fn word_start(prev: u8) -> bool {
     matches!(prev, b' ' | b'.' | b'-' | b'_' | b'(' | b'[' | b'+' | b',')
@@ -176,7 +179,7 @@ impl Table {
 
     /// Heap bytes held by the table.
     pub fn bytes(&self) -> usize {
-        self.slots.capacity() * size_of::<Slot>() + self.case.capacity() + self.fold.capacity() + (self.starts.capacity() + self.recs.capacity() + self.meta.capacity()) * 4
+        self.slots.capacity() * size_of::<Slot>() + self.case.capacity() + self.fold.capacity() + (self.starts.capacity() + self.recs.capacity()) * 4 + self.meta.capacity() * 8
     }
 
     pub fn shrink(&mut self) {
@@ -226,6 +229,22 @@ impl Table {
         self.slots.get(rec as usize).is_some_and(|s| s.name != NONE && s.name & DIR != 0)
     }
 
+    pub fn has_name(&self, rec: u32) -> bool {
+        self.slots.get(rec as usize).is_some_and(|s| s.name != NONE)
+    }
+
+    pub fn needs_modified(&self, rec: u32) -> bool {
+        self.slots.get(rec as usize).is_some_and(|s| s.name != NONE && self.meta[(s.name & IDX) as usize] & !META_NOISY == 0)
+    }
+
+    /// Updates a named file's last write time. An unavailable read preserves the known time.
+    pub fn set_modified(&mut self, rec: u32, modified: i64) -> bool {
+        let Some(s) = self.slots.get(rec as usize).filter(|s| s.name != NONE && modified > 0) else { return false };
+        let m = &mut self.meta[(s.name & IDX) as usize];
+        *m = modified as u64 | (*m & META_NOISY);
+        true
+    }
+
     /// Files pruned since the last call (their record numbers), for the hard link lookup.
     pub fn take_pruned_files(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.pruned_files)
@@ -239,7 +258,7 @@ impl Table {
     /// Adds or updates record `rec`: a new name or parent replaces the old one. A name inside a
     /// pruned tree does not replace a kept name outside it: a file with hard links on both sides
     /// keeps its outside one (the journal reports changes under either name).
-    pub fn upsert(&mut self, rec: u32, parent: u32, name: &str, dir: bool, attrs_noisy: bool, usn: i64) {
+    pub fn upsert(&mut self, rec: u32, parent: u32, name: &str, dir: bool, attrs_noisy: bool, modified: i64) {
         if rec == NONE || name.is_empty() || name.contains('\n') {
             return;
         }
@@ -249,6 +268,7 @@ impl Table {
         }
         if self.pruned_parent(parent) {
             if !dir && self.slots[r].name != NONE && !self.walk_pruned(rec) {
+                self.set_modified(rec, modified);
                 return;
             }
             self.remove(rec);
@@ -261,21 +281,19 @@ impl Table {
         if dir && PRUNE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) && !self.prune_roots.contains(&rec) {
             self.prune_roots.push(rec);
         }
-        let usn = ((usn.max(0) as u64) >> 16).min((META_NOISY - 1) as u64) as u32;
         let noisy = attrs_noisy || name.starts_with('$') || NOISY_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name));
         let under = noisy || self.slots.get(parent as usize).is_some_and(|p| p.name != NONE && p.name & UNDER != 0);
         let flags = if dir { DIR } else { 0 } | if noisy { NOISY } else { 0 } | if under { UNDER } else { 0 };
         let old = self.slots[r];
-        let mut old_usn = 0;
+        let mut previous = 0;
         if old.name != NONE {
             let oi = (old.name & IDX) as usize;
+            previous = self.meta[oi] & !META_NOISY;
             if old.parent == parent && self.name(rec).as_deref() == Some(name) {
                 self.slots[r].name = (old.name & IDX) | flags;
-                let m = &mut self.meta[oi];
-                *m = (*m & !META_NOISY).max(usn) | if under { META_NOISY } else { 0 };
+                self.meta[oi] = write_time(modified, previous) | if under { META_NOISY } else { 0 };
                 return;
             }
-            old_usn = self.meta[oi] & !META_NOISY;
             self.recs[(old.name & IDX) as usize] = NONE;
             self.dead += 1;
             self.live -= 1;
@@ -283,7 +301,7 @@ impl Table {
         let idx = self.starts.len() as u32;
         self.starts.push(self.fold.len() as u32);
         self.recs.push(rec);
-        self.meta.push(usn.max(old_usn) | if under { META_NOISY } else { 0 });
+        self.meta.push(write_time(modified, previous) | if under { META_NOISY } else { 0 });
         let base = self.fold.len();
         let mut marks = Vec::new();
         fold::push_folded(name, &mut self.fold, |i| marks.push(base + i));
@@ -477,7 +495,7 @@ impl Table {
         }
         // A word or inner match ranks after every clean name prefix: skip when those fill the list.
         // Past INNER_CAP inner matches the rest is left out (one-letter queries on a big volume).
-        if !top.full_below(key(false, 1, 0)) {
+        if !top.full_below((1, Reverse(u64::MAX))) {
             let finder = memmem::Finder::new(q);
             let (mut at, mut i, mut seen) = (0, 0, 0usize);
             while let Some(p) = finder.find(&self.fold[at..]) {
@@ -505,13 +523,17 @@ impl Table {
 /// Inner matches looked at, at most, per query.
 const INNER_CAP: usize = 60_000;
 
-fn meta_key(meta: u32, rank: u8) -> u64 {
-    key(meta & META_NOISY != 0, rank, meta & !META_NOISY)
+fn write_time(modified: i64, previous: u64) -> u64 {
+    if modified > 0 { modified as u64 } else { previous }
+}
+
+fn meta_key(meta: u64, rank: u8) -> SortKey {
+    (rank | (((meta >> 63) as u8) << 2), Reverse(meta & !META_NOISY))
 }
 
 /// The best `max` keys seen so far (a max-heap: the worst kept on top).
 struct Top {
-    heap: std::collections::BinaryHeap<(u64, usize)>,
+    heap: std::collections::BinaryHeap<(SortKey, usize)>,
     max: usize,
 }
 
@@ -520,7 +542,7 @@ impl Top {
         Top { heap: std::collections::BinaryHeap::with_capacity(max + 1), max }
     }
 
-    fn offer(&mut self, k: u64, i: usize) {
+    fn offer(&mut self, k: SortKey, i: usize) {
         if self.heap.len() < self.max {
             self.heap.push((k, i));
         } else if self.heap.peek().is_some_and(|w| k < w.0) {
@@ -530,7 +552,7 @@ impl Top {
     }
 
     /// Full of keys all better than `k`.
-    fn full_below(&self, k: u64) -> bool {
+    fn full_below(&self, k: SortKey) -> bool {
         self.heap.len() >= self.max && self.heap.peek().is_some_and(|w| w.0 < k)
     }
 }
@@ -569,6 +591,22 @@ mod tests {
         assert_eq!(got, vec![(34, 0, false), (33, 1, false), (37, 2, false), (36, 0, true)]);
         assert_eq!(t.query("FINAL", 10).len(), 0, "the caller folds the query");
         assert_eq!(t.query("final", 2).len(), 2);
+    }
+
+    #[test]
+    fn newest_last_write_wins_before_cut() {
+        let mut t = sample();
+        let older = 133_800_000_000_000_000;
+        t.upsert(51, 32, "clock-old.txt", false, false, older);
+        t.upsert(52, 32, "clock-new.txt", false, false, older + 1);
+        t.upsert(53, 35, "clock-cache.txt", false, false, older + 2);
+        t.compact();
+        assert_eq!(t.query("clock", 1)[0].rec, 52);
+        // SetFileTime can move a file backwards. A later rename without a fresh read keeps it.
+        assert!(t.set_modified(52, older - 1));
+        t.upsert(52, 32, "clock-renamed.txt", false, false, 0);
+        let got = t.query("clock", 2);
+        assert_eq!(got.iter().map(|f| (f.rec, f.modified())).collect::<Vec<_>>(), vec![(51, older as u64), (52, (older - 1) as u64)]);
     }
 
     #[test]

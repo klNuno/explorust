@@ -2,7 +2,7 @@
 //! service restarted. The service must run in session 0 (a service, not a user process that
 //! grabbed the pipe name first), checked on each connect.
 
-use crate::proto::{self, Reply};
+use crate::proto::{self, Reply, Version};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
@@ -48,8 +48,11 @@ impl Client {
                 self.pipe = Some(connect()?);
             }
             let Some(p) = self.pipe.as_mut() else { break };
-            match proto::write_request(p, q, max).and_then(|()| proto::read_reply(p)) {
-                Ok(r) => return Ok(r),
+            match proto::write_request(p, q, max, Version::V2).and_then(|()| proto::read_reply(p)) {
+                Ok(mut r) => {
+                    r.hits.truncate(usize::from(max));
+                    return Ok(r);
+                }
                 Err(e) => {
                     self.pipe = None;
                     last = Some(e);

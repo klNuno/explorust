@@ -1,11 +1,16 @@
 //! One NTFS volume: its handle, the USN journal, the MFT enumeration and the journal follower.
 
-use crate::log;
+use crate::retry::LinkRetry;
+use crate::{log, metadata};
 use fsindex::table::{RecState, Table};
 use fsindex::usn::{self, Record};
+use std::collections::HashMap;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::RwLock;
 use std::time::Instant;
-use windows::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE, GENERIC_READ, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE, ERROR_MORE_DATA, GENERIC_READ, HANDLE,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_READ_ATTRIBUTES,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdType, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
@@ -13,14 +18,19 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
-    CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
+    CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA, FSCTL_QUERY_FILE_LAYOUT, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
     MFT_ENUM_DATA_V0, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
 };
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows_core::HSTRING;
 
 const DRIVE_FIXED: u32 = 3;
 /// Metadata files ($MFT, $LogFile, the root itself) sit below record 16.
 const FIRST_USER_RECORD: u64 = 16;
+
+fn full_reference(rec: u32, seq: u16) -> u64 {
+    u64::from(rec) | (u64::from(seq) << 48)
+}
 
 /// The letters of the fixed NTFS volumes.
 pub fn fixed_ntfs() -> Vec<char> {
@@ -47,7 +57,8 @@ pub struct Volume {
     h: HANDLE,
 }
 
-// SAFETY: the volume handle is used from the follower thread only after the load.
+// SAFETY: each Volume owns its handle. The link worker receives a duplicate and only uses it
+// to open files by ID while the follower reads the journal through the original handle.
 unsafe impl Send for Volume {}
 
 impl Drop for Volume {
@@ -57,10 +68,10 @@ impl Drop for Volume {
     }
 }
 
-fn ioctl<I>(h: HANDLE, code: u32, input: &I, out: &mut [u8]) -> windows_core::Result<usize> {
+pub(crate) fn ioctl<I>(h: HANDLE, code: u32, input: &I, out: &mut [u8]) -> windows_core::Result<usize> {
     let mut got = 0u32;
     // SAFETY: the input struct and the output buffer outlive the synchronous call.
-    unsafe {
+    let result = unsafe {
         DeviceIoControl(
             h,
             code,
@@ -70,7 +81,12 @@ fn ioctl<I>(h: HANDLE, code: u32, input: &I, out: &mut [u8]) -> windows_core::Re
             out.len() as u32,
             Some(&mut got),
             None,
-        )?;
+        )
+    };
+    if let Err(e) = result
+        && !(code == FSCTL_QUERY_FILE_LAYOUT && got != 0 && e.code() == ERROR_MORE_DATA.to_hresult())
+    {
+        return Err(e);
     }
     Ok(got as usize)
 }
@@ -80,16 +96,28 @@ const FILE_HARD_LINK_INFORMATION: u32 = 46;
 
 windows_core::link!("ntdll.dll" "system" fn NtQueryInformationFile(file: HANDLE, iosb: *mut [usize; 2], info: *mut core::ffi::c_void, len: u32, class: u32) -> i32);
 
-/// The names of file `frn` (full reference, sequence included) as (parent record, name).
-fn hard_links(volume: HANDLE, frn: u64, buf: &mut Vec<u8>) -> Option<Vec<(u32, String)>> {
+pub(crate) fn file_by_id(volume: HANDLE, frn: u64) -> Option<OwnedHandle> {
     let id = FILE_ID_DESCRIPTOR { dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32, Type: FileIdType, Anonymous: FILE_ID_DESCRIPTOR_0 { FileId: frn as i64 } };
-    // SAFETY: opens by id for attributes only; the handle is closed below.
+    // SAFETY: opens by id for attributes only and hands ownership to OwnedHandle.
     let h = unsafe {
         OpenFileById(volume, &id, FILE_READ_ATTRIBUTES.0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, None, FILE_FLAG_BACKUP_SEMANTICS).ok()?
     };
+    Some(unsafe { OwnedHandle::from_raw_handle(h.0) })
+}
+
+struct LinkInfo {
+    names: Vec<(u32, String)>,
+    modified: i64,
+}
+
+/// The names of file `frn` (full reference, sequence included) as (parent record, name).
+fn hard_links(volume: HANDLE, frn: u64, buf: &mut Vec<u8>) -> Option<LinkInfo> {
+    let file = file_by_id(volume, frn)?;
+    let h = HANDLE(file.as_raw_handle());
     let mut iosb = [0usize; 2];
     let mut st = 0;
     for _ in 0..2 {
+        buf[..4].fill(0);
         // SAFETY: the buffer outlives the call; the class fills FILE_LINKS_INFORMATION.
         st = unsafe { NtQueryInformationFile(h, &mut iosb, buf.as_mut_ptr().cast(), buf.len() as u32, FILE_HARD_LINK_INFORMATION) };
         // Too many links for the buffer: NTFS reports the size it needs in BytesNeeded.
@@ -99,8 +127,6 @@ fn hard_links(volume: HANDLE, frn: u64, buf: &mut Vec<u8>) -> Option<Vec<(u32, S
         }
         buf.resize(needed, 0);
     }
-    // SAFETY: the handle opened above.
-    let _ = unsafe { CloseHandle(h) };
     if st < 0 {
         return None;
     }
@@ -111,7 +137,7 @@ fn hard_links(volume: HANDLE, frn: u64, buf: &mut Vec<u8>) -> Option<Vec<(u32, S
     let (mut o, mut out) = (8usize, Vec::with_capacity(n));
     for _ in 0..n {
         let next = u32_at(o)? as usize;
-        let parent = u64::from_le_bytes(buf.get(o + 8..o + 16)?.try_into().ok()?) & ((1 << 48) - 1);
+        let parent = u64::from_le_bytes(buf.get(o + 8..o + 16)?.try_into().ok()?) & usn::MASK48;
         let len = u32_at(o + 16)? as usize;
         let units: Vec<u16> = buf.get(o + 20..o + 20 + len * 2)?.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
         out.push((parent.min(u32::MAX as u64) as u32, String::from_utf16_lossy(&units)));
@@ -120,19 +146,30 @@ fn hard_links(volume: HANDLE, frn: u64, buf: &mut Vec<u8>) -> Option<Vec<(u32, S
         }
         o += next;
     }
-    Some(out)
+    Some(LinkInfo { names: out, modified: metadata::last_write(h).unwrap_or(0) })
 }
 
-/// Gives each file in `frns` (whose name is inside a pruned tree, or whose kept name may be gone)
-/// its first name outside the pruned trees, if it has one: System32's binaries are hard links whose
-/// first name is in WinSxS; a kept name with no link left outside is dropped. The links are read
-/// without the lock, so queries and the journal go on meanwhile; a result is written only into the
-/// same table and only when its record still holds what it held before the read (the journal wins
-/// any change made in between, `Table::touched`). `id` is the table the files were taken from.
-/// Returns (files looked at, names added, the files whose lookup failed).
-pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -> (usize, usize, Vec<u64>) {
+/// Reconciles the one alias we keep for a file. The other names may have disappeared.
+fn set_link(table: &mut Table, rec: u32, info: LinkInfo) -> bool {
+    let Some((parent, name)) = info.names.into_iter().find(|(p, _)| (*p == fsindex::table::ROOT || table.has_name(*p)) && !table.pruned_parent(*p)) else {
+        table.prune(rec);
+        return false;
+    };
+    if matches!(table.state(rec), RecState::Named(p, n) if p == parent && n == name) {
+        table.set_modified(rec, info.modified);
+        return false;
+    }
+    table.upsert(rec, parent, &name, false, false, info.modified);
+    true
+}
+
+/// Finds outside aliases for files pruned by the initial MFT read, such as System32 binaries with
+/// a WinSxS name. The journal may run during the lookup. Only write results to the original table
+/// and to records that are still pruned and were not touched during the lookup.
+/// Returns the counts of files looked at, names added and lookups that failed.
+pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -> (usize, usize, usize) {
     let mut buf = vec![0u8; 8 << 10];
-    let (mut added, mut failed) = (0, Vec::new());
+    let (mut looked, mut added, mut failed) = (0, 0, 0);
     {
         let mut t = table.write().unwrap_or_else(|p| p.into_inner());
         if t.id() != id {
@@ -141,15 +178,19 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -
         t.watch_touches(true);
     }
     for chunk in frns.chunks(256) {
-        let (before, since): (Vec<RecState>, u64) = {
+        let (pruned, since) = {
             let t = table.read().unwrap_or_else(|p| p.into_inner());
-            (chunk.iter().map(|&f| t.state((f & ((1 << 48) - 1)) as u32)).collect(), t.touches())
+            if t.id() != id {
+                break;
+            }
+            (chunk.iter().copied().filter(|&f| t.state((f & usn::MASK48) as u32) == RecState::Pruned).collect::<Vec<_>>(), t.touches())
         };
         let mut found = Vec::new();
-        for (&frn, was) in chunk.iter().zip(before) {
+        for frn in pruned {
+            looked += 1;
             match hard_links(volume, frn, &mut buf) {
-                Some(links) => found.push(((frn & ((1 << 48) - 1)) as u32, was, links)),
-                None => failed.push(frn),
+                Some(links) => found.push(((frn & usn::MASK48) as u32, links)),
+                None => failed += 1,
             }
         }
         if found.is_empty() {
@@ -159,18 +200,9 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -
         if t.id() != id {
             break;
         }
-        for (rec, was, links) in found {
-            if t.state(rec) != was || t.touched_since(rec, since) {
-                continue;
-            }
-            match links.into_iter().find(|(p, _)| !t.pruned_parent(*p)) {
-                Some((parent, name)) => {
-                    if !matches!(&was, RecState::Named(p, n) if *p == parent && *n == name) {
-                        t.upsert(rec, parent, &name, false, false, 0);
-                        added += 1;
-                    }
-                }
-                None => t.prune(rec),
+        for (rec, links) in found {
+            if t.state(rec) == RecState::Pruned && !t.touched_since(rec, since) {
+                added += usize::from(set_link(&mut t, rec, links));
             }
         }
     }
@@ -178,21 +210,24 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -
     if t.id() == id {
         t.watch_touches(false);
     }
-    (frns.len(), added, failed)
+    (looked, added, failed)
 }
 
-fn apply(t: &mut Table, r: &Record) {
+fn apply(t: &mut Table, r: &Record, modified: i64) {
     if r.rec < FIRST_USER_RECORD || r.rec > u32::MAX as u64 - 1 {
         return;
     }
     t.touch(r.rec as u32);
     if r.reason & usn::REASON_FILE_DELETE != 0 {
         t.remove(r.rec as u32);
-    } else if r.reason & usn::REASON_RENAME_OLD_NAME == 0 {
+    } else if r.reason & usn::REASON_RENAME_OLD_NAME != 0 {
+        // A close record can carry both the old-name reason and data changes.
+        t.set_modified(r.rec as u32, modified);
+    } else {
         let dir = r.attrs & usn::ATTR_DIRECTORY != 0;
         let noisy = r.attrs & (usn::ATTR_HIDDEN | usn::ATTR_SYSTEM) != 0;
         let parent = r.parent.min(u32::MAX as u64) as u32;
-        t.upsert(r.rec as u32, parent, &r.name, dir, noisy, r.usn);
+        t.upsert(r.rec as u32, parent, &r.name, dir, noisy, modified);
         // A kept name may be gone: renamed into a pruned tree, or one of its hard links removed.
         if !dir && (r.reason & usn::REASON_HARD_LINK_CHANGE != 0 || (r.reason & usn::REASON_RENAME_NEW_NAME != 0 && t.pruned_parent(parent))) {
             t.recheck_links(r.rec as u32);
@@ -208,6 +243,16 @@ impl Volume {
             CreateFileW(&path, GENERIC_READ.0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_FLAGS_AND_ATTRIBUTES(0), None)?
         };
         Ok(Volume { letter, h })
+    }
+
+    pub fn duplicate(&self) -> windows_core::Result<Self> {
+        let mut h = HANDLE::default();
+        // SAFETY: both process handles refer to this process; the duplicate is owned by Self.
+        unsafe {
+            let process = GetCurrentProcess();
+            DuplicateHandle(process, self.h, process, &mut h, 0, false, DUPLICATE_SAME_ACCESS)?;
+        }
+        Ok(Self { letter: self.letter, h })
     }
 
     pub fn journal(&self) -> windows_core::Result<USN_JOURNAL_DATA_V0> {
@@ -254,14 +299,98 @@ impl Volume {
                     }
                     seqs[i] = r.seq;
                 }
-                apply(&mut t, &r)
+                apply(&mut t, &r, 0)
             });
         }
         let pruned = t.settle();
+        let clock = Instant::now();
+        if let Err(e) = metadata::initial(self.h, &mut t, &seqs) {
+            log::line(&format!("{}: file layout unavailable ({e}), reading remaining last write times by ID", self.letter));
+        }
+        let mut modified = 0;
+        for (rec, &seq) in seqs.iter().enumerate() {
+            let rec = rec as u32;
+            if !t.has_name(rec) {
+                continue;
+            }
+            if t.needs_modified(rec) && let Some(m) = metadata::last_write_by_id(self.h, full_reference(rec, seq)) {
+                t.set_modified(rec, m);
+            }
+            modified += usize::from(!t.needs_modified(rec));
+        }
+        log::line(&format!("{}: last write times loaded for {modified}/{} names in {} ms", self.letter, t.len(), clock.elapsed().as_millis()));
         t.shrink();
-        let files: Vec<u64> = t.take_pruned_files().into_iter().map(|r| r as u64 | (seqs.get(r as usize).copied().unwrap_or(0) as u64) << 48).collect();
+        let files: Vec<u64> = t.take_pruned_files().into_iter().filter_map(|r| seqs.get(r as usize).map(|&seq| full_reference(r, seq))).collect();
         log::line(&format!("{}: {pruned} names inside WinSxS left out ({} files)", self.letter, files.len()));
         Ok((t, files))
+    }
+
+    fn changes(&self, bytes: &[u8], table: &RwLock<Table>, retries: &mut HashMap<u32, LinkRetry>) -> u64 {
+        let mut records = Vec::new();
+        let mut dates = HashMap::new();
+        usn::parse(bytes, |r| {
+            if !(FIRST_USER_RECORD..u32::MAX as u64).contains(&r.rec) {
+                return;
+            }
+            let frn = full_reference(r.rec as u32, r.seq);
+            if r.reason & (usn::REASON_FILE_CREATE | usn::REASON_BASIC_INFO_CHANGE | usn::REASON_DATA_CHANGE | usn::REASON_RENAME_NEW_NAME) != 0
+                && r.reason & usn::REASON_FILE_DELETE == 0
+            {
+                dates.entry(frn).or_insert_with(|| metadata::last_write_by_id(self.h, frn).unwrap_or(0));
+            }
+            records.push(r);
+        });
+        let now = Instant::now();
+        let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+        let mut refs = HashMap::new();
+        for r in &records {
+            let rec = r.rec as u32;
+            let frn = full_reference(rec, r.seq);
+            let deleted = r.reason & usn::REASON_FILE_DELETE != 0;
+            let renamed_outside = r.reason & usn::REASON_RENAME_NEW_NAME != 0
+                && r.reason & usn::REASON_HARD_LINK_CHANGE == 0
+                && !t.pruned_parent(r.parent.min(u32::MAX as u64) as u32);
+            if deleted || renamed_outside || retries.get(&rec).is_some_and(|job| job.frn != frn) {
+                retries.remove(&rec);
+            }
+            apply(&mut t, r, dates.get(&frn).copied().unwrap_or(0));
+            let current = refs.entry(rec).or_insert((frn, true));
+            // A lookup queued earlier in this batch must not invalidate a later, known name.
+            if deleted || renamed_outside {
+                *current = (frn, false);
+            } else if current.0 != frn || r.reason & (usn::REASON_FILE_CREATE | usn::REASON_HARD_LINK_CHANGE | usn::REASON_RENAME_NEW_NAME) != 0 {
+                *current = (frn, true);
+            }
+        }
+        for rec in t.take_pruned_files() {
+            if let Some(&(frn, true)) = refs.get(&rec) && t.state(rec) != RecState::Free {
+                retries.entry(rec).or_insert_with(|| LinkRetry::new(frn, now));
+            }
+        }
+        records.len() as u64
+    }
+
+    fn retry_links(&self, table: &RwLock<Table>, retries: &mut HashMap<u32, LinkRetry>, buf: &mut Vec<u8>) {
+        let now = Instant::now();
+        let due: Vec<_> = retries.extract_if(|_, job| job.due <= now).collect();
+        for (rec, job) in due {
+            if job.attempts != 0 {
+                log::line(&format!("{}: hard link retry timer: record {rec}, attempt {}", self.letter, job.attempts + 1));
+            }
+            if let Some(info) = hard_links(self.h, job.frn, buf) {
+                let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+                t.touch(rec);
+                set_link(&mut t, rec, info);
+            } else if let Some(next) = job.after_failure(Instant::now()) {
+                retries.insert(rec, next);
+            } else {
+                let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+                t.touch(rec);
+                t.prune(rec);
+                drop(t);
+                log::line(&format!("{}: hard link retry exhausted: record {rec}, alias invalidated", self.letter));
+            }
+        }
     }
 
     /// Applies the journal from `next` on, blocking until changes come; returns on an error
@@ -270,61 +399,34 @@ impl Volume {
         let mut buf = vec![0u8; 64 << 10];
         let mut changes = 0u64;
         let mut since = Instant::now();
-        let mut seq_of: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
-        let (mut retry, mut tries) = (Vec::new(), std::collections::HashMap::<u64, u8>::new());
+        let mut retries = HashMap::new();
+        let mut links_buf = vec![0u8; 8 << 10];
         loop {
             let rd = READ_USN_JOURNAL_DATA_V0 {
                 StartUsn: next,
                 ReasonMask: u32::MAX,
                 ReturnOnlyOnClose: 0,
                 Timeout: 0,
-                BytesToWaitFor: 1,
+                // Only poll while a link retry has a deadline. With no pending retries, wait
+                // indefinitely for USN records so an idle volume never wakes the follower.
+                BytesToWaitFor: u64::from(retries.is_empty()),
                 UsnJournalID: journal_id,
             };
             let got = match ioctl(self.h, FSCTL_READ_USN_JOURNAL, &rd, &mut buf) {
                 Ok(n) => n,
                 Err(e) => return e,
             };
-            if got < 8 {
-                continue;
+            if got >= 8 {
+                next = i64::from_le_bytes(buf[..8].try_into().unwrap_or_default());
             }
-            next = i64::from_le_bytes(buf[..8].try_into().unwrap_or_default());
             if got > 8 {
-                let mut pruned = std::mem::take(&mut retry);
-                let id;
-                {
-                    let mut t = table.write().unwrap_or_else(|p| p.into_inner());
-                    id = t.id();
-                    usn::parse(&buf[8..got], |r| {
-                        changes += 1;
-                        apply(&mut t, &r);
-                        if r.rec <= u32::MAX as u64 {
-                            seq_of.insert(r.rec as u32, r.seq);
-                        }
-                    });
-                    for rec in t.take_pruned_files() {
-                        pruned.push(rec as u64 | (seq_of.get(&rec).copied().unwrap_or(0) as u64) << 48);
-                    }
-                    seq_of.clear();
-                }
-                // A file added inside WinSxS by an update: its System32 link, if any.
-                // A lookup that failed (file busy, buffer) is tried again with the next batch, up
-                // to 3 times.
-                if !pruned.is_empty() {
-                    let failed = add_links(self.h, &pruned, table, id).2;
-                    for frn in pruned.iter().filter(|f| !failed.contains(f)) {
-                        tries.remove(frn);
-                    }
-                    for frn in failed {
-                        let n = tries.entry(frn).or_insert(0);
-                        *n += 1;
-                        if *n < 3 {
-                            retry.push(frn);
-                        } else {
-                            tries.remove(&frn);
-                        }
-                    }
-                }
+                changes += self.changes(&buf[8..got], table, &mut retries);
+            }
+            if !retries.is_empty() {
+                self.retry_links(table, &mut retries, &mut links_buf);
+            }
+            if got <= 8 && let Some(deadline) = retries.values().map(|r| r.due).min() {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
             }
             if since.elapsed().as_secs() >= 600 {
                 log::line(&format!("{}: {changes} journal records in the last {} s, {} names", self.letter, since.elapsed().as_secs(), table.read().map(|t| t.len()).unwrap_or(0)));
@@ -332,5 +434,35 @@ impl Volume {
                 since = Instant::now();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fsindex::table::ROOT;
+
+    #[test]
+    fn retry_timer_invalidates_an_unresolvable_alias() {
+        let volume = Volume::open('C').expect("open NTFS test volume as administrator");
+        let mut table = Table::new();
+        let rec = 72;
+        table.upsert(rec, ROOT, "obsolete.txt", false, false, 0);
+        let table = RwLock::new(table);
+        let now = Instant::now();
+        // This reference is beyond NTFS's supported record range and cannot be opened.
+        let mut retries = HashMap::from([(rec, LinkRetry::new(u64::MAX, now))]);
+        let mut buf = vec![0; 8 << 10];
+
+        volume.retry_links(&table, &mut retries, &mut buf);
+        assert_eq!(table.read().unwrap().name(rec).as_deref(), Some("obsolete.txt"));
+        for attempt in 1..=2 {
+            let retry = retries.get(&rec).expect("a retry is scheduled even without a journal record");
+            assert_eq!(retry.attempts, attempt);
+            std::thread::sleep(retry.due.saturating_duration_since(Instant::now()));
+            volume.retry_links(&table, &mut retries, &mut buf);
+        }
+        assert!(retries.is_empty());
+        assert_eq!(table.read().unwrap().state(rec), RecState::Pruned);
     }
 }

@@ -3,13 +3,13 @@
 //! every key, beside the Windows Search worker (`index.rs`); its hits merge into the same file
 //! groups (`search::merge_files`). Per key timings are logged, with p50 and p95 every 20 keys.
 
-use crate::index::{Batch, FileHit, modified, post};
+use crate::index::{Batch, FileHit, post};
 use crate::{apps, log, search};
 use fsindex::client::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
@@ -17,8 +17,6 @@ use windows::Win32::UI::Shell::{IShellItemImageFactory, SHFILEINFOW, SHGFI_TYPEN
 use windows_core::HSTRING;
 
 const MAX: u16 = 24;
-/// Time a key may spend reading its hits' last write times (one file system call each).
-const STAT_BUDGET: Duration = Duration::from_millis(2);
 /// The source of the second batch of a query: icons and type names for rows already shown.
 pub const ICONS: &str = "mft-icons";
 /// Rows that can show: five per group, folders and files.
@@ -136,18 +134,14 @@ fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32, up: Arc<AtomicB
         let trip = t.elapsed().as_secs_f32() * 1000.0;
         let n = reply.hits.len();
         // The rows go out at once with no icon; icons and type names follow in a second batch.
-        // The service already ordered them by rank, then most recent change (USN), before cutting
-        // the list; the last write times refine that order within a rank for a bounded time, so
-        // a cold disk never holds the rows: past the budget a hit keeps the service's order.
-        let stat_end = t + STAT_BUDGET;
+        // The service orders by rank and last write before capping the list.
         let hits: Vec<FileHit> = reply
             .hits
             .iter()
             .map(|h| {
                 let name = h.path.rsplit('\\').next().unwrap_or(&h.path).to_string();
                 let rank = search::file_rank(&name, &q) + if h.noisy { 4 } else { 0 };
-                let modified = if Instant::now() < stat_end { modified(&h.path) } else { 0 };
-                FileHit { type_text: String::new(), name, path: h.path.clone(), folder: h.folder, icon: None, rank, modified }
+                FileHit { type_text: String::new(), name, path: h.path.clone(), folder: h.folder, icon: None, rank, modified: h.modified }
             })
             .collect();
         let ms = t.elapsed().as_secs_f32() * 1000.0;

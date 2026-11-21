@@ -6,6 +6,8 @@ pub const REASON_FILE_DELETE: u32 = 0x0000_0200;
 pub const REASON_RENAME_OLD_NAME: u32 = 0x0000_1000;
 pub const REASON_RENAME_NEW_NAME: u32 = 0x0000_2000;
 pub const REASON_HARD_LINK_CHANGE: u32 = 0x0001_0000;
+pub const REASON_BASIC_INFO_CHANGE: u32 = 0x0000_8000;
+pub const REASON_DATA_CHANGE: u32 = 0x0000_0077;
 pub const ATTR_HIDDEN: u32 = 0x2;
 pub const ATTR_SYSTEM: u32 = 0x4;
 pub const ATTR_DIRECTORY: u32 = 0x10;
@@ -33,7 +35,7 @@ fn u64_at(b: &[u8], o: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(o..o + 8)?.try_into().ok()?))
 }
 
-const MASK48: u64 = (1 << 48) - 1;
+pub const MASK48: u64 = (1 << 48) - 1;
 
 /// Parses the records of `buf` (without the cursor); stops at the first malformed one and
 /// skips records of another major version.

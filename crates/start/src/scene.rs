@@ -90,6 +90,8 @@ pub struct Start {
     pub scroll: f32,
     pub query: String,
     pub found: Found,
+    /// Count and oldest message time of text keys waiting for a frame.
+    pub pending_search_keys: Option<(u32, u32)>,
     /// Search entries of `apps` (same order), their use counts, and the Settings pages.
     pub app_index: Vec<crate::search::Entry>,
     pub app_uses: Vec<u32>,
@@ -166,6 +168,7 @@ impl Start {
             scroll: 0.0,
             query: String::new(),
             found: Found::default(),
+            pending_search_keys: None,
             app_index: Vec::new(),
             app_uses: Vec::new(),
             usage: Vec::new(),
@@ -523,7 +526,6 @@ impl Start {
     }
 
     pub fn draw(&mut self) -> Result<()> {
-        self.dirty = false;
         self.surface.begin();
         // SAFETY: inside BeginDraw.
         unsafe { self.surface.ctx.SetTransform(&Matrix3x2::scale(self.scale, self.scale)) };
@@ -542,7 +544,10 @@ impl Start {
                 unsafe { self.surface.ctx.DrawRoundedRectangle(&rr, self.color(WHITE), 2.0, None) };
             }
         }
-        self.surface.end()
+        self.surface.end()?;
+        self.dirty = false;
+        self.pending_search_keys = None;
+        Ok(())
     }
 
     fn draw_search(&self) {
