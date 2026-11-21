@@ -5,6 +5,7 @@ use windows::Win32::Graphics::Direct2D::{D2D1_DRAW_TEXT_OPTIONS_NONE, ID2D1Brush
 use windows::Win32::Graphics::DirectWrite::*;
 use windows_core::{HSTRING, Result};
 
+#[derive(Clone)]
 pub struct Text {
     pub factory: IDWriteFactory,
 }

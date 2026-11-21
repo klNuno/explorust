@@ -5,7 +5,7 @@ pub mod backdrop;
 pub mod surface;
 pub mod text;
 
-pub use surface::Surface;
+pub use surface::{Device, Surface};
 pub use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F as Color;
 
 /// sRGB color from 0..255 channels and an alpha in 0..1.

@@ -20,15 +20,27 @@ pub struct Surface {
     _visual: IDCompositionVisual,
 }
 
-impl Surface {
-    pub fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self> {
-        Self::with_buffers(hwnd, width, height, 2)
-    }
+/// The device half of a `Surface`: D3D11 device, DXGI and D2D factories, D2D device and the
+/// DirectWrite factory with its system font collection loaded. Made on a worker thread while
+/// the UI thread creates its window (the viewer's and taskman's first frame), then handed to
+/// `Surface::on`. Nothing in it is used by two threads at once: the worker drops it after the
+/// send.
+pub struct Device {
+    d3d: ID3D11Device,
+    dxgi: IDXGIDevice,
+    dxgi_factory: IDXGIFactory2,
+    factory: ID2D1Factory1,
+    d2d: ID2D1Device,
+    pub text: crate::text::Text,
+}
 
-    /// As `new` with `buffers` back buffers. Three let a window present twice in one refresh
-    /// without its next draw waiting for the vblank that releases the buffer on screen (Start's
-    /// search: a key right after another).
-    pub fn with_buffers(hwnd: HWND, width: u32, height: u32, buffers: u32) -> Result<Self> {
+// SAFETY: the D3D11 device is free threaded, the DWrite shared factory is thread safe, and the
+// single-threaded D2D factory and device are only used by one thread at a time (made on the
+// worker, then used by the UI thread alone).
+unsafe impl Send for Device {}
+
+impl Device {
+    pub fn new() -> Result<Self> {
         unsafe {
             let mut d3d = None;
             D3D11CreateDevice(
@@ -45,6 +57,50 @@ impl Surface {
             let d3d = d3d.unwrap();
             let dxgi: IDXGIDevice = d3d.cast()?;
             let dxgi_factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let d2d = factory.CreateDevice(&dxgi)?;
+            let text = crate::text::Text::new()?;
+            Ok(Self { d3d, dxgi, dxgi_factory, factory, d2d, text })
+        }
+    }
+
+    /// `Device::new` on its own thread; `warm` font families get a format made there so the
+    /// UI thread's first `CreateTextFormat` finds the font collection loaded.
+    pub fn spawn(warm: &'static [&'static str]) -> std::sync::mpsc::Receiver<Result<Self>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new().name("render-device".into()).spawn(move || {
+            let d = Self::new();
+            if let Ok(d) = &d {
+                for f in warm {
+                    let _ = d.text.format(f, 14.0, windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL, crate::text::Align::Leading);
+                }
+            }
+            let _ = tx.send(d);
+        });
+        rx
+    }
+
+    pub fn d3d(&self) -> &ID3D11Device {
+        &self.d3d
+    }
+}
+
+impl Surface {
+    pub fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self> {
+        Self::with_buffers(hwnd, width, height, 2)
+    }
+
+    /// As `new` with `buffers` back buffers. Three let a window present twice in one refresh
+    /// without its next draw waiting for the vblank that releases the buffer on screen (Start's
+    /// search: a key right after another).
+    pub fn with_buffers(hwnd: HWND, width: u32, height: u32, buffers: u32) -> Result<Self> {
+        Self::on(&Device::new()?, hwnd, width, height, buffers)
+    }
+
+    /// The swap chain, device context and composition visual of `hwnd` on a device made
+    /// before (`Device::spawn`).
+    pub fn on(dev: &Device, hwnd: HWND, width: u32, height: u32, buffers: u32) -> Result<Self> {
+        unsafe {
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -57,10 +113,9 @@ impl Surface {
                 AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
                 ..Default::default()
             };
-            let swap = dxgi_factory.CreateSwapChainForComposition(&dxgi, &desc, None)?;
-            let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let device = factory.CreateDevice(&dxgi)?;
-            let ctx = device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+            let swap = dev.dxgi_factory.CreateSwapChainForComposition(&dev.dxgi, &desc, None)?;
+            let factory = dev.factory.clone();
+            let ctx = dev.d2d.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
             let buffer: IDXGISurface = swap.GetBuffer(0)?;
             let props = D2D1_BITMAP_PROPERTIES1 {
                 pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
@@ -72,7 +127,7 @@ impl Surface {
             let target = ctx.CreateBitmapFromDxgiSurface(&buffer, Some(&props))?;
             ctx.SetTarget(&target);
             ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi)?;
+            let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dev.dxgi)?;
             let dtarget = dcomp.CreateTargetForHwnd(hwnd, true)?;
             let visual = dcomp.CreateVisual()?;
             visual.SetContent(&swap)?;

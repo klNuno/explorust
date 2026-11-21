@@ -93,16 +93,34 @@ fn with<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 
 /// Entry of `explorust-viewer.exe`; returns the exit code.
 pub fn run(args: &[String]) -> i32 {
-    unsafe {
-        let _ = OleInitialize(None);
-    }
-    let code = match args.first().map(String::as_str) {
-        Some("--register") => (!actions::register()) as i32,
-        Some("--unregister") => (!actions::unregister()) as i32,
-        Some("--defaults") => (!actions::defaults()) as i32,
-        p => window(p.map(|p| std::path::absolute(p).map(|a| a.display().to_string()).unwrap_or_else(|_| p.into()))),
+    log::mark("main");
+    let p = match args.first().map(String::as_str) {
+        Some(a @ ("--register" | "--unregister" | "--defaults")) => {
+            unsafe {
+                let _ = OleInitialize(None);
+            }
+            let ok = match a {
+                "--register" => actions::register(),
+                "--unregister" => actions::unregister(),
+                _ => actions::defaults(),
+            };
+            unsafe { OleUninitialize() };
+            return (!ok) as i32;
+        }
+        p => p,
     };
-    unsafe { OleUninitialize() };
+    // The device and the font collection load on a worker while this thread makes the window.
+    let dev = render::Device::spawn(&["Segoe UI Variable Text", "Segoe Fluent Icons"]);
+    // COM for the WIC factory now, OLE (the clipboard) after the first frame.
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+    }
+    log::mark("com");
+    let code = window(p.map(|p| std::path::absolute(p).map(|a| a.display().to_string()).unwrap_or_else(|_| p.into())), dev);
+    unsafe {
+        OleUninitialize();
+        windows::Win32::System::Com::CoUninitialize();
+    }
     code
 }
 
@@ -114,7 +132,7 @@ fn client(hwnd: HWND) -> (u32, u32) {
     ((r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32)
 }
 
-fn window(path: Option<String>) -> i32 {
+fn window(path: Option<String>, dev: std::sync::mpsc::Receiver<windows_core::Result<render::Device>>) -> i32 {
     unsafe {
         let Ok(inst) = GetModuleHandleW(None) else { return 1 };
         let wc = WNDCLASSEXW {
@@ -128,6 +146,7 @@ fn window(path: Option<String>) -> i32 {
             ..Default::default()
         };
         RegisterClassExW(&wc);
+        log::mark("class");
         // Photos opens near 70% of the work area, centered.
         let mut wa = RECT::default();
         let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut wa as *mut _ as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
@@ -138,13 +157,16 @@ fn window(path: Option<String>) -> i32 {
             let (tx, rx) = std::sync::mpsc::channel();
             let fit = (ww.max(1) as u32, wh.max(1) as u32);
             worker(move |f| {
-                let _ = tx.send(decode::decode(f, &p, Some(fit)));
+                let d = decode::decode(f, &p, Some(fit));
+                log::mark("decoded");
+                let _ = tx.send(d);
             });
             rx
         });
         let title = path.as_deref().map(|p| p.rsplit('\\').next().unwrap_or(p).to_string()).unwrap_or_else(|| "Photos".into());
+        // No GDI surface: DirectComposition draws the client area, Mica shows where it is clear.
         let Ok(hwnd) = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WS_EX_NOREDIRECTIONBITMAP,
             CLASS,
             &HSTRING::from(title),
             WS_OVERLAPPEDWINDOW,
@@ -159,6 +181,7 @@ fn window(path: Option<String>) -> i32 {
         ) else {
             return 1;
         };
+        log::mark("window");
         let light = theme::light();
         let dark: i32 = (!light) as i32;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
@@ -166,17 +189,43 @@ fn window(path: Option<String>) -> i32 {
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &kind as *const _ as _, 4);
         let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
+        log::mark("dwm");
+        // Shown now, empty over Mica: the show (20 to 30 ms in g1) and DWM's open animation run
+        // while the device worker and the decode finish; the first frame lands inside the animation.
+        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        log::mark("shown");
         let k = GetDpiForWindow(hwnd) as f32 / 96.0;
         let size = client(hwnd);
-        let (Ok(surface), Ok(text), Ok(wic)) = (render::Surface::new(hwnd, size.0, size.1), render::text::Text::new(), factory()) else {
-            log::line("surface, text or WIC failed");
+        let Ok(wic) = factory() else {
+            log::line("WIC failed");
             return 1;
         };
+        log::mark("wic");
+        let dev = match dev.recv() {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => {
+                log::line(&format!("device failed: {e:?}"));
+                return 1;
+            }
+            Err(_) => return 1,
+        };
+        log::mark("device");
+        let surface = match render::Surface::on(&dev, hwnd, size.0, size.1, 2) {
+            Ok(s) => s,
+            Err(e) => {
+                log::line(&format!("surface failed: {e:?}"));
+                return 1;
+            }
+        };
+        let text = dev.text.clone();
+        drop(dev);
+        log::mark("surface");
         log::line(&format!("window and device ready {:.1} ms after process start", log::since_start()));
         use windows::Win32::Graphics::DirectWrite::*;
         let ui = text.format("Segoe UI Variable Text", 14.0 * k, DWRITE_FONT_WEIGHT_NORMAL, render::text::Align::Leading).unwrap();
         let glyphs = text.format("Segoe Fluent Icons", 16.0 * k, DWRITE_FONT_WEIGHT_NORMAL, render::text::Align::Center).unwrap();
         let _ = ui.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        log::mark("formats");
         let app = App {
             hwnd,
             surface,
@@ -211,8 +260,10 @@ fn window(path: Option<String>) -> i32 {
         let gc = GESTURECONFIG { dwID: GID_ZOOM, dwWant: 1 /* GC_ZOOM */, dwBlock: 0 };
         let _ = SetGestureConfig(hwnd, 0, &[gc], size_of::<GESTURECONFIG>() as u32);
         with(|a| a.load(true));
-        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        log::mark("bitmap");
         with(|a| a.paint());
+        let _ = OleInitialize(None);
+        log::mark("ole");
         let mut o = POINT::default();
         let _ = ClientToScreen(hwnd, &mut o);
         log::line(&format!("client at {},{} size {}x{} scale {}", o.x, o.y, size.0, size.1, k));
@@ -497,6 +548,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
             WM_SIZE => {
                 with(|a| {
+                    // The first show sends a WM_SIZE of the size the swap chain has: no second frame.
+                    if client(hwnd) == a.size {
+                        return;
+                    }
                     a.size = client(hwnd);
                     let _ = a.surface.resize(a.size.0, a.size.1);
                     if a.view.fit {

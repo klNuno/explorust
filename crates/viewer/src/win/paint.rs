@@ -141,7 +141,9 @@ impl App {
         let _ = s.end();
         if self.first_frame && !self.frames.is_empty() {
             self.first_frame = false;
+            log::mark("presented");
             log::line(&format!("first frame on screen {:.1} ms after process start", log::since_start()));
+            log::line(&format!("timeline: {}", log::timeline()));
         }
     }
 }

@@ -130,14 +130,19 @@ pub fn run() -> i32 {
             let _ = SetForegroundWindow(h);
             return 0;
         }
+        log::mark("main");
+        // The device and the font collection load on a worker while this thread makes the
+        // window and takes the first sample.
+        let dev = render::Device::spawn(&["Segoe UI Variable Text", "Segoe Fluent Icons"]);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let code = window();
+        log::mark("com");
+        let code = window(dev);
         CoUninitialize();
         code
     }
 }
 
-fn window() -> i32 {
+fn window(dev: std::sync::mpsc::Receiver<windows_core::Result<render::Device>>) -> i32 {
     unsafe {
         let Ok(inst) = GetModuleHandleW(None) else { return 1 };
         let wc = WNDCLASSEXW {
@@ -149,12 +154,14 @@ fn window() -> i32 {
             ..Default::default()
         };
         RegisterClassExW(&wc);
+        log::mark("class");
         let mut wa = RECT::default();
         let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut wa as *mut _ as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
         let (ww, wh) = (980.min(wa.right - wa.left), 680.min(wa.bottom - wa.top));
         let fr = french();
+        // No GDI surface: DirectComposition draws the client area, Mica shows where it is clear.
         let Ok(hwnd) = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WS_EX_NOREDIRECTIONBITMAP,
             CLASS,
             &HSTRING::from(if fr { "Gestionnaire des tâches" } else { "Task Manager" }),
             WS_OVERLAPPEDWINDOW,
@@ -169,6 +176,7 @@ fn window() -> i32 {
         ) else {
             return 1;
         };
+        log::mark("window");
         let light = theme::light();
         let dark: i32 = (!light) as i32;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
@@ -176,16 +184,39 @@ fn window() -> i32 {
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &kind as *const _ as _, 4);
         let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
+        log::mark("dwm");
+        // Shown now, empty over Mica: the show (20 to 30 ms in g1) and DWM's open animation run
+        // while the device worker and the decode finish; the first frame lands inside the animation.
+        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        log::mark("shown");
         let k = GetDpiForWindow(hwnd) as f32 / 96.0;
         let size = client(hwnd);
-        let (Ok(surface), Ok(text)) = (render::Surface::new(hwnd, size.0, size.1), render::text::Text::new()) else {
-            log::line("surface or text failed");
-            return 1;
-        };
-        let f = paint::Fonts::new(&text, k);
-        log::line(&format!("window and device ready {:.1} ms after process start", log::since_start()));
+        // The first sample while the worker may still make the device.
         let s = Sampler::new();
+        log::mark("sample");
         log::line(&format!("first sample {:.1} ms after process start", log::since_start()));
+        let dev = match dev.recv() {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => {
+                log::line(&format!("device failed: {e:?}"));
+                return 1;
+            }
+            Err(_) => return 1,
+        };
+        log::mark("device");
+        let surface = match render::Surface::on(&dev, hwnd, size.0, size.1, 2) {
+            Ok(s) => s,
+            Err(e) => {
+                log::line(&format!("surface failed: {e:?}"));
+                return 1;
+            }
+        };
+        let text = dev.text.clone();
+        drop(dev);
+        log::mark("surface");
+        let f = paint::Fonts::new(&text, k);
+        log::mark("formats");
+        log::line(&format!("window and device ready {:.1} ms after process start", log::since_start()));
         let groups = group(&s.procs);
         log::line(&format!("first sample {} processes", s.procs.len()));
         let app = App {
@@ -217,7 +248,6 @@ fn window() -> i32 {
             cpu_at: (own_cpu(), wall()),
         };
         APP.with(|a| *a.borrow_mut() = Some(app));
-        let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         with(|a| a.paint());
         let target = hwnd.0 as usize;
         with(|a| {
@@ -435,6 +465,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
             WM_SIZE => {
                 with(|a| {
+                    // The first show sends a WM_SIZE of the size the swap chain has: no second frame.
+                    if client(hwnd) == a.size {
+                        return;
+                    }
                     a.size = client(hwnd);
                     let _ = a.surface.resize(a.size.0, a.size.1);
                     a.paint();
@@ -522,6 +556,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 pub fn first_frame(a: &mut App) {
     if a.first {
         a.first = false;
+        log::mark("presented");
         log::line(&format!("first frame on screen {:.1} ms after process start, {} processes", log::since_start(), a.s.procs.len()));
+        log::line(&format!("timeline: {}", log::timeline()));
     }
 }

@@ -33,3 +33,18 @@ pub fn since_start() -> f64 {
         (f(now) - f(c)) / 10_000.0
     }
 }
+
+static MARKS: std::sync::Mutex<Vec<(&'static str, f64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes a startup step at its time since process start, for `timeline`.
+pub fn mark(what: &'static str) {
+    let t = since_start();
+    MARKS.lock().unwrap_or_else(|p| p.into_inner()).push((what, t));
+}
+
+/// The startup steps noted so far, `step ms` in order of time.
+pub fn timeline() -> String {
+    let mut m = MARKS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    m.sort_by(|a, b| a.1.total_cmp(&b.1));
+    m.iter().map(|(w, t)| format!("{w} {t:.1}")).collect::<Vec<_>>().join(", ")
+}
