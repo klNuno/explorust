@@ -8,7 +8,7 @@ use fsindex::table::Table;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
-use windows::Win32::System::Threading::GetCurrentProcess;
+use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
 
 pub struct Vol {
     pub root: String,
@@ -30,11 +30,12 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
             let v = volume::Volume::open(letter)?;
             let j = v.journal()?;
             let t0 = Instant::now();
-            let t = v.load(j.NextUsn)?;
+            let (t, pruned) = v.load(j.NextUsn)?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             let (n, bytes) = (t.len(), t.bytes());
             *vol.table.write().unwrap_or_else(|p| p.into_inner()) = t;
             log::line(&format!("{letter}: MFT read: {n} names in {ms:.0} ms, table {:.1} MB ({:.1} bytes a name)", bytes as f64 / 1048576.0, bytes as f64 / n.max(1) as f64));
+            links_later(letter, pruned, vol.clone());
             if first {
                 let _ = loaded.send(());
                 first = false;
@@ -59,6 +60,28 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
         }
         std::thread::sleep(Duration::from_secs(30));
     }
+}
+
+/// Looks up the outside names of the pruned files on a background thread of its own, so the
+/// follower starts at once (the lookup opens each file by id).
+fn links_later(letter: char, frns: Vec<u64>, vol: Arc<Vol>) {
+    if frns.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name(format!("index-{letter}-links")).spawn(move || {
+        // SAFETY: lowers this thread's CPU and I/O priority for the lookup.
+        let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
+        let t0 = Instant::now();
+        let Ok(v) = volume::Volume::open(letter) else { return };
+        let (looked, added, failed) = volume::add_links(v.handle(), &frns, &vol.table);
+        vol.table.write().unwrap_or_else(|p| p.into_inner()).shrink();
+        let (bytes, names) = vol.table.read().map(|t| (t.bytes(), t.len())).unwrap_or((0, 0));
+        log::line(&format!(
+            "{letter}: hard links: {looked} files inside WinSxS looked up in {:.0} ms, {added} names outside it added, {failed} not opened; {names} names, table {:.1} MB",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            bytes as f64 / 1048576.0
+        ));
+    });
 }
 
 fn answer(vols: &[Arc<Vol>], q: &str, max: u16) -> Reply {

@@ -7,8 +7,9 @@ use std::sync::RwLock;
 use std::time::Instant;
 use windows::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE, GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
-    OPEN_EXISTING,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdType, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    OPEN_EXISTING, OpenFileById,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
@@ -74,6 +75,74 @@ fn ioctl<I>(h: HANDLE, code: u32, input: &I, out: &mut [u8]) -> windows_core::Re
     Ok(got as usize)
 }
 
+/// FileHardLinkInformation (FILE_INFORMATION_CLASS 46): every name of a file with its folder.
+const FILE_HARD_LINK_INFORMATION: u32 = 46;
+
+windows_core::link!("ntdll.dll" "system" fn NtQueryInformationFile(file: HANDLE, iosb: *mut [usize; 2], info: *mut core::ffi::c_void, len: u32, class: u32) -> i32);
+
+/// The names of file `frn` (full reference, sequence included) as (parent record, name).
+fn hard_links(volume: HANDLE, frn: u64, buf: &mut [u8]) -> Option<Vec<(u32, String)>> {
+    let id = FILE_ID_DESCRIPTOR { dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32, Type: FileIdType, Anonymous: FILE_ID_DESCRIPTOR_0 { FileId: frn as i64 } };
+    // SAFETY: opens by id for attributes only; the handle is closed below.
+    let h = unsafe {
+        OpenFileById(volume, &id, FILE_READ_ATTRIBUTES.0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, None, FILE_FLAG_BACKUP_SEMANTICS).ok()?
+    };
+    let mut iosb = [0usize; 2];
+    // SAFETY: the buffer outlives the call; the class fills FILE_LINKS_INFORMATION.
+    let st = unsafe { NtQueryInformationFile(h, &mut iosb, buf.as_mut_ptr().cast(), buf.len() as u32, FILE_HARD_LINK_INFORMATION) };
+    // SAFETY: the handle opened above.
+    let _ = unsafe { CloseHandle(h) };
+    if st < 0 {
+        return None;
+    }
+    // FILE_LINKS_INFORMATION: BytesNeeded u32, EntriesReturned u32, then entries of
+    // NextEntryOffset u32, (pad) ParentFileId i64 at 8, FileNameLength u32 at 16, FileName at 20.
+    let u32_at = |o: usize| buf.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let n = u32_at(4)? as usize;
+    let (mut o, mut out) = (8usize, Vec::with_capacity(n));
+    for _ in 0..n {
+        let next = u32_at(o)? as usize;
+        let parent = u64::from_le_bytes(buf.get(o + 8..o + 16)?.try_into().ok()?) & ((1 << 48) - 1);
+        let len = u32_at(o + 16)? as usize;
+        let units: Vec<u16> = buf.get(o + 20..o + 20 + len * 2)?.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        out.push((parent.min(u32::MAX as u64) as u32, String::from_utf16_lossy(&units)));
+        if next == 0 {
+            break;
+        }
+        o += next;
+    }
+    Some(out)
+}
+
+/// Gives each file in `frns` (whose name is inside a pruned tree) its first name outside it, if
+/// it has one: System32's binaries are hard links whose first name is in WinSxS. Takes the write
+/// lock per chunk so queries go on meanwhile; returns (files looked at, names added, open failures).
+pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>) -> (usize, usize, usize) {
+    let mut buf = vec![0u8; 8 << 10];
+    let (mut added, mut failed) = (0, 0);
+    for chunk in frns.chunks(256) {
+        let mut found = Vec::new();
+        for &frn in chunk {
+            match hard_links(volume, frn, &mut buf) {
+                Some(links) if links.len() > 1 => found.push((frn & ((1 << 48) - 1), links)),
+                Some(_) => {}
+                None => failed += 1,
+            }
+        }
+        if found.is_empty() {
+            continue;
+        }
+        let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+        for (rec, links) in found {
+            if let Some((parent, name)) = links.into_iter().find(|(p, _)| !t.pruned_parent(*p)) {
+                t.upsert(rec as u32, parent, &name, false, false, 0);
+                added += 1;
+            }
+        }
+    }
+    (frns.len(), added, failed)
+}
+
 fn apply(t: &mut Table, r: &Record) {
     if r.rec < FIRST_USER_RECORD || r.rec > u32::MAX as u64 - 1 {
         return;
@@ -113,9 +182,15 @@ impl Volume {
         Ok(unsafe { std::ptr::read_unaligned(out.as_ptr() as *const USN_JOURNAL_DATA_V0) })
     }
 
-    /// Every name in the MFT up to `high` into a new table.
-    pub fn load(&self, high: i64) -> windows_core::Result<Table> {
+    pub fn handle(&self) -> HANDLE {
+        self.h
+    }
+
+    /// Every name in the MFT up to `high` into a new table, and the full references of the files
+    /// left out with the pruned trees (for `add_links`).
+    pub fn load(&self, high: i64) -> windows_core::Result<(Table, Vec<u64>)> {
         let mut t = Table::new();
+        let mut seqs: Vec<u16> = Vec::new();
         let mut med = MFT_ENUM_DATA_V0 { StartFileReferenceNumber: 0, LowUsn: 0, HighUsn: high };
         let mut buf = vec![0u8; 1 << 20];
         loop {
@@ -128,12 +203,21 @@ impl Volume {
                 break;
             }
             med.StartFileReferenceNumber = u64::from_le_bytes(buf[..8].try_into().unwrap_or_default());
-            usn::parse(&buf[8..got], |r| apply(&mut t, &r));
+            usn::parse(&buf[8..got], |r| {
+                if let Some(i) = usize::try_from(r.rec).ok().filter(|&i| i < u32::MAX as usize) {
+                    if seqs.len() <= i {
+                        seqs.resize(i + 1, 0);
+                    }
+                    seqs[i] = r.seq;
+                }
+                apply(&mut t, &r)
+            });
         }
         let pruned = t.settle();
         t.shrink();
-        log::line(&format!("{}: {pruned} names inside WinSxS left out", self.letter));
-        Ok(t)
+        let files: Vec<u64> = t.take_pruned_files().into_iter().map(|r| r as u64 | (seqs.get(r as usize).copied().unwrap_or(0) as u64) << 48).collect();
+        log::line(&format!("{}: {pruned} names inside WinSxS left out ({} files)", self.letter, files.len()));
+        Ok((t, files))
     }
 
     /// Applies the journal from `next` on, blocking until changes come; returns on an error
@@ -142,6 +226,7 @@ impl Volume {
         let mut buf = vec![0u8; 64 << 10];
         let mut changes = 0u64;
         let mut since = Instant::now();
+        let mut seq_of: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
         loop {
             let rd = READ_USN_JOURNAL_DATA_V0 {
                 StartUsn: next,
@@ -160,11 +245,25 @@ impl Volume {
             }
             next = i64::from_le_bytes(buf[..8].try_into().unwrap_or_default());
             if got > 8 {
-                let mut t = table.write().unwrap_or_else(|p| p.into_inner());
-                usn::parse(&buf[8..got], |r| {
-                    changes += 1;
-                    apply(&mut t, &r)
-                });
+                let mut pruned = Vec::new();
+                {
+                    let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+                    usn::parse(&buf[8..got], |r| {
+                        changes += 1;
+                        apply(&mut t, &r);
+                        if r.rec <= u32::MAX as u64 {
+                            seq_of.insert(r.rec as u32, r.seq);
+                        }
+                    });
+                    for rec in t.take_pruned_files() {
+                        pruned.push(rec as u64 | (seq_of.get(&rec).copied().unwrap_or(0) as u64) << 48);
+                    }
+                    seq_of.clear();
+                }
+                // A file added inside WinSxS by an update: its System32 link, if any.
+                if !pruned.is_empty() {
+                    add_links(self.h, &pruned, table);
+                }
             }
             if since.elapsed().as_secs() >= 600 {
                 log::line(&format!("{}: {changes} journal records in the last {} s, {} names", self.letter, since.elapsed().as_secs(), table.read().map(|t| t.len()).unwrap_or(0)));

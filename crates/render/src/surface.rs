@@ -22,6 +22,13 @@ pub struct Surface {
 
 impl Surface {
     pub fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self> {
+        Self::with_buffers(hwnd, width, height, 2)
+    }
+
+    /// As `new` with `buffers` back buffers. Three let a window present twice in one refresh
+    /// without its next draw waiting for the vblank that releases the buffer on screen (Start's
+    /// search: a key right after another).
+    pub fn with_buffers(hwnd: HWND, width: u32, height: u32, buffers: u32) -> Result<Self> {
         unsafe {
             let mut d3d = None;
             D3D11CreateDevice(
@@ -44,7 +51,7 @@ impl Surface {
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: 2,
+                BufferCount: buffers,
                 Scaling: DXGI_SCALING_STRETCH,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
                 AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,

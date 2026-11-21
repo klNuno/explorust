@@ -51,6 +51,9 @@ pub struct Table {
     dead: usize,
     /// Records of the folders named in PRUNE_NAMES (their contents are not kept).
     prune_roots: Vec<u32>,
+    /// Files pruned since the last `take_pruned_files`: a hard link of theirs may sit outside
+    /// the pruned tree (System32 binaries are links into WinSxS), looked up by the service.
+    pruned_files: Vec<u32>,
 }
 
 /// A match before its path is built.
@@ -143,7 +146,19 @@ impl Table {
         self.slots.get(rec as usize).is_some_and(|s| s.name != NONE && s.name & DIR != 0)
     }
 
-    /// Adds or updates record `rec`: a new name or parent replaces the old one.
+    /// Files pruned since the last call (their record numbers), for the hard link lookup.
+    pub fn take_pruned_files(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pruned_files)
+    }
+
+    /// True when a name under `parent` would be left out (a prune root or inside one).
+    pub fn pruned_parent(&self, parent: u32) -> bool {
+        self.prune_roots.contains(&parent) || self.slots.get(parent as usize).is_some_and(|p| p.parent == NONE && p.name == NONE)
+    }
+
+    /// Adds or updates record `rec`: a new name or parent replaces the old one. A name inside a
+    /// pruned tree does not replace a kept name outside it: a file with hard links on both sides
+    /// keeps its outside one (the journal reports changes under either name).
     pub fn upsert(&mut self, rec: u32, parent: u32, name: &str, dir: bool, attrs_noisy: bool, usn: i64) {
         if rec == NONE || name.is_empty() || name.contains('\n') {
             return;
@@ -152,9 +167,15 @@ impl Table {
         if r >= self.slots.len() {
             self.slots.resize(r + 1, FREE);
         }
-        if self.prune_roots.contains(&parent) || self.slots.get(parent as usize).is_some_and(|p| p.parent == NONE && p.name == NONE) {
+        if self.pruned_parent(parent) {
+            if !dir && self.slots[r].name != NONE && !self.walk_pruned(rec) {
+                return;
+            }
             self.remove(rec);
             self.slots[r] = PRUNED;
+            if !dir {
+                self.pruned_files.push(rec);
+            }
             return;
         }
         if dir && PRUNE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) && !self.prune_roots.contains(&rec) {
@@ -248,6 +269,9 @@ impl Table {
         if !self.prune_roots.is_empty() {
             for r in 0..self.slots.len() as u32 {
                 if self.slots[r as usize].name != NONE && self.walk_pruned(r) {
+                    if self.slots[r as usize].name & DIR == 0 {
+                        self.pruned_files.push(r);
+                    }
                     self.recs[(self.slots[r as usize].name & IDX) as usize] = NONE;
                     self.slots[r as usize] = PRUNED;
                     self.dead += 1;
@@ -505,6 +529,30 @@ mod tests {
         // A record moved out of the tree comes back.
         t.upsert(46, 32, "final3.dll", false, false, 3);
         assert_eq!(t.path(46, "C:\\").as_deref(), Some("C:\\Users\\agent\\Documents\\final3.dll"));
+    }
+
+    #[test]
+    fn hard_link_outside_pruned_tree() {
+        let mut t = sample();
+        t.upsert(40, ROOT, "Windows", true, false, 1);
+        t.upsert(50, 40, "System32", true, false, 1);
+        t.upsert(43, 42, "kernelbase.dll", false, false, 1);
+        t.upsert(42, 41, "amd64_kernelbase_31bf3856ad364e35", true, false, 1);
+        t.upsert(41, 40, "WinSxS", true, false, 1);
+        t.settle();
+        assert_eq!(t.take_pruned_files(), vec![43], "files only, not the pruned folder");
+        assert!(t.take_pruned_files().is_empty());
+        // The service found the file's other link, in System32.
+        t.upsert(43, 50, "kernelbase.dll", false, false, 0);
+        assert_eq!(t.path(43, "C:\\").as_deref(), Some("C:\\Windows\\System32\\kernelbase.dll"));
+        // A journal record under its WinSxS name keeps the System32 one.
+        t.upsert(43, 42, "kernelbase.dll", false, false, 2);
+        assert_eq!(t.path(43, "C:\\").as_deref(), Some("C:\\Windows\\System32\\kernelbase.dll"));
+        assert!(t.take_pruned_files().is_empty());
+        // A new file inside the tree is reported for the lookup.
+        t.upsert(44, 42, "new.dll", false, false, 3);
+        assert_eq!(t.take_pruned_files(), vec![44]);
+        assert!(t.pruned_parent(42) && t.pruned_parent(41) && !t.pruned_parent(50));
     }
 
     #[test]

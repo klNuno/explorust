@@ -13,6 +13,8 @@ pub const ATTR_DIRECTORY: u32 = 0x10;
 pub struct Record {
     /// The MFT record number (the low 48 bits of the file reference).
     pub rec: u64,
+    /// The sequence number (the high 16 bits of the file reference), for opening by id.
+    pub seq: u16,
     pub parent: u64,
     pub usn: i64,
     pub reason: u32,
@@ -51,7 +53,7 @@ pub fn parse(buf: &[u8], mut f: impl FnMut(Record)) {
             let (nl, no) = (nl as usize, no as usize);
             if no + nl <= len {
                 let units: Vec<u16> = r[no..no + nl].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-                f(Record { rec: frn & MASK48, parent: parent & MASK48, usn: usn as i64, reason, attrs, name: String::from_utf16_lossy(&units) });
+                f(Record { rec: frn & MASK48, seq: (frn >> 48) as u16, parent: parent & MASK48, usn: usn as i64, reason, attrs, name: String::from_utf16_lossy(&units) });
             }
         }
         o += len;
@@ -89,7 +91,7 @@ mod tests {
         let mut got = Vec::new();
         parse(&buf, |r| got.push(r));
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0], Record { rec: 40, parent: 5, usn: 1234, reason: REASON_FILE_CREATE, attrs: ATTR_DIRECTORY, name: "Projets".into() });
+        assert_eq!(got[0], Record { rec: 40, seq: 7, parent: 5, usn: 1234, reason: REASON_FILE_CREATE, attrs: ATTR_DIRECTORY, name: "Projets".into() });
         assert_eq!(got[1].name, "notes été.txt");
         assert_eq!(got[1].parent, 40);
     }
