@@ -39,13 +39,19 @@ pub fn apply(hwnd: HWND, backdrop: Backdrop) {
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as _, 4);
         let none = DWMWA_COLOR_NONE;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &none as *const _ as _, 4);
-        let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else { return };
-        let Some(f) = GetProcAddress(user32, s!("SetWindowCompositionAttribute")) else { return };
-        let set: unsafe extern "system" fn(HWND, *mut CompositionData) -> BOOL = core::mem::transmute(f);
         let (state, tint) = match backdrop {
             Backdrop::Acrylic { tint_abgr } => (4, tint_abgr),
             Backdrop::Transparent { tint_abgr } => (2, tint_abgr),
         };
+        accent(hwnd, state, tint);
+    }
+}
+
+pub(crate) fn accent(hwnd: HWND, state: u32, tint: u32) {
+    unsafe {
+        let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else { return };
+        let Some(f) = GetProcAddress(user32, s!("SetWindowCompositionAttribute")) else { return };
+        let set: unsafe extern "system" fn(HWND, *mut CompositionData) -> BOOL = core::mem::transmute(f);
         let mut policy = AccentPolicy { state, flags: 2, gradient_abgr: tint, animation_id: 0 };
         let mut data = CompositionData { attrib: 19, data: &mut policy as *mut _ as _, size: size_of::<AccentPolicy>() };
         let _ = set(hwnd, &mut data);
