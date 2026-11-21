@@ -13,6 +13,7 @@ use super::report;
 use super::rules::Rules;
 use super::watch::{self, Watch};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::UI::Core::{CoreDispatcher, CoreDispatcherPriority, DispatchedHandler};
@@ -52,7 +53,8 @@ impl IClassFactory_Impl for Factory_Impl {
         if !outer.is_null() {
             return Err(CLASS_E_NOAGGREGATION.into());
         }
-        let tap: IObjectWithSite = Tap { site: Mutex::new(None) }.into();
+        let id = TAPS.fetch_add(1, Ordering::Relaxed) + 1;
+        let tap: IObjectWithSite = Tap { site: Mutex::new(None), id }.into();
         // SAFETY: COM's out pointer contract.
         unsafe { tap.query(iid, out).ok() }
     }
@@ -65,16 +67,27 @@ impl IClassFactory_Impl for Factory_Impl {
 #[implement(IObjectWithSite)]
 struct Tap {
     site: Mutex<Option<IUnknown>>,
+    /// This TAP's number: only its own watch is stopped when the runtime lets go of it.
+    id: u64,
 }
+
+static TAPS: AtomicU64 = AtomicU64::new(0);
 
 impl IObjectWithSite_Impl for Tap_Impl {
     fn SetSite(&self, site: Ref<IUnknown>) -> windows_core::Result<()> {
         let site = site.cloned();
         *self.site.lock().unwrap_or_else(|e| e.into_inner()) = site.clone();
         let r = match site {
-            Some(s) => start(&s),
-            // The runtime lets go of the TAP: its watch stops and its changes are undone.
-            None => spawn(|| stop_active(Instant::now())),
+            Some(s) => start(&s, self.id),
+            // The runtime lets go of the TAP: its watch, if still the active one, stops and its
+            // changes are undone, after any attach in flight (same lock).
+            None => {
+                let id = self.id;
+                spawn(move || {
+                    let _swap = SWAP.lock().unwrap_or_else(|e| e.into_inner());
+                    stop_active(Instant::now(), Some(id));
+                })
+            }
         };
         if let Err(e) = r {
             report::line(format!("tap: not started: {e}"));
@@ -102,6 +115,7 @@ struct Session {
     diag: IXamlDiagnostics,
     cb: IVisualTreeServiceCallback2,
     st: Arc<Mutex<watch::State>>,
+    tap: u64,
 }
 
 static ACTIVE: Mutex<Option<Send<Session>>> = Mutex::new(None);
@@ -112,9 +126,17 @@ fn spawn(f: impl FnOnce() + std::marker::Send + 'static) -> windows_core::Result
     std::thread::Builder::new().name("explorust-xaml".into()).spawn(f).map(|_| ()).map_err(|_| E_FAIL.into())
 }
 
-/// Unadvises the running watch, then undoes its changes on the UI thread and waits for that.
-fn stop_active(t0: Instant) {
-    let Some(Send(s)) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+/// Unadvises the running watch (only when TAP `only` advised it, if given), then undoes its
+/// changes on the UI thread and waits for that. Called with `SWAP` held.
+fn stop_active(t0: Instant, only: Option<u64>) {
+    let s = {
+        let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if only.is_some_and(|id| active.as_ref().is_some_and(|a| a.0.tap != id)) {
+            return;
+        }
+        active.take()
+    };
+    let Some(Send(s)) = s else { return };
     // SAFETY: COM on this thread; the callback was advised on this service.
     let hr = unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -127,27 +149,39 @@ fn stop_active(t0: Instant) {
         .and_then(|()| (!raw.is_null()).then(|| unsafe { IInspectable::from_raw(raw) }).ok_or(E_FAIL.into()))
         .and_then(|i| i.cast::<CoreDispatcher>());
     let (tx, rx) = std::sync::mpsc::channel();
-    let moved = Send((s.st.clone(), s.svc.clone(), tx));
+    // Claimed by whichever comes first: the queued undo, or this thread giving up on it, so an
+    // undo that runs late never lands over the next watch's styling.
+    let claim = Arc::new(AtomicBool::new(false));
+    let moved = Send((s.st.clone(), s.svc.clone(), tx, claim.clone()));
     let queued = dispatcher.and_then(|d| {
         d.RunAsync(
             CoreDispatcherPriority::Normal,
             &DispatchedHandler::new(move || {
                 // The whole wrapper is moved in (Send), not its fields one by one.
                 let m = &moved;
-                let (st, svc, tx) = &m.0;
-                let _ = tx.send(watch::undo(st, svc));
+                let (st, svc, tx, claim) = &m.0;
+                if !claim.swap(true, Ordering::AcqRel) {
+                    let _ = tx.send(watch::undo(st, svc));
+                }
                 Ok(())
             }),
         )
     });
     let undone = match queued {
-        Ok(_) => rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| "UI thread did not answer in 5 s".into()),
+        Ok(_) => match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(u) => u,
+            // Running already: let it finish (bounded) rather than style over it.
+            Err(_) if claim.swap(true, Ordering::AcqRel) => {
+                rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| "undo still running after 10 s".into())
+            }
+            Err(_) => "UI thread did not answer in 5 s, undo cancelled".into(),
+        },
         Err(e) => format!("no UI dispatcher: {e}"),
     };
     report::line(format!("tap: previous watch unadvised {:#010x}, {undone}, in {} ms", hr.0, t0.elapsed().as_millis()));
 }
 
-fn start(site: &IUnknown) -> windows_core::Result<()> {
+fn start(site: &IUnknown, tap: u64) -> windows_core::Result<()> {
     let t0 = Instant::now();
     let diag: IXamlDiagnostics = site.cast()?;
     let svc: IVisualTreeService = site.cast()?;
@@ -169,11 +203,11 @@ fn start(site: &IUnknown) -> windows_core::Result<()> {
     let idle = rules.idle();
     let (w, st) = Watch::new(svc.clone(), diag.clone(), rules, t0);
     let cb: IVisualTreeServiceCallback2 = w.into();
-    let moved = Send(Session { svc, diag, cb, st });
+    let moved = Send(Session { svc, diag, cb, st, tap });
     spawn(move || {
         let m = moved;
         let swap = SWAP.lock().unwrap_or_else(|e| e.into_inner());
-        stop_active(t0);
+        stop_active(t0, None);
         if idle {
             report::line("tap: no rules, Settings keeps its own look".into());
             return;

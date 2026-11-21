@@ -50,6 +50,8 @@ pub fn spawn_all() {
     // The injector has no bus owner: it answers no hotkey, only window shows of other apps.
     if off.iter().any(|o| o == "inject") {
         log::line("inject: off (parts-off.txt)");
+        // A Settings process styled by an earlier run still holds the TAP: it undoes that.
+        let _ = std::thread::Builder::new().name("inject-undo".into()).spawn(explorust_inject::undo_settings);
     } else if let Err(e) = std::thread::Builder::new().name("inject".into()).spawn(|| supervise("inject", explorust_inject::run)) {
         log::line(&format!("inject: thread not started: {e}"));
     }

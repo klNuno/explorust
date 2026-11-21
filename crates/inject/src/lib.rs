@@ -35,6 +35,14 @@ pub const MSG_STYLE: &str = "explorust.inject.style";
 pub const MSG_DONE: &str = "explorust.inject.done";
 /// The DLL's file name, next to explorust.exe.
 pub const DLL_NAME: &str = "explorust_inject.dll";
+
+/// The injector is off (parts-off.txt): undo the styling a TAP loaded earlier still applies.
+#[cfg(target_os = "windows")]
+pub fn undo_settings() {
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        xaml::attach::undo_everywhere(&dir.join(DLL_NAME));
+    }
+}
 /// The exported hook procedure.
 pub const HOOK_EXPORT: &[u8] = b"explorust_inject_hook\0";
 

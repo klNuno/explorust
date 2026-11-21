@@ -81,15 +81,24 @@ const FILE_HARD_LINK_INFORMATION: u32 = 46;
 windows_core::link!("ntdll.dll" "system" fn NtQueryInformationFile(file: HANDLE, iosb: *mut [usize; 2], info: *mut core::ffi::c_void, len: u32, class: u32) -> i32);
 
 /// The names of file `frn` (full reference, sequence included) as (parent record, name).
-fn hard_links(volume: HANDLE, frn: u64, buf: &mut [u8]) -> Option<Vec<(u32, String)>> {
+fn hard_links(volume: HANDLE, frn: u64, buf: &mut Vec<u8>) -> Option<Vec<(u32, String)>> {
     let id = FILE_ID_DESCRIPTOR { dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32, Type: FileIdType, Anonymous: FILE_ID_DESCRIPTOR_0 { FileId: frn as i64 } };
     // SAFETY: opens by id for attributes only; the handle is closed below.
     let h = unsafe {
         OpenFileById(volume, &id, FILE_READ_ATTRIBUTES.0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, None, FILE_FLAG_BACKUP_SEMANTICS).ok()?
     };
     let mut iosb = [0usize; 2];
-    // SAFETY: the buffer outlives the call; the class fills FILE_LINKS_INFORMATION.
-    let st = unsafe { NtQueryInformationFile(h, &mut iosb, buf.as_mut_ptr().cast(), buf.len() as u32, FILE_HARD_LINK_INFORMATION) };
+    let mut st = 0;
+    for _ in 0..2 {
+        // SAFETY: the buffer outlives the call; the class fills FILE_LINKS_INFORMATION.
+        st = unsafe { NtQueryInformationFile(h, &mut iosb, buf.as_mut_ptr().cast(), buf.len() as u32, FILE_HARD_LINK_INFORMATION) };
+        // Too many links for the buffer: NTFS reports the size it needs in BytesNeeded.
+        let needed = buf.get(..4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+        if st >= 0 || needed <= buf.len() || needed > 1 << 20 {
+            break;
+        }
+        buf.resize(needed, 0);
+    }
     // SAFETY: the handle opened above.
     let _ = unsafe { CloseHandle(h) };
     if st < 0 {
@@ -119,11 +128,18 @@ fn hard_links(volume: HANDLE, frn: u64, buf: &mut [u8]) -> Option<Vec<(u32, Stri
 /// first name is in WinSxS; a kept name with no link left outside is dropped. The links are read
 /// without the lock, so queries and the journal go on meanwhile; a result is written only into the
 /// same table and only when its record still holds what it held before the read (the journal wins
-/// any change made in between). Returns (files looked at, names added, open failures).
-pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>) -> (usize, usize, usize) {
+/// any change made in between, `Table::touched`). `id` is the table the files were taken from.
+/// Returns (files looked at, names added, the files whose lookup failed).
+pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -> (usize, usize, Vec<u64>) {
     let mut buf = vec![0u8; 8 << 10];
-    let (mut added, mut failed) = (0, 0);
-    let id = table.read().unwrap_or_else(|p| p.into_inner()).id();
+    let (mut added, mut failed) = (0, Vec::new());
+    {
+        let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+        if t.id() != id {
+            return (0, 0, failed);
+        }
+        t.watch_touches(true);
+    }
     for chunk in frns.chunks(256) {
         let before: Vec<RecState> = {
             let t = table.read().unwrap_or_else(|p| p.into_inner());
@@ -133,7 +149,7 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>) -> (usize,
         for (&frn, was) in chunk.iter().zip(before) {
             match hard_links(volume, frn, &mut buf) {
                 Some(links) => found.push(((frn & ((1 << 48) - 1)) as u32, was, links)),
-                None => failed += 1,
+                None => failed.push(frn),
             }
         }
         if found.is_empty() {
@@ -144,7 +160,7 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>) -> (usize,
             break;
         }
         for (rec, was, links) in found {
-            if t.state(rec) != was {
+            if t.state(rec) != was || t.touched(rec) {
                 continue;
             }
             match links.into_iter().find(|(p, _)| !t.pruned_parent(*p)) {
@@ -158,6 +174,10 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>) -> (usize,
             }
         }
     }
+    let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+    if t.id() == id {
+        t.watch_touches(false);
+    }
     (frns.len(), added, failed)
 }
 
@@ -165,6 +185,7 @@ fn apply(t: &mut Table, r: &Record) {
     if r.rec < FIRST_USER_RECORD || r.rec > u32::MAX as u64 - 1 {
         return;
     }
+    t.touch(r.rec as u32);
     if r.reason & usn::REASON_FILE_DELETE != 0 {
         t.remove(r.rec as u32);
     } else if r.reason & usn::REASON_RENAME_OLD_NAME == 0 {
@@ -250,6 +271,7 @@ impl Volume {
         let mut changes = 0u64;
         let mut since = Instant::now();
         let mut seq_of: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
+        let (mut retry, mut tries) = (Vec::new(), std::collections::HashMap::<u64, u8>::new());
         loop {
             let rd = READ_USN_JOURNAL_DATA_V0 {
                 StartUsn: next,
@@ -268,9 +290,11 @@ impl Volume {
             }
             next = i64::from_le_bytes(buf[..8].try_into().unwrap_or_default());
             if got > 8 {
-                let mut pruned = Vec::new();
+                let mut pruned = std::mem::take(&mut retry);
+                let id;
                 {
                     let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+                    id = t.id();
                     usn::parse(&buf[8..got], |r| {
                         changes += 1;
                         apply(&mut t, &r);
@@ -284,8 +308,22 @@ impl Volume {
                     seq_of.clear();
                 }
                 // A file added inside WinSxS by an update: its System32 link, if any.
+                // A lookup that failed (file busy, buffer) is tried again with the next batch, up
+                // to 3 times.
                 if !pruned.is_empty() {
-                    add_links(self.h, &pruned, table);
+                    let failed = add_links(self.h, &pruned, table, id).2;
+                    for frn in pruned.iter().filter(|f| !failed.contains(f)) {
+                        tries.remove(frn);
+                    }
+                    for frn in failed {
+                        let n = tries.entry(frn).or_insert(0);
+                        *n += 1;
+                        if *n < 3 {
+                            retry.push(frn);
+                        } else {
+                            tries.remove(&frn);
+                        }
+                    }
                 }
             }
             if since.elapsed().as_secs() >= 600 {

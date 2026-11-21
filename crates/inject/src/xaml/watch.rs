@@ -18,6 +18,8 @@ const BATCH: usize = 60;
 /// `PropertyChainValue::MetadataBits`: the value is another element's handle, or null.
 const IS_VALUE_HANDLE: i64 = 0x1;
 const IS_VALUE_NULL: i64 = 0x20;
+/// `BaseValueSourceLocal` (xamlom.h).
+const BASE_VALUE_SOURCE_LOCAL: i32 = 4;
 
 #[implement(IVisualTreeServiceCallback2)]
 pub struct Watch {
@@ -38,8 +40,9 @@ pub struct State {
     buf: Vec<String>,
     /// Backgrounds this watch set (element, property index), cleared by [`undo`].
     set: Vec<(InstanceHandle, u32)>,
-    /// The window's own backdrop, put back by [`undo`].
-    kept: Option<super::backdrop::Kept>,
+    /// The window's own backdrop, one record per application (a Window can be reported again),
+    /// put back newest first by [`undo`].
+    kept: Vec<super::backdrop::Kept>,
 }
 
 /// An effective property value: its index in the property chain, its value as text (a
@@ -49,6 +52,8 @@ struct Prop {
     value: String,
     ty: String,
     handle: bool,
+    /// Set locally (a value or a binding Settings gave the element), not by a style.
+    local: bool,
 }
 
 impl Watch {
@@ -78,7 +83,7 @@ pub fn flush(st: &Mutex<State>, t0: Instant) {
 pub fn undo(st: &Mutex<State>, svc: &IVisualTreeService) -> String {
     let (set, kept) = {
         let mut st = lock(st);
-        (std::mem::take(&mut st.set), st.kept.take())
+        (std::mem::take(&mut st.set), std::mem::take(&mut st.kept))
     };
     let mut cleared = 0;
     for (h, i) in &set {
@@ -87,7 +92,16 @@ pub fn undo(st: &Mutex<State>, svc: &IVisualTreeService) -> String {
             cleared += 1;
         }
     }
-    let backdrop = kept.map_or("system backdrop untouched".to_string(), super::backdrop::restore);
+    let backdrop = if kept.is_empty() {
+        "system backdrop untouched".to_string()
+    } else {
+        // Newest first: the oldest record holds Settings' own brush and is put back last.
+        let mut line = String::new();
+        for k in kept.into_iter().rev() {
+            line = super::backdrop::restore(k);
+        }
+        line
+    };
     format!("{cleared} of {} backgrounds cleared, {backdrop}", set.len())
 }
 
@@ -127,7 +141,7 @@ impl Watch_Impl {
             let us = t.elapsed().as_micros();
             match r {
                 Ok((s, k)) => {
-                    lock(&self.st).kept.get_or_insert(k);
+                    lock(&self.st).kept.push(k);
                     report::line(format!("{label}: system backdrop {s} in {us} us, {} ms after advise", self.t0.elapsed().as_millis()));
                 }
                 Err(e) => report::line(format!("{label}: system backdrop not set: {e}")),
@@ -163,6 +177,10 @@ impl Watch_Impl {
     /// Sets the element's local `Background` to a shared brush of that color; the property's index.
     fn set_background(&self, h: InstanceHandle, color: &str) -> Result<u32, String> {
         let bg = self.background(h)?.ok_or("no Background property")?;
+        // Undo clears what the rule set: a local value or binding of Settings' own would be lost.
+        if bg.local {
+            return Err("set locally by Settings, left alone".into());
+        }
         let brush = self.brush(color)?;
         // SAFETY: handles from this service; the index came from the element's own chain.
         let hr = unsafe { self.svc.SetProperty(h, brush, bg.index) };
@@ -233,7 +251,9 @@ impl Watch_Impl {
                         let null = v.MetadataBits & IS_VALUE_NULL != 0;
                         let value = if null { "null".to_string() } else { bstr(v.Value) };
                         let handle = !null && v.MetadataBits & IS_VALUE_HANDLE != 0;
-                        found = Some((effective, Prop { index: v.Index, value, ty: bstr(v.ValueType), handle }));
+                        let src = v.PropertyChainIndex as usize;
+                        let local = src < ns as usize && (*sources.add(src)).Source == BASE_VALUE_SOURCE_LOCAL;
+                        found = Some((effective, Prop { index: v.Index, value, ty: bstr(v.ValueType), handle, local }));
                     }
                 }
                 for s in [v.Type, v.DeclaringType, v.ValueType, v.ItemType, v.Value, v.PropertyName] {

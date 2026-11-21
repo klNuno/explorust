@@ -57,6 +57,10 @@ pub struct Table {
     /// This table's number: a table made by a reload has another, so work begun on the old one
     /// is not written into it.
     id: u64,
+    /// Links lookups running on this table, and the records the journal touched while one ran:
+    /// a lookup's result for such a record is stale.
+    watchers: usize,
+    touched: std::collections::HashSet<u32>,
 }
 
 /// What a record holds, compared across a hard link lookup made without the lock (compaction
@@ -124,6 +128,30 @@ impl Table {
 
     /// A rename into a pruned tree or a hard link change of a file that has a kept name: that
     /// name may be gone, so the file goes to the next links lookup (`take_pruned_files`).
+    /// A links lookup begins (`true`) or ends on this table; the touched set lives while one runs.
+    pub fn watch_touches(&mut self, on: bool) {
+        if on {
+            self.watchers += 1;
+        } else {
+            self.watchers = self.watchers.saturating_sub(1);
+            if self.watchers == 0 {
+                self.touched = Default::default();
+            }
+        }
+    }
+
+    /// The journal changed `rec` (called for every record it applies).
+    pub fn touch(&mut self, rec: u32) {
+        if self.watchers > 0 {
+            self.touched.insert(rec);
+        }
+    }
+
+    /// The journal changed `rec` while a links lookup ran.
+    pub fn touched(&self, rec: u32) -> bool {
+        self.touched.contains(&rec)
+    }
+
     pub fn recheck_links(&mut self, rec: u32) {
         if self.slots.get(rec as usize).is_some_and(|s| s.name != NONE && s.name & DIR == 0) && !self.pruned_files.contains(&rec) {
             self.pruned_files.push(rec);
@@ -263,6 +291,8 @@ impl Table {
     pub fn remove(&mut self, rec: u32) {
         let Some(s) = self.slots.get_mut(rec as usize) else { return };
         if s.name == NONE {
+            // A deleted file inside a pruned tree is free, not pruned (a lookup then sees the change).
+            *s = FREE;
             return;
         }
         self.recs[(s.name & IDX) as usize] = NONE;
@@ -620,6 +650,27 @@ mod tests {
         t.prune(32);
         assert!(t.name(32).is_some());
         assert_ne!(Table::new().id(), t.id());
+    }
+
+    #[test]
+    fn journal_changes_during_a_links_lookup_win() {
+        let mut t = sample();
+        t.upsert(40, ROOT, "Windows", true, false, 1);
+        t.upsert(42, 40, "WinSxS", true, false, 1);
+        t.upsert(50, 42, "ntdll.dll", false, false, 1);
+        t.settle();
+        assert_eq!(t.state(50), RecState::Pruned);
+        // A lookup snapshots the pruned file, then the journal deletes it.
+        t.watch_touches(true);
+        let was = t.state(50);
+        t.touch(50);
+        t.remove(50);
+        assert_ne!(t.state(50), was, "a deleted pruned record is free, not pruned");
+        assert!(t.touched(50) && !t.touched(33));
+        t.watch_touches(false);
+        assert!(!t.touched(50), "the set ends with the last lookup");
+        t.touch(33);
+        assert!(!t.touched(33), "no lookup running: nothing kept");
     }
 
     #[test]

@@ -324,6 +324,7 @@ fn open(search: bool, msg_time: i32) {
 }
 
 fn hide(restore: bool, why: &str) {
+    search::forget_coalesced();
     let Some(Some(prev)) = with(|s| {
         if !s.shown {
             return None;

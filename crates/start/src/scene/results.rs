@@ -160,7 +160,9 @@ impl Start {
         search::merge_files(&mut self.found.files, |f| f.path.as_str(), |f| (f.rank, f.modified), |f, r| f.rank = r);
         let keep = match (keep, keep_path) {
             (Some(h), Some(p)) => self.found.files.iter().position(|f| f.path.eq_ignore_ascii_case(&p)).map(|index| search::Hit { index, ..h }),
-            (k, _) => k,
+            // Unmoved, the selection follows the best match, whatever row the merge puts first.
+            (k, _) if moved => k,
+            _ => None,
         };
         self.found.files_done = done;
         self.rebuild_rows(keep);

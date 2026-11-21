@@ -67,6 +67,34 @@ pub fn loaded_in(pid: u32, dll: &Path) -> bool {
     }
 }
 
+/// With the injector off: each Settings process that still holds the TAP gets empty rules, so a
+/// TAP an earlier explorust loaded undoes its styling.
+pub fn undo_everywhere(dll: &Path) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    };
+    let mut pids = Vec::new();
+    // SAFETY: a process snapshot walked into a local entry and closed.
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return };
+        let mut e = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut ok = Process32FirstW(snap, &mut e).is_ok();
+        while ok {
+            let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            if String::from_utf16_lossy(&e.szExeFile[..n]).eq_ignore_ascii_case("SystemSettings.exe") {
+                pids.push(e.th32ProcessID);
+            }
+            ok = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+    }
+    for pid in pids.into_iter().filter(|&p| loaded_in(p, dll)) {
+        log::line(&format!("settings xaml: injector off, the TAP in pid {pid} undoes its styling"));
+        attach(pid, dll, String::new());
+    }
+}
+
 /// Loads the TAP into the Settings process `pid`, from `dll` (explorust_inject.dll beside
 /// explorust), with these rules; empty rules undo what a TAP loaded before set.
 pub fn attach(pid: u32, dll: &Path, rules: String) {
