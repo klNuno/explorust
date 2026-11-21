@@ -8,6 +8,7 @@ mod gfx;
 mod log;
 mod menus;
 mod search;
+mod share;
 mod shell;
 mod shellwindows;
 mod tab;

@@ -11,7 +11,7 @@ use crate::win::details::Pane;
 use crate::win::gfx::{Canvas, Shared};
 use crate::win::shell::{self, Pidl};
 use crate::win::tab::{self, Tab};
-use crate::win::{log, menus, search, shellwindows};
+use crate::win::{log, menus, search, share, shellwindows};
 use render::style::{self, Native, Part, WindowStyle};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -58,6 +58,7 @@ pub struct Frame {
     search_focus: bool,
     search_timer: bool,
     search_worker: Option<search::Worker>,
+    sharing: Option<share::Registration>,
     details: Option<Pane>,
     s: &'static Strings,
     icons: HashMap<usize, ID2D1Bitmap1>,
@@ -183,6 +184,7 @@ pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
             search_focus: false,
             search_timer: false,
             search_worker: None,
+            sharing: None,
             details: None,
             s,
             icons: HashMap::new(),
@@ -759,6 +761,14 @@ impl Frame {
             Cmd::Rename => {
                 let Some(v) = fv.as_ref().filter(|v| shell::has_selection(v)) else { return };
                 unsafe { v.DoRename() }
+            }
+            Cmd::Share => {
+                let Some(view) = &sv else { return };
+                if !fv.as_ref().is_some_and(shell::has_selection) {
+                    return;
+                }
+                self.sharing = None;
+                share::open(self.hwnd, view).map(|registration| self.sharing = Some(registration))
             }
             Cmd::Paste => {
                 if t.path.is_none() || !t.query.is_empty() || !menus::file_clipboard() {

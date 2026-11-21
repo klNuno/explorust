@@ -5,7 +5,7 @@ use super::paint::{self, Fonts, View};
 use super::{log, read, tip::Tip, worker};
 use crate::model::{self, CommandItem, Entry, Hit, Kind, Layout, Recent};
 use render::Surface;
-use render::style::{self, Part, WindowStyle};
+use render::style::{self, Native, Part, WindowStyle};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -14,7 +14,7 @@ use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
@@ -33,7 +33,6 @@ const TIMER_SUB: usize = 1;
 const TIMER_TIP: usize = 2;
 const TIP_MS: u32 = 500;
 const HOVER_MS: u32 = 300;
-const CORNER_DIP: f32 = 8.0;
 /// Acrylic tint of the dark flyout (ABGR).
 const TINT: u32 = 0xE62C_2C2C;
 
@@ -157,7 +156,13 @@ fn new_window(root: bool) -> windows_core::Result<Win> {
         let inst = GetModuleHandleW(None)?;
         let ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | if root { WINDOW_EX_STYLE(0) } else { WS_EX_NOACTIVATE };
         let hwnd = CreateWindowExW(ex, CLASS, w!(""), WS_POPUP, 0, 0, 64, 64, None, None, Some(inst.into()), None)?;
-        style::bind_with_repaint(hwnd, Part::Menus, WindowStyle::popup(TINT, 0x0040_4040), Some(|hwnd| {
+        let appearance = WindowStyle {
+            native: Native::Solid(TINT),
+            border: 0x0040_4040,
+            corner: DWMWCP_ROUND,
+            popup: true,
+        };
+        style::bind_with_repaint(hwnd, Part::Menus, appearance, Some(|hwnd| {
             with(|ui| {
                 if let Some(depth) = ui.level_of(hwnd) { ui.draw(depth); }
             });
@@ -285,7 +290,7 @@ impl Ui {
         self.levels.push(level);
         self.draw(depth);
         let hwnd = self.pool[depth].hwnd;
-        round_window(hwnd, w, h, self.px(2.0 * CORNER_DIP));
+        round_window(hwnd, w, h, self.px(2.0 * model::metrics::CORNER_RADIUS));
         // SAFETY: shows our own popup; the root takes the foreground for the keyboard.
         unsafe {
             let flags = SWP_SHOWWINDOW | if sub || depth > 0 { SWP_NOACTIVATE } else { SET_WINDOW_POS_FLAGS(0) };
@@ -469,7 +474,7 @@ impl Ui {
         };
         let hwnd = win.hwnd;
         self.levels[0] = Level { win: 0, entries: list, top, layout, hover, open: None, bitmaps, origin: (x, y) };
-        round_window(hwnd, w, h, self.px(2.0 * CORNER_DIP));
+        round_window(hwnd, w, h, self.px(2.0 * model::metrics::CORNER_RADIUS));
         // SAFETY: moves and sizes our own popup; the swap chain already has the new size.
         unsafe {
             let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);

@@ -37,7 +37,7 @@ pub const SEARCH_TEXT_PAD: f32 = 15.0;
 pub const SEARCH_GLYPH_FROM_RIGHT: f32 = 32.0;
 
 pub const CMD_CY: f32 = 116.0;
-pub const CMD_SEPS: [f32; 2] = [115.0, 320.0];
+pub const CMD_SEPS: [f32; 2] = [115.0, 358.0];
 pub const CMD_BTN_W: f32 = 34.0;
 pub const CMD_H: f32 = 32.0;
 
@@ -48,6 +48,7 @@ pub enum Cmd {
     Copy,
     Paste,
     Rename,
+    Share,
     Delete,
     Sort,
     View,
@@ -56,20 +57,21 @@ pub enum Cmd {
 }
 
 /// Icon buttons of the command bar: command, glyph, center x.
-pub const CMD_ICONS: [(Cmd, char, f32); 5] = [
+pub const CMD_ICONS: [(Cmd, char, f32); 6] = [
     (Cmd::Cut, '\u{E8C6}', 140.0),
     (Cmd::Copy, '\u{E8C8}', 178.0),
     (Cmd::Paste, '\u{E77F}', 216.0),
     (Cmd::Rename, '\u{E8AC}', 254.0),
-    (Cmd::Delete, '\u{E74D}', 292.0),
+    (Cmd::Share, '\u{E72D}', 292.0),
+    (Cmd::Delete, '\u{E74D}', 330.0),
 ];
 /// Labelled buttons: command, glyph, glyph cx, label x, chevron cx, left, right.
 pub const CMD_LABELLED: [(Cmd, char, f32, f32, f32, f32, f32); 3] = [
     (Cmd::New, '\u{E8F4}', 27.0, 44.0, 0.0, 10.0, 107.0),
-    (Cmd::Sort, '\u{E8CB}', 341.0, 358.0, 390.0, 324.0, 403.0),
-    (Cmd::View, '\u{E8FD}', 422.0, 439.0, 488.0, 405.0, 500.0),
+    (Cmd::Sort, '\u{E8CB}', 379.0, 396.0, 428.0, 362.0, 441.0),
+    (Cmd::View, '\u{E8FD}', 460.0, 477.0, 526.0, 443.0, 538.0),
 ];
-pub const CMD_MORE_CX: f32 = 522.0;
+pub const CMD_MORE_CX: f32 = 560.0;
 /// Details pane toggle, from the right edge: glyph cx, label x, left edge.
 pub const CMD_DETAILS: (f32, f32, f32) = (77.0, 61.0, 95.0);
 
@@ -128,18 +130,18 @@ pub fn search_left(w: f32) -> f32 {
 }
 
 pub fn compact_commands(w: f32) -> bool {
-    w < 660.0
+    w < 680.0
 }
 
 pub fn command_more_x(w: f32) -> f32 {
-    if compact_commands(w) { 425.0 } else { CMD_MORE_CX }
+    if compact_commands(w) { 462.0 } else { CMD_MORE_CX }
 }
 
 pub fn label_bounds(w: f32, cmd: Cmd, center: f32, left: f32, right: f32) -> (f32, f32, f32) {
     if compact_commands(w) {
         match cmd {
-            Cmd::Sort => (342.0, 325.0, 359.0),
-            Cmd::View => (384.0, 367.0, 401.0),
+            Cmd::Sort => (380.0, 363.0, 397.0),
+            Cmd::View => (422.0, 405.0, 439.0),
             _ => (center, left, right),
         }
     } else {
@@ -299,9 +301,12 @@ mod tests {
     #[test]
     fn command_bar() {
         assert_eq!(hit(148.0, 112.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Cut));
-        assert_eq!(hit(292.0, 116.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Delete));
-        assert_eq!(hit(375.0, 116.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Sort));
-        assert_eq!(hit(460.0, 116.0, W, 1, 0, &[]), Hit::Cmd(Cmd::View));
+        assert_eq!(hit(292.0, 116.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Share));
+        assert_eq!(hit(330.0, 116.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Delete));
+        assert_eq!(hit(413.0, 116.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Sort));
+        assert_eq!(hit(498.0, 116.0, W, 1, 0, &[]), Hit::Cmd(Cmd::View));
+        assert_eq!(hit(462.0, 116.0, 520.0, 1, 0, &[]), Hit::Cmd(Cmd::More));
+        assert_eq!(hit(496.0, 116.0, 520.0, 1, 0, &[]), Hit::Cmd(Cmd::Details));
         assert_eq!(hit(W - 60.0, 112.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Details));
         assert_eq!(hit(800.0, 112.0, W, 1, 0, &[]), Hit::None);
         assert_eq!(hit(800.0, 200.0, W, 1, 0, &[]), Hit::None);

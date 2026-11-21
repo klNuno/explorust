@@ -376,6 +376,7 @@ pub mod metrics {
     pub const MIN_W: f32 = 220.0;
     pub const MAX_W: f32 = 560.0;
     pub const RADIUS: f32 = 4.0;
+    pub const CORNER_RADIUS: f32 = 8.0;
 }
 
 /// Where each row sits, in DIPs from the menu's top left.

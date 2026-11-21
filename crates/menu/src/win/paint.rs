@@ -1,8 +1,9 @@
-//! Drawing one menu level: Windows 11's dark flyout colours over the DWM acrylic, Segoe UI Variable
-//! text, Segoe Fluent Icons glyphs, the handler's bitmaps.
+//! Drawing one menu level: dark flyout colours, Segoe UI Variable text, Segoe Fluent Icons glyphs,
+//! and the handler's bitmaps.
 
 use crate::model::{Entry, Hit, Kind, Layout, metrics::*, top_glyph};
 use render::text::{Align, Text};
+use render::style::{self, Material, Part};
 use render::{Surface, rgba};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::*;
@@ -96,16 +97,23 @@ pub fn draw(s: &Surface, f: &Fonts, v: &View, scale: f32) -> Result<()> {
     let shortcut = s.brush(rgba(255, 255, 255, 0.6))?;
     let hover = s.brush(rgba(255, 255, 255, if v.pressed { 0.04 } else { 0.065 }))?;
     let line = s.brush(rgba(255, 255, 255, 0.084))?;
+    let fill = match style::current(Part::Menus).material {
+        Material::Windows => Some(s.brush(rgba(44, 44, 44, 1.0))?),
+        Material::Oled => Some(s.brush(rgba(0, 0, 0, 1.0))?),
+        _ => None,
+    };
     s.begin();
-    use render::style::{self, Material, Part};
-    style::paint_base(ctx, Part::Menus);
     // SAFETY: drawing calls between begin and end on this thread's device context.
     unsafe {
         ctx.SetTransform(&Matrix3x2 { M11: scale, M12: 0.0, M21: 0.0, M22: scale, M31: 0.0, M32: 0.0 });
         let l = v.layout;
-        if style::current(Part::Menus).material == Material::Windows {
-            let fill = s.brush(rgba(44, 44, 44, 0.2))?;
-            ctx.FillRectangle(&rect(0.0, 0.0, l.width, l.height), &fill);
+        if let Some(fill) = &fill {
+            let bounds = D2D1_ROUNDED_RECT {
+                rect: rect(0.0, 0.0, l.width, l.height),
+                radiusX: CORNER_RADIUS,
+                radiusY: CORNER_RADIUS,
+            };
+            ctx.FillRoundedRectangle(&bounds, fill);
         }
         for (i, ((verb, _), &(x, y, w, h))) in v.top.iter().zip(&l.top).enumerate() {
             if v.hover == Some(Hit::Top(i)) {

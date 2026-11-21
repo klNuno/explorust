@@ -20,6 +20,8 @@ const PROPERTY: PCWSTR = w!("explorust.StyleBinding");
 pub enum Native {
     Acrylic(u32),
     Mica,
+    /// The surface paints its own default background. The color supplies the optional tint.
+    Solid(u32),
 }
 
 #[derive(Clone, Copy)]
@@ -258,7 +260,7 @@ unsafe extern "system" fn subclass(
 /// Native accent and Mica policies are mutually exclusive. Clear the old one during transitions.
 pub fn apply(hwnd: HWND, frame: WindowStyle, style: Style) {
     let native_tint = match frame.native {
-        Native::Acrylic(tint) => tint,
+        Native::Acrylic(tint) | Native::Solid(tint) => tint,
         Native::Mica => 0xDB20_2020,
     };
     let rgb = native_tint & 0x00FF_FFFF;
@@ -268,7 +270,7 @@ pub fn apply(hwnd: HWND, frame: WindowStyle, style: Style) {
         (Material::Windows, Native::Mica) | (Material::Mica, _) => (0, 0, DWMSBT_MAINWINDOW),
         (Material::Acrylic, _) => (4, tinted, DWMSBT_NONE),
         (Material::Transparent, _) => (2, tinted, DWMSBT_NONE),
-        (Material::Oled, _) => (0, 0, DWMSBT_NONE),
+        (Material::Windows, Native::Solid(_)) | (Material::Oled, _) => (0, 0, DWMSBT_NONE),
     };
     // A window's own frame can extend only as far as its custom chrome.
     unsafe {
