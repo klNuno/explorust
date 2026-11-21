@@ -372,22 +372,25 @@ pub fn file_rank(name: &str, query: &str) -> u8 {
 }
 
 /// Merges file results of several sources in place: the first of each path (case ignored) stays,
-/// with the better rank of its copies, then a stable sort by rank keeps each source's own order
-/// (recent first) inside a rank.
-pub fn merge_files<T>(v: &mut Vec<T>, path: impl Fn(&T) -> &str, rank: impl Fn(&T) -> u8, set_rank: impl Fn(&mut T, u8)) {
+/// with the better rank of its copies, then a sort by rank, newest last write first inside a rank
+/// (Windows Search sorts by rank then date modified); `order` gives (rank, last write).
+pub fn merge_files<T>(v: &mut Vec<T>, path: impl Fn(&T) -> &str, order: impl Fn(&T) -> (u8, u64), set_rank: impl Fn(&mut T, u8)) {
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut keep: Vec<T> = Vec::with_capacity(v.len());
     for e in v.drain(..) {
         let key = path(&e).to_lowercase();
         if let Some(&i) = seen.get(&key) {
-            let r = rank(&keep[i]).min(rank(&e));
+            let r = order(&keep[i]).0.min(order(&e).0);
             set_rank(&mut keep[i], r);
             continue;
         }
         seen.insert(key, keep.len());
         keep.push(e);
     }
-    keep.sort_by_key(|e| rank(e));
+    keep.sort_by_key(|e| {
+        let (r, m) = order(e);
+        (r, std::cmp::Reverse(m))
+    });
     *v = keep;
 }
 
@@ -402,15 +405,16 @@ mod tests {
         assert_eq!(file_rank("unfinalized.md", "final"), 2);
         assert_eq!(file_rank("notes.txt", "budget"), 3);
         let mut v = vec![
-            (r"C:\a\x final.txt".to_string(), 1u8),
-            (r"C:\a\final.txt".to_string(), 0),
-            (r"c:\A\X FINAL.TXT".to_string(), 1),
-            (r"C:\b\notes.txt".to_string(), 3),
-            (r"C:\b\final2.txt".to_string(), 0),
+            (r"C:\a\x final.txt".to_string(), 1u8, 5u64),
+            (r"C:\a\final.txt".to_string(), 0, 1),
+            (r"c:\A\X FINAL.TXT".to_string(), 1, 5),
+            (r"C:\b\notes.txt".to_string(), 3, 9),
+            (r"C:\b\final2.txt".to_string(), 0, 7),
         ];
-        merge_files(&mut v, |e| e.0.as_str(), |e| e.1, |e, r| e.1 = r);
+        merge_files(&mut v, |e| e.0.as_str(), |e| (e.1, e.2), |e, r| e.1 = r);
         let got: Vec<&str> = v.iter().map(|e| e.0.as_str()).collect();
-        assert_eq!(got, vec![r"C:\a\final.txt", r"C:\b\final2.txt", r"C:\a\x final.txt", r"C:\b\notes.txt"]);
+        // Inside rank 0 the newer final2.txt (7) comes before final.txt (1).
+        assert_eq!(got, vec![r"C:\b\final2.txt", r"C:\a\final.txt", r"C:\a\x final.txt", r"C:\b\notes.txt"]);
     }
 
     fn entries(names: &[&str]) -> Vec<Entry> {

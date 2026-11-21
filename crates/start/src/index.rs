@@ -8,6 +8,7 @@ use shelldata::Image;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Storage::FileSystem::{GetFileAttributesExW, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
 use windows::Win32::System::Search::{
     CSearchManager, DBACCESSOR_ROWDATA, DBBINDING, DBMEMOWNER_CLIENTOWNED, DBPARAMIO_NOTPARAM, DBPART_LENGTH, DBPART_STATUS,
@@ -33,6 +34,8 @@ pub struct FileHit {
     pub folder: bool,
     pub icon: Option<Image>,
     pub rank: u8,
+    /// Last write time (FILETIME ticks), 0 when unknown: newer first inside a rank, like Windows.
+    pub modified: u64,
 }
 
 pub struct Batch {
@@ -135,6 +138,17 @@ fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32) {
     }
 }
 
+/// The last write time of `path` (FILETIME ticks), 0 when it cannot be read.
+pub fn modified(path: &str) -> u64 {
+    let mut d = WIN32_FILE_ATTRIBUTE_DATA::default();
+    // SAFETY: fills a local struct of the type the standard info level asks for.
+    let ok = unsafe { GetFileAttributesExW(&HSTRING::from(path), GetFileExInfoStandard, (&mut d as *mut WIN32_FILE_ATTRIBUTE_DATA).cast()) };
+    if ok.is_err() {
+        return 0;
+    }
+    ((d.ftLastWriteTime.dwHighDateTime as u64) << 32) | d.ftLastWriteTime.dwLowDateTime as u64
+}
+
 pub fn post(hwnd: HWND, b: Batch) {
     let p = Box::into_raw(Box::new(b));
     // SAFETY: hands the box to the UI thread, freed here when the post fails.
@@ -222,7 +236,8 @@ fn run_query(d: &Db, q: &str, generation: u64, hwnd: HWND, icon_px: i32, rx: &Re
                     .and_then(|f| apps::image(&f, icon_px));
                 let name = col(&cells[1]);
                 let rank = search::file_rank(&name, q);
-                hits.push(FileHit { name, type_text: col(&cells[3]), path, folder, icon, rank });
+                let modified = modified(&path);
+                hits.push(FileHit { name, type_text: col(&cells[3]), path, folder, icon, rank, modified });
             }
             let _ = rowset.ReleaseRows(got, handles.as_ptr(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut());
             total += hits.len();

@@ -3,7 +3,7 @@
 //! every key, beside the Windows Search worker (`index.rs`); its hits merge into the same file
 //! groups (`search::merge_files`). Per key timings are logged, with p50 and p95 every 20 keys.
 
-use crate::index::{Batch, FileHit, post};
+use crate::index::{Batch, FileHit, modified, post};
 use crate::{apps, log, search};
 use fsindex::client::Client;
 use std::sync::Arc;
@@ -65,14 +65,48 @@ fn percentile(v: &[f32], p: f32) -> f32 {
     s[((s.len() - 1) as f32 * p).round() as usize]
 }
 
-fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32, up: Arc<AtomicBool>) {
+type Rows = (u64, Vec<(String, bool, u8)>, Instant);
+
+/// Icons and type names of the rows already shown, newest key only (older ones are dropped).
+fn icons(rx: Receiver<Rows>, hwnd: HWND, icon_px: i32) {
     // SAFETY: COM for this worker thread (shell items for icons), for its whole life.
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    while let Ok(mut job) = rx.recv() {
+        while let Ok(j) = rx.try_recv() {
+            job = j;
+        }
+        let (generation, rows, t) = job;
+        let n = rows.len();
+        let icons: Vec<FileHit> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, (path, folder, rank))| {
+                let icon = if i < WITH_ICONS {
+                    // SAFETY: a shell item for a path the service just listed.
+                    unsafe { SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(&HSTRING::from(path.as_str()), None) }
+                        .ok()
+                        .and_then(|f| apps::image(&f, icon_px))
+                } else {
+                    None
+                };
+                let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
+                FileHit { type_text: type_text(&path, folder), name, path, folder, icon, rank, modified: 0 }
+            })
+            .collect();
+        let ms = t.elapsed().as_secs_f32() * 1000.0;
+        post(hwnd, Batch { source: ICONS, generation, hits: icons, done: false, ms });
+        log::line(&format!("mft icons: {n} rows at {ms:.1} ms after the query"));
+    }
+}
+
+fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32, up: Arc<AtomicBool>) {
     let mut client = Client::default();
     let mut trips: Vec<f32> = Vec::new();
     let mut down = false;
-    let mut next: Option<(u64, String)> = None;
-    while let Some(mut job) = next.take().or_else(|| rx.recv().ok()) {
+    let (icons_tx, icons_rx) = channel();
+    let target = hwnd.0 as isize;
+    let _ = std::thread::Builder::new().name("start-mft-icons".into()).spawn(move || icons(icons_rx, HWND(target as _), icon_px));
+    while let Ok(mut job) = rx.recv() {
         while let Ok(j) = rx.try_recv() {
             job = j;
         }
@@ -106,40 +140,17 @@ fn worker(rx: Receiver<(u64, String)>, hwnd: HWND, icon_px: i32, up: Arc<AtomicB
             .map(|h| {
                 let name = h.path.rsplit('\\').next().unwrap_or(&h.path).to_string();
                 let rank = search::file_rank(&name, &q) + if h.noisy { 4 } else { 0 };
-                FileHit { type_text: String::new(), name, path: h.path.clone(), folder: h.folder, icon: None, rank }
+                FileHit { type_text: String::new(), name, path: h.path.clone(), folder: h.folder, icon: None, rank, modified: modified(&h.path) }
             })
             .collect();
         let ms = t.elapsed().as_secs_f32() * 1000.0;
         let rows: Vec<(String, bool, u8)> = hits.iter().map(|h| (h.path.clone(), h.folder, h.rank)).collect();
         post(hwnd, Batch { source: "mft", generation, hits, done: false, ms });
-        // A newer key drops the icons of this one.
-        if let Ok(j) = rx.try_recv() {
-            next = Some(j);
-            log::line(&format!("mft \"{q}\": {n} hits, service {:.2} ms, pipe round trip {trip:.2} ms, rows posted at {ms:.2} ms, icons skipped (newer key)", reply.micros as f32 / 1000.0));
-            trips.push(trip);
-            continue;
-        }
-        let icons: Vec<FileHit> = rows
-            .into_iter()
-            .enumerate()
-            .map(|(i, (path, folder, rank))| {
-                let icon = if i < WITH_ICONS {
-                    // SAFETY: a shell item for a path the service just listed.
-                    unsafe { SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(&HSTRING::from(path.as_str()), None) }
-                        .ok()
-                        .and_then(|f| apps::image(&f, icon_px))
-                } else {
-                    None
-                };
-                let name = path.rsplit('\\').next().unwrap_or(&path).to_string();
-                FileHit { type_text: type_text(&path, folder), name, path, folder, icon, rank }
-            })
-            .collect();
-        let with_icons = t.elapsed().as_secs_f32() * 1000.0;
-        post(hwnd, Batch { source: ICONS, generation, hits: icons, done: false, ms: with_icons });
+        // Icons load on their own thread: a key's query never waits behind the previous key's icons.
+        let _ = icons_tx.send((generation, rows, t));
         trips.push(trip);
         log::line(&format!(
-            "mft \"{q}\": {n} hits, service {:.2} ms, pipe round trip {trip:.2} ms, rows posted at {ms:.2} ms, icons at {with_icons:.1} ms ({} names)",
+            "mft \"{q}\": {n} hits, service {:.2} ms, pipe round trip {trip:.2} ms, rows posted at {ms:.2} ms ({} names)",
             reply.micros as f32 / 1000.0,
             reply.names
         ));

@@ -18,7 +18,8 @@ use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTa
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{SHOpenFolderAndSelectItems, SHParseDisplayName};
-use windows::Win32::UI::WindowsAndMessaging::{GetMessageTime, MSG, PM_REMOVE, PeekMessageW, PostMessageW};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU};
+use windows::Win32::UI::WindowsAndMessaging::{GetMessageTime, MSG, PM_NOREMOVE, PM_NOYIELD, PM_REMOVE, PeekMessageW, PostMessageW, WM_KEYDOWN};
 use windows_core::HSTRING;
 
 thread_local! {
@@ -28,6 +29,26 @@ thread_local! {
     static KEY_AT: RefCell<Option<Instant>> = const { RefCell::new(None) };
     /// The generation whose first MFT rows were timed, and the key to rows on screen times.
     static MFT_TIMED: RefCell<(u64, Vec<f32>)> = const { RefCell::new((0, Vec::new())) };
+    /// Keys whose frame was left to a newer key already queued: how many, and the message time
+    /// of the oldest (the next frame is timed from it).
+    static COALESCED: RefCell<Option<(u32, u32)>> = const { RefCell::new(None) };
+}
+
+/// A text key (letter, digit, space, backspace) is waiting in this thread's queue: its own
+/// answer draws a frame, so the current one can skip drawing. Ctrl or Alt held, or any other
+/// key, draws as usual (a shortcut or a dead key may not draw).
+fn text_key_queued(hwnd: HWND) -> bool {
+    // SAFETY: reads the modifier state of the message being handled.
+    if unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 || GetKeyState(VK_MENU.0 as i32) < 0 } {
+        return false;
+    }
+    let mut msg = MSG::default();
+    // SAFETY: looks at the first queued key down without removing it.
+    if !unsafe { PeekMessageW(&mut msg, Some(hwnd), WM_KEYDOWN, WM_KEYDOWN, PM_NOREMOVE | PM_NOYIELD) }.as_bool() {
+        return false;
+    }
+    let vk = msg.wParam.0 as u16;
+    matches!(vk, 0x08 | 0x20 | 0x30..=0x39 | 0x41..=0x5A | 0x60..=0x69)
 }
 
 const CALCULATOR: &str = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
@@ -119,6 +140,7 @@ fn to_entries(s: &crate::scene::Start, hits: Vec<crate::index::FileHit>) -> Vec<
             type_text: h.type_text,
             folder: h.folder,
             rank: h.rank,
+            modified: h.modified,
         })
         .collect()
 }
@@ -143,7 +165,8 @@ fn wait_mft_rows(hwnd: HWND, generation: u64, t0: Instant) -> bool {
                 })
                 .unwrap_or(false);
             }
-            files(b);
+            // The key's frame follows: no draw of its own.
+            apply_files(b, false);
         } else {
             std::thread::yield_now();
         }
@@ -183,6 +206,19 @@ fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
     }) else {
         return;
     };
+    // SAFETY: the time of the key message being handled.
+    let msg_time = unsafe { GetMessageTime() } as u32;
+    if text_key_queued(hwnd) {
+        let n = COALESCED.with(|c| {
+            let mut c = c.borrow_mut();
+            let e = c.get_or_insert((0, msg_time));
+            e.0 += 1;
+            e.0
+        });
+        log::line(&format!("search key {key} \"{q}\": queue {} ms, ranked {ranked:.2} ms, frame left to the queued key ({n} so far)", queued.max(0)));
+        return;
+    }
+    let coalesced = COALESCED.with(|c| c.borrow_mut().take());
     let rows = !q.trim().is_empty() && wait_mft_rows(hwnd, generation, t0);
     let waited = t0.elapsed().as_secs_f32() * 1000.0;
     let Some((apps, settings, calc, files_n)) = with(|s| {
@@ -198,10 +234,13 @@ fn answer(key: &str, edit: impl FnOnce(&str) -> String) {
     let vblank = next_vblank(qp);
     let queued = queued.max(0) as f32;
     let (frame, refresh) = vblank.map_or((present, 0.0), |(v, p)| (ms(q0, v), ms(0, p)));
-    let total = queued + frame;
+    // Timed from the oldest key this frame answers for when earlier keys left it their frame.
+    let since_oldest = coalesced.map(|(_, t)| msg_time.wrapping_sub(t) as i32 as f32).unwrap_or(0.0).max(0.0);
+    let total = queued + frame + since_oldest;
     log::line(&format!(
-        "search key {key} \"{q}\": queue {queued} ms, ranked {ranked:.2} ms, mft rows {}, presented {present:.1} ms, shown at the vblank {frame:.1} ms (refresh {refresh:.1} ms), key to frame {total:.1} ms{}; apps {apps}, settings {settings}, files {files_n}{}",
+        "search key {key} \"{q}\": queue {queued} ms, ranked {ranked:.2} ms, mft rows {}, presented {present:.1} ms, shown at the vblank {frame:.1} ms (refresh {refresh:.1} ms), key to frame {total:.1} ms{}{}; apps {apps}, settings {settings}, files {files_n}{}",
         if rows { format!("in this frame at {waited:.1} ms") } else { format!("not in this frame (waited {waited:.1} ms)") },
+        coalesced.map(|(n, _)| format!(" from the oldest of {} keys ({since_oldest:.0} ms before this one)", n + 1)).unwrap_or_default(),
         if total <= 16.0 { "" } else { " (over 16)" },
         if calc { ", calculator" } else { "" }
     ));
@@ -230,6 +269,12 @@ fn mft_timed(generation: u64, q: &str, on_screen: f32, n: usize, how: &str) {
 /// A batch of files from the index worker. The MFT rows come first with no icon (timed from the
 /// key to the vblank that shows them, p50 and p95 every 30 keys), their icons in a second batch.
 pub fn files(b: Batch) {
+    // A text key waiting draws everything with its own frame.
+    let draw = with(|s| s.hwnd).is_some_and(|h| !text_key_queued(h));
+    apply_files(b, draw);
+}
+
+fn apply_files(b: Batch, draw: bool) {
     let after = KEY_AT.with(|k| k.borrow().map(|t| t.elapsed().as_secs_f32() * 1000.0)).unwrap_or(0.0);
     let n = b.hits.len();
     let t = Instant::now();
@@ -237,17 +282,18 @@ pub fn files(b: Batch) {
     let shown = with(|s| {
         let entries = to_entries(s, b.hits);
         let ok = if icons { s.update_files(b.generation, entries) } else { s.add_files(b.generation, entries, b.done) };
-        if ok {
-            if let Err(e) = s.draw() {
-                log::line(&format!("search files: draw failed: {e}"));
-            }
+        if ok
+            && draw
+            && let Err(e) = s.draw()
+        {
+            log::line(&format!("search files: draw failed: {e}"));
         }
         ok.then(|| (s.query.clone(), s.found.generation))
     })
     .flatten();
     let Some((q, generation)) = shown else { return };
     let drawn = t.elapsed().as_secs_f32() * 1000.0;
-    if b.source == "mft" && n > 0 {
+    if b.source == "mft" && n > 0 && draw {
         let mut freq = 0;
         // SAFETY: writes the frequency into a local.
         let _ = unsafe { QueryPerformanceFrequency(&mut freq) };
@@ -256,10 +302,11 @@ pub fn files(b: Batch) {
         mft_timed(generation, &q, after + drawn + wait, n, &format!("a later frame (batch at {after:.1} ms, drawn {drawn:.1} ms)"));
     } else if n > 0 || b.done {
         log::line(&format!(
-            "search files \"{q}\": +{n} from {}{} at {after:.1} ms after the key (source {:.1} ms), drawn in {drawn:.1} ms",
+            "search files \"{q}\": +{n} from {}{} at {after:.1} ms after the key (source {:.1} ms), {}",
             b.source,
             if b.done { ", done" } else { "" },
             b.ms,
+            if draw { format!("drawn in {drawn:.1} ms") } else { "drawn with the key's frame".into() },
         ));
     }
 }

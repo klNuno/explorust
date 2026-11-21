@@ -123,7 +123,7 @@ fn r(x: &Rect) -> D2D_RECT_F {
 
 impl Start {
     pub fn new(hwnd: HWND, scale: f32, s: &'static Strings, user: String) -> Result<Self> {
-        let surface = Surface::new(hwnd, (L::W * scale).round() as u32, (L::H * scale).round() as u32)?;
+        let surface = Surface::with_buffers(hwnd, (L::W * scale).round() as u32, (L::H * scale).round() as u32, 3)?;
         let text = Text::new()?;
         let brush = surface.brush(WHITE)?;
         let base: ID2D1Brush = brush.cast()?;
