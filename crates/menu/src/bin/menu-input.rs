@@ -5,7 +5,8 @@
 //! delete f1..f12 a..z 0..9 or vk<hex>), `type:<text>`, `down:<key>`, `up:<key>`, `wait:<s>`,
 //! `shot:<file.bmp>` (the screen through GDI), `run:<exe>|<arg>|...` (started, not waited for),
 //! `ensure:<window class>:<chord>` (the chord pressed up to three times until the foreground
-//! window has that class), `close:<title part>` (WM_CLOSE to the visible top-level windows whose
+//! window has that class), `guard:<window class>` (require that window before sending subsequent
+//! input, or clear the requirement with an empty class), `close:<title part>` (WM_CLOSE to the visible top-level windows whose
 //! title contains it), `note:<text>`. `@<file>` reads one step per line from a file (`#` lines
 //! skipped), so one `os win run --desktop` call (about a minute each in g1) runs a whole session.
 //! Results go to `menu-input.log` beside the exe, one timestamped line per step, `done` last.
@@ -39,9 +40,21 @@ fn main() {
             None => steps.push(arg),
         }
     }
+    let mut required = String::new();
     for arg in steps {
         let (op, rest) = arg.split_once(':').unwrap_or((arg.as_str(), ""));
+        if !required.is_empty() && matches!(op, "key" | "type" | "down" | "up" | "click" | "rclick") {
+            let class = win::foreground();
+            if class != required {
+                log(format!("stopped before {op}: wanted {required}, foreground {class}"));
+                break;
+            }
+        }
         let r = match op {
+            "guard" => {
+                required = rest.to_owned();
+                Ok(())
+            }
             "wait" => {
                 std::thread::sleep(std::time::Duration::from_secs_f32(rest.parse().unwrap_or(1.0)));
                 Ok(())

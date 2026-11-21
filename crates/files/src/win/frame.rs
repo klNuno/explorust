@@ -26,7 +26,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::System::Com::IServiceProvider;
 use windows::Win32::UI::Shell::{
-    FVM_DETAILS, FVM_ICON, IShellView, SIGDN_DESKTOPABSOLUTEEDITING, SVGIO_ALLVIEW, SVGIO_SELECTION,
+    IShellView, SIGDN_DESKTOPABSOLUTEEDITING,
     SVSI_DESELECTOTHERS, SVSI_ENSUREVISIBLE, SVSI_FOCUSED, SVSI_SELECT, SVUIA_ACTIVATE_FOCUS,
 };
 use windows_core::Interface;
@@ -45,8 +45,6 @@ const SEARCH_DELAY_MS: u32 = 125;
 pub struct Frame {
     pub hwnd: HWND,
     canvas: Canvas,
-    status: Canvas,
-    status_drawn: Option<(i32, i32, bool, Hit, Hit)>,
     tabs: Vec<Tab>,
     active: usize,
     next_id: usize,
@@ -160,15 +158,8 @@ pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
         shell::allow_dark(hwnd);
         let rc = client(hwnd);
         let chrome_height = (L::CHROME_H * k).ceil() as u32;
-        let status_height = (L::STATUS_H * k).ceil() as u32;
-        let canvas = Canvas::new(sh, hwnd, rc.right as u32, chrome_height, 96.0 * k);
-        let layers = canvas.and_then(|canvas| {
-            let status = canvas.add_layer(rc.right as u32, status_height, 96.0 * k)?;
-            status.set_y(rc.bottom - status_height as i32)?;
-            Ok((canvas, status))
-        });
-        let (canvas, status) = match layers {
-            Ok(layers) => layers,
+        let canvas = match Canvas::new(sh, hwnd, rc.right as u32, chrome_height, 96.0 * k) {
+            Ok(canvas) => canvas,
             Err(error) => {
                 let _ = DestroyWindow(hwnd);
                 return Err(error);
@@ -177,8 +168,6 @@ pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
         let frame = Frame {
             hwnd,
             canvas,
-            status,
-            status_drawn: None,
             tabs: Vec::new(),
             active: 0,
             next_id: 1,
@@ -394,13 +383,9 @@ impl Frame {
         (L::CHROME_H * self.scale()).ceil() as i32
     }
 
-    fn status_px(&self) -> i32 {
-        (L::STATUS_H * self.scale()).ceil() as i32
-    }
-
     fn extend_frame(&self) {
         let m = MARGINS {
-            cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: self.chrome_px(), cyBottomHeight: self.status_px()
+            cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: self.chrome_px(), cyBottomHeight: 0
         };
         unsafe {
             let _ = DwmExtendFrameIntoClientArea(self.hwnd, &m);
@@ -409,7 +394,7 @@ impl Frame {
 
     fn view_rect(&self) -> RECT {
         let r = client(self.hwnd);
-        RECT { left: 0, top: self.chrome_px(), right: r.right, bottom: (r.bottom - self.status_px()).max(self.chrome_px()) }
+        RECT { left: 0, top: self.chrome_px(), right: r.right, bottom: r.bottom.max(self.chrome_px()) }
     }
 
     fn tab(&self) -> Option<&Tab> {
@@ -526,14 +511,7 @@ impl Frame {
         let t = self.tabs.get(self.active);
         let folder_view = t.and_then(|t| t.folder_view());
         let ready = folder_view.is_some();
-        let mut selected = 0;
-        let mut details_view = false;
-        let items = folder_view.as_ref().map_or(-1, |view| unsafe {
-            selected = view.ItemCount(SVGIO_SELECTION).unwrap_or(0);
-            details_view = view.GetCurrentViewMode().is_ok_and(|m| m == FVM_DETAILS.0 as u32);
-            view.ItemCount(SVGIO_ALLVIEW).unwrap_or(0)
-        });
-        let selection = selected > 0;
+        let selection = folder_view.as_ref().is_some_and(shell::has_selection);
         let create = t.is_some_and(|t| t.path.is_some() && t.query.is_empty());
         let view = chrome::View {
             w,
@@ -563,19 +541,6 @@ impl Frame {
             log::line(&format!("draw failed: {e}"));
         }
         self.spans = spans;
-        let status_hit = |hit| match hit {
-            Hit::StatusDetails | Hit::StatusIcons => hit,
-            _ => Hit::None,
-        };
-        let status = (items, selected, details_view, status_hit(self.hover), status_hit(self.pressed));
-        if self.status_drawn != Some(status) {
-            self.status.begin();
-            chrome::status(&self.status, &view, items, selected, details_view);
-            match self.status.end() {
-                Ok(()) => self.status_drawn = Some(status),
-                Err(error) => log::line(&format!("status draw failed: {error}")),
-            }
-        }
     }
 
     fn layout(&mut self) {
@@ -589,13 +554,6 @@ impl Frame {
         if let Err(e) = self.canvas.resize(r.right as u32, (L::CHROME_H * k).ceil() as u32, 96.0 * k) {
             log::line(&format!("resize failed: {e}"));
         }
-        let status_height = self.status_px();
-        if let Err(error) = self.status.resize(r.right as u32, status_height as u32, 96.0 * k)
-            .and_then(|()| self.status.set_y(r.bottom - status_height))
-        {
-            log::line(&format!("status resize failed: {error}"));
-        }
-        self.status_drawn = None;
         self.extend_frame();
         if let Some(t) = self.tab() {
             t.set_rect(self.view_rect());
@@ -607,9 +565,6 @@ impl Frame {
         let k = self.scale();
         let rect = client(self.hwnd);
         let w = rect.right as f32 / k;
-        if (rect.bottom - self.status_px()..rect.bottom).contains(&y_px) {
-            return L::status_hit(x_px as f32 / k, w);
-        }
         L::hit(x_px as f32 / k, y_px as f32 / k, w, self.tabs.len(), self.active, &self.spans)
     }
 
@@ -697,13 +652,6 @@ impl Frame {
             Hit::NewTab => self.new_tab(),
             Hit::TabsBack => self.switch(L::tab_strip(client(self.hwnd).right as f32 / k, self.tabs.len(), self.active).visible.start.saturating_sub(1)),
             Hit::TabsForward => self.switch(L::tab_strip(client(self.hwnd).right as f32 / k, self.tabs.len(), self.active).visible.end),
-            Hit::StatusDetails | Hit::StatusIcons => {
-                if let Some(view) = self.tab().and_then(Tab::folder_view) {
-                    let (mode, size) = if h == Hit::StatusDetails { (FVM_DETAILS, 16) } else { (FVM_ICON, 48) };
-                    let result = unsafe { view.SetViewModeAndIconSize(mode, size) };
-                    log::line(&format!("status view {mode:?}: {result:?}"));
-                }
-            }
             Hit::Cmd(c) => self.command(c, k),
             Hit::Min => unsafe {
                 let _ = ShowWindow(self.hwnd, SW_MINIMIZE);

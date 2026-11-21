@@ -80,33 +80,6 @@ pub fn draw(c: &Canvas, v: &View) -> Vec<(f32, f32)> {
     spans
 }
 
-pub fn status(c: &Canvas, v: &View, items: i32, selected: i32, details: bool) {
-    let h = L::STATUS_H;
-    c.fill(rect(0.0, 0.0, v.w, h), LAYER);
-    c.fill(rect(0.0, 0.0, v.w, 1.0), CMDBAR_LINE);
-    if v.ready {
-        let mut summary = format!("{items} {}", v.s.items[usize::from(items != 1)]);
-        if selected > 0 {
-            use std::fmt::Write;
-            let noun = v.s.selected[usize::from(selected != 1)];
-            let _ = write!(summary, "   |   {selected} {noun}");
-        }
-        c.text(&c.sh.fonts.ui12, &summary, 12.0, v.w - 80.0, L::baseline(h / 2.0, 12.0), TEXT_DIM);
-    }
-    for (hit, glyph, from_right, active) in [
-        (Hit::StatusDetails, '\u{E8FD}', L::STATUS_DETAILS_FROM_RIGHT, details),
-        (Hit::StatusIcons, '\u{E8A9}', L::STATUS_ICONS_FROM_RIGHT, !details),
-    ] {
-        let x = v.w - from_right;
-        if v.ready {
-            if let Some(fill) = v.state(hit).or_else(|| active.then_some(TAB_ACTIVE)) {
-                c.round(rect(x - 14.0, 3.0, 28.0, h - 6.0), 4.0, fill);
-            }
-        }
-        c.glyph(&c.sh.fonts.glyph14, glyph, x, h / 2.0, 14.0, if v.ready { TEXT_DIM } else { TEXT_DISABLED });
-    }
-}
-
 fn tab_strip(c: &Canvas, v: &View) {
     c.fill(rect(0.0, 0.0, v.w, L::TABSTRIP_H), TITLE_LAYER);
     let strip = L::tab_strip(v.w, v.tabs.len(), v.active);

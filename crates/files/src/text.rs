@@ -16,8 +16,6 @@ pub struct Strings {
     pub select_all: &'static str,
     pub select_none: &'static str,
     pub properties: &'static str,
-    pub items: [&'static str; 2],
-    pub selected: [&'static str; 2],
 }
 
 pub const EN: Strings = Strings {
@@ -35,8 +33,6 @@ pub const EN: Strings = Strings {
     select_all: "Select all",
     select_none: "Select none",
     properties: "Properties",
-    items: ["item", "items"],
-    selected: ["item selected", "items selected"],
 };
 
 pub const FR: Strings = Strings {
@@ -63,8 +59,6 @@ pub const FR: Strings = Strings {
     select_all: "S\u{e9}lectionner tout",
     select_none: "Ne rien s\u{e9}lectionner",
     properties: "Propri\u{e9}t\u{e9}s",
-    items: ["\u{e9}l\u{e9}ment", "\u{e9}l\u{e9}ments"],
-    selected: ["\u{e9}l\u{e9}ment s\u{e9}lectionn\u{e9}", "\u{e9}l\u{e9}ments s\u{e9}lectionn\u{e9}s"],
 };
 
 /// Strings for a UI language tag such as `fr-FR`; English for anything else.

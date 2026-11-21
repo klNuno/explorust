@@ -5,9 +5,6 @@ pub const NAVBAR_BOTTOM: f32 = 92.0;
 pub const CMDBAR_BOTTOM: f32 = 139.0;
 /// Height of the chrome, the command bar's bottom line included.
 pub const CHROME_H: f32 = CMDBAR_BOTTOM + 1.0;
-pub const STATUS_H: f32 = 30.0;
-pub const STATUS_DETAILS_FROM_RIGHT: f32 = 52.0;
-pub const STATUS_ICONS_FROM_RIGHT: f32 = 20.0;
 
 pub const TAB_X: f32 = 12.0;
 pub const TAB_Y: f32 = 8.0;
@@ -88,8 +85,6 @@ pub enum Hit {
     NewTab,
     TabsBack,
     TabsForward,
-    StatusDetails,
-    StatusIcons,
     Back,
     Forward,
     Up,
@@ -99,16 +94,6 @@ pub enum Hit {
     Crumb(usize),
     Search,
     Cmd(Cmd),
-}
-
-pub fn status_hit(x: f32, w: f32) -> Hit {
-    if within(x, w - STATUS_DETAILS_FROM_RIGHT, 30.0) {
-        Hit::StatusDetails
-    } else if within(x, w - STATUS_ICONS_FROM_RIGHT, 30.0) {
-        Hit::StatusIcons
-    } else {
-        Hit::None
-    }
 }
 
 /// Width of each tab when `n` tabs share a window `w` wide, as Explorer shrinks them.
