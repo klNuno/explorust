@@ -142,6 +142,11 @@ fn run(tx: std::sync::mpsc::Sender<isize>) {
     // SAFETY: COM for this thread only; a message window of a class registered here.
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        // Copy and Cut run here (Job::Invoke): the shell puts the files on the clipboard with
+        // OleSetClipboard, which needs OLE on the calling thread, and the data object lives as
+        // long as this thread does.
+        let ole = windows::Win32::System::Ole::OleInitialize(None);
+        super::log::line(&format!("worker: OLE {ole:?}"));
         let inst = GetModuleHandleW(None).unwrap_or_default();
         let wc = WNDCLASSW { lpfnWndProc: Some(proc_), hInstance: inst.into(), lpszClassName: w!("explorust.menu.worker"), ..Default::default() };
         RegisterClassW(&wc);
