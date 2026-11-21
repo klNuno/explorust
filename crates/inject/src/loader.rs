@@ -36,6 +36,9 @@ struct Hooked {
     windows: Vec<isize>,
 }
 
+/// When the first event of a host's target arrived, its kind, and the phases the DLL reported.
+type Pending = (Instant, Kind, Vec<(Phase, u64)>);
+
 struct State {
     dll: HMODULE,
     proc: HOOKPROC,
@@ -47,7 +50,7 @@ struct State {
     seen: HashMap<isize, Kind>,
     /// When the first event of a host's target arrived, for the latency log, and the phases the
     /// DLL reported so far.
-    pending: HashMap<u32, (Instant, Kind, Vec<(Phase, u64)>)>,
+    pending: HashMap<u32, Pending>,
     /// Dialogs hooked at their creation, not shown yet: at the show they are kept (a file dialog)
     /// or let go.
     created: HashSet<isize>,
@@ -55,6 +58,10 @@ struct State {
     retry: Vec<(isize, u8)>,
     /// File dialogs whose caption is checked again: (window, ticks left).
     captions: Vec<(isize, u8)>,
+    /// The DLL's path, for the Settings TAP.
+    dll_path: std::path::PathBuf,
+    /// Settings processes the TAP was sent to.
+    xaml_pids: HashSet<u32>,
     hwnd: HWND,
 }
 
@@ -90,7 +97,7 @@ pub fn run() {
             let _ = FreeLibrary(dll);
             return;
         };
-        (dll, Some(std::mem::transmute::<_, unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT>(p)))
+        (dll, Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT>(p)))
     };
     // SAFETY: the window, the event hook and the thread hooks all live and die on this thread.
     unsafe {
@@ -115,6 +122,8 @@ pub fn run() {
             created: HashSet::new(),
             retry: Vec::new(),
             captions: Vec::new(),
+            dll_path: path.clone(),
+            xaml_pids: HashSet::new(),
             hwnd,
         };
         STATE.with(|s| *s.borrow_mut() = Some(state));
@@ -123,6 +132,7 @@ pub fn run() {
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
         log::line(&format!("watching (dll {}, {} bytes)", path.display(), std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)));
+        scan_existing();
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -151,6 +161,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return true;
         }
         match msg {
+            WM_COPYDATA => {
+                // SAFETY: WM_COPYDATA's lParam is a COPYDATASTRUCT valid for the send.
+                unsafe { tap_lines(lp) };
+                true
+            }
             WM_TIMER if wp.0 == RETRY_TIMER => {
                 retry();
                 true
@@ -178,7 +193,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
     })
     .unwrap_or(false);
-    if handled { LRESULT(0) } else { unsafe { DefWindowProcW(hwnd, msg, wp, lp) } }
+    if handled { LRESULT(if msg == WM_COPYDATA { 1 } else { 0 }) } else { unsafe { DefWindowProcW(hwnd, msg, wp, lp) } }
+}
+
+/// Lines the Settings TAP sent (`xaml::report`), into inject.log.
+unsafe fn tap_lines(lp: LPARAM) {
+    // SAFETY: the caller's contract.
+    let cds = unsafe { &*(lp.0 as *const windows::Win32::System::DataExchange::COPYDATASTRUCT) };
+    if cds.dwData != crate::xaml::report::COPYDATA_TAG || cds.lpData.is_null() {
+        return;
+    }
+    // SAFETY: cbData bytes at lpData, valid during the send.
+    let bytes = unsafe { std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize) };
+    for l in String::from_utf8_lossy(bytes).lines() {
+        log::line(&format!("settings xaml: {l}"));
+    }
 }
 
 unsafe extern "system" fn on_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, obj: i32, child: i32, _: u32, _: u32) {
@@ -191,6 +220,33 @@ unsafe extern "system" fn on_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, obj
         EVENT_OBJECT_DESTROY => forget(hwnd),
         _ => {}
     });
+}
+
+/// Windows shown before the loader started (explorust restarted with Settings or a file dialog
+/// open) get what a new show would give them.
+fn scan_existing() {
+    unsafe extern "system" fn each(h: HWND, list: LPARAM) -> BOOL {
+        // SAFETY: lParam is the Vec below, alive for the enumeration.
+        unsafe { (*(list.0 as *mut Vec<HWND>)).push(h) };
+        BOOL(1)
+    }
+    let mut tops: Vec<HWND> = Vec::new();
+    // SAFETY: the callback only pushes into the Vec passed as lParam.
+    unsafe { let _ = EnumWindows(Some(each), LPARAM(&mut tops as *mut _ as isize)); }
+    for h in tops {
+        // SAFETY: plain queries; the handle may be gone.
+        if !unsafe { IsWindowVisible(h) }.as_bool() {
+            continue;
+        }
+        if class_of(h) == target::FRAME_WINDOW {
+            // SAFETY: plain query.
+            if let Ok(core) = unsafe { FindWindowExW(Some(h), None, &HSTRING::from(target::CORE_WINDOW), PCWSTR::null()) } {
+                consider(core);
+            }
+        } else {
+            consider(h);
+        }
+    }
 }
 
 fn class_of(h: HWND) -> String {
@@ -383,6 +439,21 @@ fn settings(core: HWND, t0: Instant, tries: u8) {
         inject(frame, Kind::Settings, t0);
     } else {
         log::line(&format!("settings styled without injection in {} us", t0.elapsed().as_micros()));
+    }
+    let (pid, _) = pid_tid(core);
+    let dll = STATE.with(|s| {
+        let mut b = s.borrow_mut();
+        let st = b.as_mut()?;
+        st.xaml_pids.insert(pid).then(|| st.dll_path.clone())
+    });
+    if let Some(dll) = dll {
+        if crate::xaml::attach::switched_off() {
+            log::line("settings xaml: off (parts-off.txt)");
+        } else if let Some(rules) = crate::xaml::attach::rules_text() {
+            crate::xaml::attach::attach(pid, &dll, rules);
+        } else {
+            log::line("settings xaml: no settings-style.txt, Settings left as Windows draws it");
+        }
     }
 }
 

@@ -846,6 +846,7 @@ name = "inject"
 version = "0.1.0"
 dependencies = [
  "windows",
+ "windows-core",
 ]
 
 [[package]]

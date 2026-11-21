@@ -11,6 +11,7 @@
 //! catches panics. Kill switch: a line `inject` in `%LOCALAPPDATA%\explorust\parts-off.txt`.
 
 pub mod target;
+pub mod xaml;
 
 #[cfg(target_os = "windows")]
 mod dark;

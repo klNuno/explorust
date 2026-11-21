@@ -27,7 +27,10 @@ ua=0
 [ "$mode" = installed ] && ua=1
 # Plain cargo: it takes its tokens from the box's shared jobserver (MAKEFLAGS), so it stays fair
 # to other threads; os job admission can sit queued behind another thread's long job.
-nice -n 10 env EXPLORUST_UIACCESS=$ua cargo build --release --target x86_64-pc-windows-gnu -p shell -p keys -p guard -p devkeys -p files -p inject -p notify -p viewer -p taskman -p fsindex
+# A rustc the box's memory guard kills (the windows crate is the big one) gets one retry on two
+# jobs; a build that still fails stops the deploy instead of pushing the previous binaries.
+build() { nice -n 10 env EXPLORUST_UIACCESS=$ua cargo build "$@" --release --target x86_64-pc-windows-gnu -p shell -p keys -p guard -p devkeys -p files -p inject -p notify -p viewer -p taskman -p fsindex; }
+build || build -j 2 || { echo "g1-deploy: build failed" >&2; exit 1; }
 t=target/x86_64-pc-windows-gnu/release
 mkdir -p dist
 cp "$t/explorust.exe" "$t/explorust-guard.exe" "$t/keys.exe" "$t/explorust-keys.exe" "$t/explorust-open.exe" "$t/explorust_inject.dll" "$t/explorust-notify.exe" "$t/explorust-viewer.exe" "$t/explorust-taskman.exe" "$t/explorust-index.exe" tools/g1-state.ps1 dist/
