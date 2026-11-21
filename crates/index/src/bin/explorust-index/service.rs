@@ -203,6 +203,11 @@ pub fn uninstall() -> u32 {
             say(&format!("uninstall: service {} stopped and deleted", fsindex::SERVICE));
             0
         }
+        // Absent, or already deleted and waiting for its last handle: nothing left to do.
+        Err(e) if e.code().0 as u32 & 0xffff == 1060 || e.code().0 as u32 & 0xffff == 1072 => {
+            say(&format!("uninstall: service {} already gone ({e})", fsindex::SERVICE));
+            0
+        }
         Err(e) => {
             say(&format!("uninstall: service {}: {e}", fsindex::SERVICE));
             1

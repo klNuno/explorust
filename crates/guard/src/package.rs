@@ -6,7 +6,6 @@
 //! WinRT in the guard), with no window.
 
 use crate::log;
-use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -14,7 +13,6 @@ pub const MSIX: &str = "explorust-notify.msix";
 const NAME: &str = "explorust.notify";
 /// Family name: the package name and the hash of its unsigned OID publisher.
 const FAMILY: &str = "explorust.notify_m23m5a37cevzy";
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CONSENT: &str = r"HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\userNotificationListener";
 
 /// PowerShell single-quoted literal.
@@ -22,15 +20,15 @@ fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// The longest an Appx step may take; past it PowerShell is stopped and the step fails.
+const LIMIT: std::time::Duration = std::time::Duration::from_secs(180);
+
 fn powershell(script: &str) -> Result<String, String> {
-    let out = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("powershell: {e}"))?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if out.status.success() && err.is_empty() {
+    let (ok, text, err) = crate::proc::run_bounded(
+        Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]),
+        LIMIT,
+    )?;
+    if ok && err.is_empty() {
         Ok(text)
     } else {
         Err(format!("{text} {err}").trim().chars().take(600).collect())

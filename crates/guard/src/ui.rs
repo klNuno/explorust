@@ -12,7 +12,8 @@ use windows::Win32::UI::Controls::{
     TDF_USE_COMMAND_LINKS, TDM_CLICK_BUTTON, TDM_ENABLE_BUTTON, TDM_SET_PROGRESS_BAR_MARQUEE, TDN_BUTTON_CLICKED, TDN_CREATED, TDN_TIMER,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    HWND_TOPMOST, IDOK, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    HWND_TOPMOST, IDNO, IDOK, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    MB_YESNOCANCEL,
     MESSAGEBOX_STYLE, MessageBoxW, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowPos,
 };
 use windows::core::{HRESULT, HSTRING, PCWSTR, s, w};
@@ -75,7 +76,7 @@ pub fn choose(icon: Icon, main: &str, content: &str, buttons: &[(i32, &str)], ca
         .map(|((id, _), l)| TASKDIALOG_BUTTON { nButtonID: *id, pszButtonText: PCWSTR(l.as_ptr()) })
         .collect();
     let Some(td) = task_dialog() else {
-        return fallback_box(icon, main, content, buttons);
+        return fallback_box(icon, main, content, buttons, cancel);
     };
     let icon_id = match icon {
         Icon::Info => TD_INFORMATION_ICON,
@@ -109,7 +110,7 @@ pub fn choose(icon: Icon, main: &str, content: &str, buttons: &[(i32, &str)], ca
     let hr = unsafe { td(&cfg, &mut pressed, std::ptr::null_mut(), std::ptr::null_mut()) };
     if hr.is_err() {
         crate::log::line(&format!("task dialog failed ({hr:?}): message box instead"));
-        return fallback_box(icon, main, content, buttons);
+        return fallback_box(icon, main, content, buttons, cancel);
     }
     crate::log::line(&format!("dialog: {main}: button {pressed}"));
     pressed
@@ -123,9 +124,15 @@ pub fn working<T: Send>(main: &str, content: &str, work: impl FnOnce() -> T + Se
     let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let job = scope.spawn(|| {
-            let r = work();
-            done.store(true, Ordering::SeqCst);
-            r
+            // Set on drop, so a panic in `work` still closes the dialog.
+            struct Done<'a>(&'a AtomicBool);
+            impl Drop for Done<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _done = Done(&done);
+            work()
         });
         if let Some(td) = task_dialog() {
             let title = HSTRING::from("explorust");
@@ -179,23 +186,38 @@ pub fn tell(icon: Icon, main: &str, content: &str, details: Option<&str>) {
     choose(icon, main, content, &[(1, tr("OK", "OK"))], false, details);
 }
 
-/// Without task dialogs: Yes is the first button, No the second (or OK for one).
-fn fallback_box(icon: Icon, main: &str, content: &str, buttons: &[(i32, &str)]) -> i32 {
+/// Without task dialogs: the first button is Yes (OK when alone), the second No; with `cancel`, a
+/// Cancel button, and a box that closes or fails to open returns 2 (IDCANCEL) so it never counts
+/// as a yes.
+fn fallback_box(icon: Icon, main: &str, content: &str, buttons: &[(i32, &str)], cancel: bool) -> i32 {
     let mut text = format!("{main}\n\n{content}");
     let yes_no = buttons.len() >= 2;
     if yes_no {
         text.push_str(&format!("\n\n{}: {}\n{}: {}", tr("Oui", "Yes"), buttons[0].1, tr("Non", "No"), buttons[1].1));
+    } else if cancel && let Some(b) = buttons.first() {
+        text.push_str(&format!("\n\nOK: {}", b.1));
     }
     let style = match icon {
         Icon::Warning | Icon::Shield => MB_ICONWARNING,
         Icon::Info => MB_ICONINFORMATION,
     };
-    let style = MESSAGEBOX_STYLE(style.0 | MB_TOPMOST.0 | MB_SETFOREGROUND.0 | if yes_no { MB_YESNO.0 } else { MB_OK.0 });
+    let kind = match (yes_no, cancel) {
+        (true, true) => MB_YESNOCANCEL,
+        (true, false) => MB_YESNO,
+        (false, true) => MB_OKCANCEL,
+        (false, false) => MB_OK,
+    };
+    let style = MESSAGEBOX_STYLE(style.0 | MB_TOPMOST.0 | MB_SETFOREGROUND.0 | kind.0);
+    crate::log::line(&format!("dialog: {main} (message box)"));
     // SAFETY: plain strings that outlive the call.
     let r = unsafe { MessageBoxW(None, &HSTRING::from(text), w!("explorust"), style) };
-    match (yes_no, r == IDYES) {
-        (true, true) => buttons[0].0,
-        (true, false) => buttons[1].0,
-        (false, _) => buttons.first().map(|b| b.0).unwrap_or(1),
-    }
+    let picked = if r == IDYES || r == IDOK {
+        buttons.first().map(|b| b.0).unwrap_or(1)
+    } else if r == IDNO && yes_no {
+        buttons[1].0
+    } else {
+        2
+    };
+    crate::log::line(&format!("dialog: {main}: button {picked}"));
+    picked
 }

@@ -13,7 +13,9 @@ use windows::Win32::Security::Cryptography::{
     CertDeleteCertificateFromStore, CertFindCertificateInStore, CertOpenStore, CertFreeCertificateContext, HCERTSTORE,
     PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::Win32::UI::Shell::IsUserAnAdmin;
 use windows::core::{HSTRING, PCWSTR};
 
@@ -54,12 +56,66 @@ pub fn dir() -> PathBuf {
 }
 
 /// Copies the shell's files from `from` into the install folder; returns the installed guard.
+/// Every file is first copied into a staging folder beside the live one and checked; only then are
+/// the live files swapped one by one (a rename on the same volume), and a failed swap puts every
+/// earlier file back, so a full disk or a broken payload leaves the installed version working.
 pub fn copy_files(from: &Path) -> Result<PathBuf, String> {
     let to = dir();
     std::fs::create_dir_all(&to).map_err(|e| format!("create {}: {e}", to.display()))?;
     if same_dir(from, &to) {
         return Ok(to.join(FILES[0]));
     }
+    clean_leftovers(&to);
+    let stage = to.join(format!(".new-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir(&stage).map_err(|e| format!("create {}: {e}", stage.display()))?;
+    let staged = stage_files(from, &stage);
+    let names = match staged {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(e);
+        }
+    };
+    let mut swapped: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    for name in &names {
+        let dst = to.join(name);
+        let result = set_aside(&dst).and_then(|aside| match std::fs::rename(stage.join(name), &dst) {
+            Ok(()) => Ok(aside),
+            Err(e) => {
+                if let Some(a) = &aside {
+                    let _ = std::fs::rename(a, &dst);
+                }
+                Err(format!("swap in {name}: {e}"))
+            }
+        });
+        match result {
+            Ok(aside) => swapped.push((dst, aside)),
+            Err(e) => {
+                for (d, a) in swapped.iter().rev() {
+                    let _ = std::fs::remove_file(d);
+                    if let Some(a) = a {
+                        let _ = std::fs::rename(a, d);
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&stage);
+                return Err(format!("{e}; the previous files are back"));
+            }
+        }
+    }
+    for (_, aside) in swapped {
+        if let Some(a) = aside {
+            discard(&a);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&stage);
+    log::line(&format!("install: {} files swapped in {}", names.len(), to.display()));
+    Ok(to.join(FILES[0]))
+}
+
+/// Copies the payload into `stage` and checks each copy's size; returns the names copied.
+fn stage_files(from: &Path, stage: &Path) -> Result<Vec<&'static str>, String> {
+    let mut names = Vec::new();
     for name in FILES {
         let src = from.join(name);
         if !src.exists() {
@@ -68,12 +124,15 @@ pub fn copy_files(from: &Path) -> Result<PathBuf, String> {
             }
             continue;
         }
-        let dst = to.join(name);
-        set_aside(&dst);
-        std::fs::copy(&src, &dst).map_err(|e| format!("copy {} to {}: {e}", src.display(), dst.display()))?;
-        log::line(&format!("install: copied {name} to {}", to.display()));
+        let dst = stage.join(name);
+        let n = std::fs::copy(&src, &dst).map_err(|e| format!("copy {} to {}: {e}", src.display(), dst.display()))?;
+        let want = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(u64::MAX);
+        if n != want {
+            return Err(format!("copy of {name}: {n} bytes of {want}"));
+        }
+        names.push(name);
     }
-    Ok(to.join(FILES[0]))
+    Ok(names)
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -83,23 +142,64 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// A running exe cannot be overwritten but can be renamed: the old one moves to `<name>.old`,
-/// deleted now when nothing runs it, else at the next boot.
-fn set_aside(path: &Path) {
+/// A running exe cannot be overwritten but can be renamed: the live file moves to a unique
+/// `<name>.old<pid>` kept until the new one is in place.
+fn set_aside(path: &Path) -> Result<Option<PathBuf>, String> {
     if !path.exists() {
-        return;
+        return Ok(None);
     }
-    let old = path.with_extension("old");
-    if old.exists() && std::fs::remove_file(&old).is_err() {
-        delete_at_boot(&old);
-        let unique = path.with_extension(format!("old{}", std::process::id()));
-        if std::fs::rename(path, &unique).is_ok() {
-            delete_at_boot(&unique);
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let aside = path.with_file_name(format!("{name}.old{}", std::process::id()));
+    let _ = std::fs::remove_file(&aside);
+    std::fs::rename(path, &aside).map_err(|e| format!("set aside {name}: {e}"))?;
+    Ok(Some(aside))
+}
+
+/// Deletes an old copy now, or at the next boot when something still runs it.
+fn discard(path: &Path) {
+    if std::fs::remove_file(path).is_err() {
+        delete_at_boot(path);
+    }
+}
+
+/// Old copies and staging folders an earlier install could not delete at once.
+fn clean_leftovers(to: &Path) {
+    let Ok(entries) = std::fs::read_dir(to) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let path = e.path();
+        if name.starts_with(".new-") {
+            let _ = std::fs::remove_dir_all(&path);
+        } else if !FILES.contains(&name.as_str()) && (name.contains(".old") || name.contains(".del")) {
+            let _ = std::fs::remove_file(&path);
         }
-        return;
     }
-    if std::fs::rename(path, &old).is_ok() && std::fs::remove_file(&old).is_err() {
-        delete_at_boot(&old);
+}
+
+/// One installer or uninstaller at a time on this machine; released on drop.
+pub struct Lock(HANDLE);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // SAFETY: the mutex this process owns.
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+pub fn lock() -> Result<Lock, String> {
+    // SAFETY: a named mutex; the handle moves into the Lock.
+    unsafe {
+        let h = CreateMutexW(None, false, &HSTRING::from(r"Global\explorust-setup")).map_err(|e| format!("setup lock: {e}"))?;
+        let w = WaitForSingleObject(h, 0);
+        if w == WAIT_OBJECT_0 || w == WAIT_ABANDONED {
+            Ok(Lock(h))
+        } else {
+            let _ = CloseHandle(h);
+            Err("another explorust install or uninstall is running".into())
+        }
     }
 }
 
@@ -118,6 +218,9 @@ pub fn remove_files() -> String {
     let (mut gone, mut later) = (0, 0);
     for (i, e) in entries.flatten().enumerate() {
         let path = e.path();
+        if path.is_dir() && std::fs::remove_dir_all(&path).is_ok() {
+            continue;
+        }
         if std::fs::remove_file(&path).is_ok() {
             gone += 1;
             continue;
@@ -225,17 +328,17 @@ pub fn trusted() -> bool {
 }
 
 /// Registers (`--install`) or removes (`--uninstall`) the index service through the index exe of
-/// the install folder, which knows its own service; elevated only. Returns its output.
-pub fn index_service(install: bool) -> String {
+/// the install folder, which knows its own service; elevated only. Ok with its output, Err when it
+/// failed or took over a minute.
+pub fn index_service(install: bool) -> Result<String, String> {
     let exe = dir().join(INDEX);
     if !exe.exists() {
-        return format!("{} absent, no service", exe.display());
+        return Ok(format!("{} absent, no service", exe.display()));
     }
     let arg = if install { "--install" } else { "--uninstall" };
-    use std::os::windows::process::CommandExt;
-    // CREATE_NO_WINDOW: the index exe is a console program.
-    match std::process::Command::new(&exe).arg(arg).creation_flags(0x0800_0000).output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        Err(e) => format!("{} {arg}: {e}", exe.display()),
+    match crate::proc::run_bounded(std::process::Command::new(&exe).arg(arg), std::time::Duration::from_secs(60)) {
+        Ok((true, out, _)) => Ok(out),
+        Ok((false, out, err)) => Err(format!("{} {arg}: {out} {err}", exe.display()).trim().to_string()),
+        Err(e) => Err(e),
     }
 }

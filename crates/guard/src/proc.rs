@@ -91,6 +91,12 @@ impl Child {
         Ok(Child { handle, pid })
     }
 
+    /// True once the process has exited.
+    pub fn ended(&self) -> bool {
+        // SAFETY: valid process handle owned by self.
+        unsafe { WaitForSingleObject(self.handle, 0) == WAIT_OBJECT_0 }
+    }
+
     pub fn exit_code(&self) -> u32 {
         let mut code = 0u32;
         // SAFETY: valid process handle owned by self.
@@ -158,4 +164,48 @@ pub fn wait_any(handles: &[HANDLE], ms: Option<u32>) -> Option<usize> {
     }
     let i = r.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
     (i < handles.len()).then_some(i)
+}
+
+/// Runs a console program with no window and waits at most `limit` for it, so a child that never
+/// ends (PowerShell's Appx module, a service install) cannot freeze an install or an uninstall.
+/// Ok((success, stdout, stderr)); Err when it does not start or is killed at the limit.
+pub fn run_bounded(cmd: &mut std::process::Command, limit: std::time::Duration) -> Result<(bool, String, String), String> {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    let what = format!("{:?}", cmd.get_program());
+    let mut child = cmd
+        .creation_flags(0x0800_0000)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{what}: {e}"))?;
+    let reader = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let out = reader(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = reader(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let t0 = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if t0.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{what} still running after {} s: stopped", limit.as_secs()));
+            }
+            Err(e) => return Err(format!("{what}: {e}")),
+        }
+    };
+    let out = out.join().unwrap_or_default();
+    let err = err.join().unwrap_or_default();
+    Ok((status.success(), out.trim().to_string(), err.trim().to_string()))
 }

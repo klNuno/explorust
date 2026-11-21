@@ -5,7 +5,9 @@
 //! signal, a ready timeout, a crash, a hung taskbar, a part the shell gave up on) the guard starts
 //! explorer.exe for the rest of the session and tells the user once. A problem at three logons in
 //! a row turns explorust off for good (the per-user Shell value is deleted), so a Windows update
-//! that breaks it never makes every logon a fallback.
+//! that breaks it never makes every logon a fallback. A logon counts by its outcome: the streak
+//! goes back to zero only at the logon after one that ended without a problem, never after some
+//! healthy minutes, so a part that fails ten minutes into every session still ends the streak.
 
 use std::time::Duration;
 
@@ -18,9 +20,6 @@ pub fn ready_timeout(self_test: bool) -> Duration {
 /// Logons in a row that ended in a problem before explorust is turned off.
 pub const MAX_STREAK: u32 = 3;
 
-/// How long a ready explorust must run without a problem before the streak goes back to zero.
-pub const HEALTHY_AFTER: Duration = Duration::from_secs(300);
-
 /// What a logon does given the streak of problem logons before it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AtLogon {
@@ -32,11 +31,16 @@ pub fn at_logon(streak: u32) -> AtLogon {
     if streak >= MAX_STREAK { AtLogon::TurnOff } else { AtLogon::Run }
 }
 
-/// The taskbar check: one probe every `PROBE`, a window that does not answer for `HUNG_FOR` or is
-/// missing for `MISSING_FOR` is a problem.
+/// The taskbar check: one probe every `PROBE`, each waiting `ANSWER_WITHIN` for an answer (the
+/// time after which Windows itself calls a window hung). A problem needs at least `MIN_MISSES`
+/// failed probes in a row and, from the start of the first, `HUNG_FOR` of silence (any probe
+/// without an answer) or `MISSING_FOR` with the window gone, so a busy machine that answers late
+/// once or twice is never a problem.
 pub const PROBE: Duration = Duration::from_secs(5);
+pub const ANSWER_WITHIN: Duration = Duration::from_secs(5);
 pub const HUNG_FOR: Duration = Duration::from_secs(20);
 pub const MISSING_FOR: Duration = Duration::from_secs(30);
+pub const MIN_MISSES: u32 = 3;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Probe {
@@ -45,37 +49,35 @@ pub enum Probe {
     Missing,
 }
 
-/// Counts probes in a row of each bad kind; `problem` names the first threshold crossed.
+/// Failed probes since the last answer: when the first started, how many, and whether one of them
+/// found the window there but silent. A window that goes from silent to gone stays one outage.
 #[derive(Default)]
 pub struct Watchdog {
-    hung: u32,
-    missing: u32,
+    since: Option<Duration>,
+    misses: u32,
+    hung: bool,
 }
 
 impl Watchdog {
-    pub fn probe(&mut self, p: Probe) -> Option<String> {
-        match p {
-            Probe::Answered => {
-                self.hung = 0;
-                self.missing = 0;
-            }
-            Probe::NoAnswer => {
-                self.hung += 1;
-                self.missing = 0;
-            }
-            Probe::Missing => {
-                self.missing += 1;
-                self.hung = 0;
-            }
+    /// `at`: when this probe started, on any clock that only goes forward.
+    pub fn probe(&mut self, p: Probe, at: Duration) -> Option<String> {
+        if p == Probe::Answered {
+            *self = Self::default();
+            return None;
         }
-        let ticks = |d: Duration| (d.as_secs() / PROBE.as_secs()) as u32;
-        if self.hung >= ticks(HUNG_FOR) {
-            return Some(format!("the taskbar has not answered for {} s", HUNG_FOR.as_secs()));
+        let since = *self.since.get_or_insert(at);
+        self.misses += 1;
+        self.hung |= p == Probe::NoAnswer;
+        let limit = if self.hung { HUNG_FOR } else { MISSING_FOR };
+        let out = at.saturating_sub(since);
+        if self.misses < MIN_MISSES || out < limit {
+            return None;
         }
-        if self.missing >= ticks(MISSING_FOR) {
-            return Some(format!("the taskbar window has been gone for {} s", MISSING_FOR.as_secs()));
-        }
-        None
+        Some(if self.hung {
+            format!("the taskbar has not answered for {} s ({} checks)", out.as_secs(), self.misses)
+        } else {
+            format!("the taskbar window has been gone for {} s ({} checks)", out.as_secs(), self.misses)
+        })
     }
 }
 
@@ -95,33 +97,62 @@ mod tests {
         assert_eq!(at_logon(3), AtLogon::TurnOff);
     }
 
-    #[test]
-    fn hung_taskbar_is_a_problem_after_20_s() {
-        let mut w = Watchdog::default();
-        for _ in 0..3 {
-            assert_eq!(w.probe(Probe::NoAnswer), None);
-        }
-        assert!(w.probe(Probe::NoAnswer).unwrap().contains("not answered"));
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
     }
 
     #[test]
-    fn an_answer_resets_the_count() {
+    fn hung_taskbar_is_a_problem_after_20_s_and_3_misses() {
         let mut w = Watchdog::default();
-        for _ in 0..3 {
-            w.probe(Probe::NoAnswer);
+        // A hung probe takes ANSWER_WITHIN, so they start 10 s apart.
+        assert_eq!(w.probe(Probe::NoAnswer, secs(0)), None);
+        assert_eq!(w.probe(Probe::NoAnswer, secs(10)), None);
+        assert!(w.probe(Probe::NoAnswer, secs(20)).unwrap().contains("not answered"));
+    }
+
+    #[test]
+    fn an_answer_resets() {
+        let mut w = Watchdog::default();
+        w.probe(Probe::NoAnswer, secs(0));
+        w.probe(Probe::NoAnswer, secs(10));
+        assert_eq!(w.probe(Probe::Answered, secs(20)), None);
+        assert_eq!(w.probe(Probe::NoAnswer, secs(25)), None);
+        assert_eq!(w.probe(Probe::NoAnswer, secs(35)), None);
+        assert_eq!(w.probe(Probe::NoAnswer, secs(44)), None);
+        assert!(w.probe(Probe::NoAnswer, secs(45)).is_some());
+    }
+
+    #[test]
+    fn misses_alone_are_not_enough() {
+        // A sleep or a frozen guard: many misses counted in a short time are not 20 s of silence.
+        let mut w = Watchdog::default();
+        for i in 0..10 {
+            assert_eq!(w.probe(Probe::NoAnswer, Duration::from_millis(i * 100)), None);
         }
-        assert_eq!(w.probe(Probe::Answered), None);
-        for _ in 0..3 {
-            assert_eq!(w.probe(Probe::NoAnswer), None);
-        }
+    }
+
+    #[test]
+    fn time_alone_is_not_enough() {
+        // Two misses a minute apart (the machine was asleep between them).
+        let mut w = Watchdog::default();
+        assert_eq!(w.probe(Probe::NoAnswer, secs(0)), None);
+        assert_eq!(w.probe(Probe::NoAnswer, secs(60)), None);
+    }
+
+    #[test]
+    fn silent_then_gone_is_one_outage() {
+        let mut w = Watchdog::default();
+        assert_eq!(w.probe(Probe::NoAnswer, secs(0)), None);
+        assert_eq!(w.probe(Probe::Missing, secs(10)), None);
+        assert!(w.probe(Probe::Missing, secs(20)).unwrap().contains("not answered"));
     }
 
     #[test]
     fn missing_taskbar_is_a_problem_after_30_s() {
         let mut w = Watchdog::default();
-        for _ in 0..5 {
-            assert_eq!(w.probe(Probe::Missing), None);
+        for t in [0, 5, 10, 15, 20, 25] {
+            assert_eq!(w.probe(Probe::Missing, secs(t)), None);
         }
-        assert!(w.probe(Probe::Missing).unwrap().contains("gone"));
+        assert!(w.probe(Probe::Missing, secs(30)).unwrap().contains("gone"));
     }
 }

@@ -3,8 +3,9 @@
 //! back on the hotkey, on Shift held at logon or when explorust.exe is missing, without a word.
 
 use crate::notice::{self, Notice};
-use crate::policy::{AtLogon, HEALTHY_AFTER, PROBE, Probe, Watchdog, at_logon, ready_timeout};
+use crate::policy::{AtLogon, MAX_STREAK, PROBE, Watchdog, at_logon, ready_timeout};
 use crate::proc::{Child, Event, wait_any};
+use crate::taskbar::{self, Start};
 use crate::{folders, hotkey, log, reg};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -52,17 +53,19 @@ pub fn run(adopt: Option<u32>) -> u32 {
             log::line("Shift held at logon: plain explorer");
             return explorer_forever(None);
         }
+        // A logon counts by its outcome: only one that ended without a problem clears the streak.
+        if !reg::last_logon_had_problem() && reg::problem_streak() != 0 {
+            log::line("the last logon ended without a problem: problem streak reset");
+            reg::set_problem_streak(0);
+        }
+        reg::set_logon_had_problem(false);
         let streak = reg::problem_streak();
         if at_logon(streak) == AtLogon::TurnOff {
-            let gone = reg::delete_shell();
-            log::line(&format!("{streak} logons in a row ended in a problem: explorust turned off (Shell value deleted: {gone:?})"));
-            reg::set_problem_streak(0);
-            return explorer_forever(Some(Notice::TurnedOff));
+            return explorer_forever(Some(turn_off(&format!("explorust ran into a problem at {streak} sign-ins in a row"))));
         }
-    }
-    if !exe.exists() {
-        log::line("explorust.exe missing: plain explorer");
-        return explorer_forever(None);
+        if !exe.exists() {
+            return explorer_forever(Some(turn_off(&format!("{} is missing", exe.display()))));
+        }
     }
     loop {
         let end = match adopted.take() {
@@ -82,9 +85,31 @@ pub fn run(adopt: Option<u32>) -> u32 {
             End::Problem(why) => {
                 let streak = reg::problem_streak() + 1;
                 reg::set_problem_streak(streak);
+                reg::set_logon_had_problem(true);
                 log::line(&format!("problem: {why}; plain explorer for this session (problem logons in a row: {streak})"));
+                if streak >= MAX_STREAK {
+                    return explorer_forever(Some(turn_off(&format!("{why} (a problem at {streak} sign-ins in a row)"))));
+                }
                 return explorer_forever(Some(Notice::Problem(why)));
             }
+        }
+    }
+}
+
+/// Deletes the Shell value so the next logon is plain Windows. The notice says what happened: off
+/// for good, or, when the value could not be deleted, a problem whose streak stays so the next
+/// logon tries again.
+fn turn_off(why: &str) -> Notice {
+    match reg::delete_shell() {
+        Ok(_) => {
+            reg::set_problem_streak(0);
+            reg::set_logon_had_problem(false);
+            log::line(&format!("explorust turned off: {why}; the Shell value is deleted"));
+            Notice::TurnedOff(why.to_string())
+        }
+        Err(e) => {
+            log::line(&format!("explorust should turn off ({why}) but the Shell value stays: {e}"));
+            Notice::Problem(format!("{why}; turning explorust off failed: {e}"))
         }
     }
 }
@@ -134,10 +159,8 @@ fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &E
 }
 
 /// Watches a ready explorust until it ends, its taskbar stops answering, or the escape hatch.
-/// After `HEALTHY_AFTER` without a problem the streak of problem logons goes back to zero.
 fn watch(child: &Child, fallback: &Event) -> End {
-    let since = Instant::now();
-    let mut healthy = false;
+    let t0 = Instant::now();
     let mut dog = Watchdog::default();
     let taskbar_off = parts_off().iter().any(|p| p == "taskbar");
     loop {
@@ -158,48 +181,15 @@ fn watch(child: &Child, fallback: &Event) -> End {
             }
             None => {}
         }
-        if !healthy && since.elapsed() >= HEALTHY_AFTER {
-            healthy = true;
-            if reg::problem_streak() != 0 {
-                reg::set_problem_streak(0);
-                log::line(&format!("explorust healthy for {} s: problem streak reset", HEALTHY_AFTER.as_secs()));
-            }
-        }
         if taskbar_off {
             continue;
         }
-        if let Some(why) = dog.probe(taskbar_probe(child.pid)) {
+        let at = t0.elapsed();
+        if let Some(why) = dog.probe(taskbar::probe(child.pid), at) {
             // A hung process may also ignore its quit event: kill waits up to 10 s, then the
             // fallback goes on anyway.
             child.kill();
             return End::Problem(why);
-        }
-    }
-}
-
-/// Asks explorust's taskbar window for an answer within 2 s.
-fn taskbar_probe(pid: u32) -> Probe {
-    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowExW, GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL,
-    };
-    use windows::core::w;
-    // SAFETY: window lookups and a bounded send; a stale handle only fails them.
-    unsafe {
-        let mut after: Option<HWND> = None;
-        loop {
-            let Ok(h) = FindWindowExW(None, after, w!("Shell_TrayWnd"), None) else { return Probe::Missing };
-            if h.is_invalid() {
-                return Probe::Missing;
-            }
-            let mut owner = 0u32;
-            GetWindowThreadProcessId(h, Some(&mut owner));
-            if owner == pid {
-                let mut out = 0usize;
-                let r = SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000, Some(&mut out));
-                return if r.0 != 0 { Probe::Answered } else { Probe::NoAnswer };
-            }
-            after = Some(h);
         }
     }
 }
@@ -257,34 +247,81 @@ pub fn explorer_path() -> PathBuf {
     windir.join("explorer.exe")
 }
 
-/// Keeps a plain explorer.exe running as the shell for the rest of the session, restarting it when it
-/// ends (at most 5 times in 5 minutes). `notice`, once explorer runs, tells the user why.
+/// Keeps a plain explorer.exe as the shell for the rest of the session: started (or an explorer
+/// whose taskbar already answers, adopted), confirmed by its answering taskbar, restarted when it
+/// ends, hangs before its taskbar comes or fails to start, at most 5 times in 5 minutes. `notice`
+/// shows once that taskbar answers; when it never does, the user is told how to start it by hand.
 fn explorer_forever(notice: Option<Notice>) -> u32 {
     folders::handler(false);
     let mut notice = notice;
     let path = explorer_path();
     let mut starts: Vec<Instant> = Vec::new();
+    let mut told = false;
     loop {
-        let now = Instant::now();
-        starts.retain(|t| now.duration_since(*t) < Duration::from_secs(300));
-        if starts.len() >= 5 {
-            log::line("explorer ended 5 times in 5 minutes: guard stops restarting it");
-            return 1;
-        }
-        starts.push(now);
-        let child = match Child::spawn(&path, "") {
-            Ok(c) => c,
-            Err(e) => {
-                log::line(&format!("explorer: {e}"));
-                return 1;
+        let pid = match taskbar::explorer() {
+            Some(pid) => {
+                log::line(&format!("explorer pid {pid} already owns the taskbar"));
+                pid
+            }
+            None => {
+                let now = Instant::now();
+                starts.retain(|t| now.duration_since(*t) < Duration::from_secs(300));
+                if starts.len() >= 5 {
+                    log::line("explorer did not come up 5 times in 5 minutes: telling the user, next try in 1 minute");
+                    if !told {
+                        told = true;
+                        notice::show_later(Notice::NoShell);
+                    }
+                    starts.clear();
+                    std::thread::sleep(Duration::from_secs(60));
+                    continue;
+                }
+                starts.push(now);
+                let Some(child) = spawn_explorer(&path) else { continue };
+                let t0 = Instant::now();
+                match taskbar::wait_explorer(&child, Duration::from_secs(60)) {
+                    Start::Up(pid) => {
+                        log::line(&format!("explorer taskbar answers (pid {pid}, started pid {}) after {} ms", child.pid, t0.elapsed().as_millis()));
+                        pid
+                    }
+                    Start::Exited(code) => {
+                        log::line(&format!("explorer pid {} ended before its taskbar came, code {code:#x}", child.pid));
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                    Start::Timeout => {
+                        log::line(&format!("explorer pid {} has no taskbar after 60 s: restarting it", child.pid));
+                        child.kill();
+                        continue;
+                    }
+                }
             }
         };
-        log::line(&format!("started explorer pid {}", child.pid));
         if let Some(n) = notice.take() {
             notice::show_later(n);
         }
-        wait_any(&[child.handle], None);
-        log::line(&format!("explorer pid {} ended, code {:#x}", child.pid, child.exit_code()));
+        match Child::open(pid) {
+            Ok(shell) => {
+                wait_any(&[shell.handle], None);
+                log::line(&format!("explorer pid {pid} ended, code {:#x}", shell.exit_code()));
+            }
+            Err(e) => log::line(&format!("explorer pid {pid}: {e}")),
+        }
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+/// Starts explorer.exe, three tries 2 s apart.
+fn spawn_explorer(path: &Path) -> Option<Child> {
+    for i in 1..=3 {
+        match Child::spawn(path, "") {
+            Ok(c) => {
+                log::line(&format!("started explorer pid {}", c.pid));
+                return Some(c);
+            }
+            Err(e) => log::line(&format!("explorer start {i}/3: {e}")),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    None
 }

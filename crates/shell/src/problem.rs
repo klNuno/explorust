@@ -22,6 +22,12 @@ pub fn report(why: String) {
     }
 }
 
+/// True once a problem was reported (not yet taken).
+#[cfg(target_os = "windows")]
+pub fn pending() -> bool {
+    FIRST.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
 /// The problem to stop on, written for the guard.
 #[cfg(target_os = "windows")]
 pub fn take() -> Option<String> {
@@ -34,28 +40,32 @@ pub fn take() -> Option<String> {
 }
 
 /// The part watchdog: every `PROBE`, each part's command window must answer a WM_NULL within 2 s;
-/// one that has not answered for `HUNG_FOR` is a problem. A part not running (off, or between two
-/// starts) is skipped.
+/// one that has not answered (or has had no window) for `HUNG_FOR` of wall time, over at least
+/// `MIN_MISSES` probes in a row, is a problem.
 pub const PROBE: Duration = Duration::from_secs(5);
 pub const HUNG_FOR: Duration = Duration::from_secs(20);
+const MIN_MISSES: u32 = 4;
 
-/// Counts unanswered probes in a row per part.
+/// Per part: when its run of unanswered probes began and how long it is.
 pub struct Hung {
-    misses: Vec<u32>,
+    since: Vec<Option<(Duration, u32)>>,
 }
 
 impl Hung {
     pub fn new(parts: usize) -> Hung {
-        Hung { misses: vec![0; parts] }
+        Hung { since: vec![None; parts] }
     }
 
-    /// `answered`: None when the part has no window. Returns true when part `i` is hung.
-    pub fn probe(&mut self, i: usize, answered: Option<bool>) -> bool {
-        match answered {
-            Some(false) => self.misses[i] += 1,
-            _ => self.misses[i] = 0,
+    /// `answered`: whether part `i` answered at `now` (time since the watchdog started). Returns
+    /// true when it is hung.
+    pub fn probe(&mut self, i: usize, answered: bool, now: Duration) -> bool {
+        if answered {
+            self.since[i] = None;
+            return false;
         }
-        self.misses[i] >= (HUNG_FOR.as_secs() / PROBE.as_secs()) as u32
+        let (start, misses) = self.since[i].get_or_insert((now, 0));
+        *misses += 1;
+        now.saturating_sub(*start) >= HUNG_FOR && *misses >= MIN_MISSES
     }
 }
 
@@ -63,26 +73,36 @@ impl Hung {
 mod tests {
     use super::*;
 
-    #[test]
-    fn four_misses_in_a_row_is_hung() {
-        let mut h = Hung::new(2);
-        for _ in 0..3 {
-            assert!(!h.probe(0, Some(false)));
-        }
-        assert!(!h.probe(1, Some(false)));
-        assert!(h.probe(0, Some(false)));
+    fn at(s: u64) -> Duration {
+        Duration::from_secs(s)
     }
 
     #[test]
-    fn an_answer_or_no_window_resets() {
+    fn silent_for_20_s_over_4_probes_is_hung() {
+        let mut h = Hung::new(2);
+        assert!(!h.probe(0, false, at(0)));
+        assert!(!h.probe(0, false, at(7)));
+        assert!(!h.probe(1, false, at(7)));
+        assert!(!h.probe(0, false, at(14)));
+        assert!(h.probe(0, false, at(21)));
+    }
+
+    #[test]
+    fn an_answer_resets() {
         let mut h = Hung::new(1);
-        for _ in 0..3 {
-            h.probe(0, Some(false));
+        for s in [0, 7, 14] {
+            h.probe(0, false, at(s));
         }
-        assert!(!h.probe(0, None));
-        for _ in 0..3 {
-            assert!(!h.probe(0, Some(false)));
-        }
-        assert!(!h.probe(0, Some(true)));
+        assert!(!h.probe(0, true, at(21)));
+        assert!(!h.probe(0, false, at(28)));
+        assert!(!h.probe(0, false, at(35)));
+    }
+
+    #[test]
+    fn few_slow_probes_are_not_enough() {
+        // Two misses 30 s apart (a long sleep of the watchdog itself) are not four in a row.
+        let mut h = Hung::new(1);
+        assert!(!h.probe(0, false, at(0)));
+        assert!(!h.probe(0, false, at(30)));
     }
 }

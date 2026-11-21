@@ -58,8 +58,9 @@ fn make_link(path: &Path, target: &Path, args: &str, description: &str) -> Resul
     }
 }
 
-/// Writes the Apps entry and the Start menu shortcuts for the installed guard.
-pub fn register(guard: &Path) -> String {
+/// Writes the Apps entry and the Start menu shortcuts for the installed guard. Err when the Apps
+/// entry, the way back every user can find, could not be written; a missing shortcut only warns.
+pub fn register(guard: &Path) -> Result<String, String> {
     let dir = guard.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let g = guard.display().to_string();
     let size_kb = std::fs::read_dir(&dir)
@@ -101,7 +102,7 @@ pub fn register(guard: &Path) -> String {
     }
     let r = format!(
         "apps entry {}, {made} Start menu shortcuts in {}{}",
-        match entry {
+        match &entry {
             Ok(()) => "written".to_string(),
             Err(e) => format!("failed ({e})"),
         },
@@ -109,15 +110,15 @@ pub fn register(guard: &Path) -> String {
         if errors.is_empty() { String::new() } else { format!(" ({})", errors.join("; ")) }
     );
     log::line(&format!("install: {r}"));
-    r
+    entry.map(|()| r)
 }
 
-/// Removes the Apps entry and the Start menu folder.
-pub fn unregister() -> String {
+/// Removes the Apps entry and the Start menu folder; Err when the entry stays.
+pub fn unregister() -> Result<String, String> {
     let entry = match reg::delete_uninstall_entry() {
         Ok(true) => "removed".to_string(),
         Ok(false) => "absent".to_string(),
-        Err(e) => e,
+        Err(e) => return Err(e),
     };
     let folder = programs();
     let links = match std::fs::remove_dir_all(&folder) {
@@ -125,5 +126,5 @@ pub fn unregister() -> String {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => "absent".to_string(),
         Err(e) => format!("{e}"),
     };
-    format!("apps entry {entry}, Start menu shortcuts {links}")
+    Ok(format!("apps entry {entry}, Start menu shortcuts {links}"))
 }

@@ -2,10 +2,10 @@
 
 use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegDeleteKeyValueW,
-    RegDeleteTreeW, RegGetValueW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+    RegCloseKey, RegDeleteKeyValueW, RegDeleteTreeW, RegEnumValueW, RegGetValueW, RegOpenKeyExW, RegSetKeyValueW,
 };
-use windows::core::HSTRING;
+use windows::core::{HSTRING, PWSTR};
 
 const WINLOGON: &str = r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon";
 const STATE: &str = r"Software\explorust";
@@ -94,6 +94,17 @@ pub fn set_last_good_build(build: &str) -> Result<(), String> {
     set_sz(HKEY_CURRENT_USER, STATE, "LastGoodBuild", build)
 }
 
+/// True when the previous logon of this user ended in a problem (`supervise` keeps it per logon).
+pub fn last_logon_had_problem() -> bool {
+    get_dword(HKEY_CURRENT_USER, STATE, "LastLogonProblem").unwrap_or(0) != 0
+}
+
+pub fn set_logon_had_problem(yes: bool) {
+    if let Err(e) = set_dword(HKEY_CURRENT_USER, STATE, "LastLogonProblem", yes as u32) {
+        crate::log::line(&format!("logon problem flag: {e}"));
+    }
+}
+
 /// Logons in a row that ended in a problem (`policy::MAX_STREAK` turns explorust off).
 pub fn problem_streak() -> u32 {
     get_dword(HKEY_CURRENT_USER, STATE, "ProblemStreak").unwrap_or(0)
@@ -130,4 +141,74 @@ pub fn delete_uninstall_entry() -> Result<bool, String> {
 
 pub fn has_uninstall_entry() -> bool {
     get_sz(HKEY_LOCAL_MACHINE, UNINSTALL, "UninstallString").is_some()
+}
+
+/// The accounts that turned explorust on, one value per SID under HKLM (elevated only): an
+/// uninstall by one of them keeps the shared files while another still has its `Shell` value.
+const MACHINE: &str = r"SOFTWARE\explorust";
+const MACHINE_USERS: &str = r"SOFTWARE\explorust\Users";
+
+pub fn add_machine_user(sid: &str) -> Result<(), String> {
+    set_dword(HKEY_LOCAL_MACHINE, MACHINE_USERS, sid, 1)
+}
+
+pub fn remove_machine_user(sid: &str) -> Result<bool, String> {
+    delete(HKEY_LOCAL_MACHINE, MACHINE_USERS, sid)
+}
+
+pub fn machine_users() -> Vec<String> {
+    let mut out = Vec::new();
+    let mut key = HKEY::default();
+    // SAFETY: the key is opened for reading and closed; each name buffer has the length given.
+    unsafe {
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, &HSTRING::from(MACHINE_USERS), None, KEY_READ, &mut key).is_err() {
+            return out;
+        }
+        for i in 0.. {
+            let mut name = vec![0u16; 256];
+            let mut len = name.len() as u32;
+            if RegEnumValueW(key, i, Some(PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None).is_err() {
+                break;
+            }
+            out.push(String::from_utf16_lossy(&name[..len as usize]));
+        }
+        let _ = RegCloseKey(key);
+    }
+    out
+}
+
+/// The `Shell` value of another account: None when its registry hive is not loaded (signed out),
+/// Some(None) when loaded without the value.
+pub fn user_shell(sid: &str) -> Option<Option<String>> {
+    let mut key = HKEY::default();
+    // SAFETY: opened for reading and closed.
+    unsafe {
+        if RegOpenKeyExW(HKEY_USERS, &HSTRING::from(sid), None, KEY_READ, &mut key).is_err() {
+            return None;
+        }
+        let _ = RegCloseKey(key);
+    }
+    Some(get_sz(HKEY_USERS, &format!(r"{sid}\{WINLOGON}"), "Shell"))
+}
+
+/// Removes the machine-wide state key (the users list) once nothing is installed.
+pub fn delete_machine_state() {
+    let key = HSTRING::from(MACHINE);
+    // SAFETY: deletes a key this program created.
+    let _ = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, &key) };
+}
+
+/// True when the account still has a profile on this computer (a deleted account's SID stays in
+/// the users list otherwise and would keep the shared files forever).
+pub fn profile_exists(sid: &str) -> bool {
+    let path = HSTRING::from(format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}"));
+    let mut key = HKEY::default();
+    // SAFETY: opened for reading and closed.
+    unsafe {
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, &path, None, KEY_READ, &mut key).is_err() {
+            return false;
+        }
+        let _ = RegCloseKey(key);
+    }
+    true
 }

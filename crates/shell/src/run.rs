@@ -14,6 +14,8 @@ pub const SELF_TEST_FAILED: i32 = 4;
 pub const RELOAD: i32 = 5;
 /// A problem found inside (`problem`): the guard starts explorer.exe and tells the user.
 pub const PROBLEM: i32 = 6;
+/// How long the parts get to show their command windows before the shell says it is ready.
+const PARTS_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long the host gets to publish the shell window and start the controller. A first run on a
 /// new Windows build downloads twinui's PDB (tens of MB) before it is ready.
@@ -119,11 +121,15 @@ fn shell(args: &Args) -> i32 {
     actions::spawn();
     keyhost::start();
     components::spawn_all();
-    components::spawn_watchdog();
+    // Ready only once every part is up: a part that cannot start is a problem now, not later.
+    match components::wait_ready(PARTS_READY_TIMEOUT) {
+        Ok(()) => components::spawn_watchdog(),
+        Err(why) => problem::report(why),
+    }
     if let Some(pid) = args.guard {
         guardwatch::spawn(pid);
     }
-    if let Some(name) = &args.ready_event {
+    if let Some(name) = args.ready_event.as_ref().filter(|_| !problem::pending()) {
         if let Err(e) = events::set_existing(name) {
             log::line(&format!("ready event: {e}"));
         }
@@ -149,7 +155,12 @@ fn shell(args: &Args) -> i32 {
             minimized::restore();
             return PROBLEM;
         }
-        if done_rx.try_recv().is_ok() {
+        // The host thread ended, or panicked (its sender dropped): the UWP frames are gone.
+        if !matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+            log::line("uwp host thread ended: stopping");
+            keyhost::stop();
+            components::shutdown_all();
+            minimized::restore();
             return HOST_FAILED;
         }
     }

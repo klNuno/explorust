@@ -10,16 +10,21 @@ use std::time::Duration;
 pub enum Notice {
     /// A problem in this session; the reason, in English, goes behind "Details".
     Problem(String),
-    /// Problems at `policy::MAX_STREAK` logons in a row: explorust has been turned off.
-    TurnedOff,
+    /// explorust has been turned off (the Shell value is gone): problems at `policy::MAX_STREAK`
+    /// logons in a row, or its files are missing. The reason goes behind "Details".
+    TurnedOff(String),
+    /// explorer's taskbar did not come up either: how to start it by hand.
+    NoShell,
 }
 
 const RETRY: i32 = 100;
 const UNINSTALL: i32 = 101;
 
+/// Shown on its own thread a moment after explorer's taskbar answers, so the dialog sits over a
+/// painted desktop.
 pub fn show_later(n: Notice) {
     let _ = std::thread::Builder::new().name("notice".into()).spawn(move || {
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(Duration::from_secs(1));
         show(n);
     });
 }
@@ -56,17 +61,30 @@ fn show(n: Notice) {
                 crate::uninstall::start_detached();
             }
         }
-        Notice::TurnedOff => {
+        Notice::TurnedOff(why) => {
+            let details = format!("{why}\n\n{}: {}", tr("Journal", "Log"), log_path());
             ui::tell(
                 Icon::Warning,
                 tr("explorust est désactivé", "explorust is turned off"),
                 tr(
-                    "Il a eu un problème trois fois de suite, alors Windows est revenu pour de bon. Pour le réessayer, relancez l'installation. Pour le supprimer : Paramètres > Applications > explorust > Désinstaller.",
-                    "It ran into a problem three times in a row, so Windows is back for good. To try it again, run the installer again. To remove it: Settings > Apps > explorust > Uninstall.",
+                    "Il ne pouvait plus démarrer correctement, alors Windows est revenu pour de bon. Pour le réessayer, relancez l'installation. Pour le supprimer : Paramètres > Applications > explorust > Désinstaller.",
+                    "It could no longer start properly, so Windows is back for good. To try it again, run the installer again. To remove it: Settings > Apps > explorust > Uninstall.",
+                ),
+                Some(&details),
+            );
+            log::line("notice: turned off shown");
+        }
+        Notice::NoShell => {
+            ui::tell(
+                Icon::Warning,
+                tr("La barre des tâches de Windows ne démarre pas", "The Windows taskbar does not start"),
+                tr(
+                    "Appuyez sur Ctrl+Maj+Échap, puis Exécuter une nouvelle tâche, tapez explorer.exe et validez. Si rien ne change, fermez la session et rouvrez-la.",
+                    "Press Ctrl+Shift+Esc, then Run new task, type explorer.exe and press Enter. If nothing changes, sign out and sign in again.",
                 ),
                 Some(&log_path()),
             );
-            log::line("notice: turned off shown");
+            log::line("notice: no shell shown");
         }
     }
 }

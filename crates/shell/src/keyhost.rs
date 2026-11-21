@@ -1,9 +1,9 @@
 //! Where the keyboard hook (`crates/keys`) runs. Installed in Program Files, explorust starts
 //! `explorust-keys.exe` beside it through ShellExecuteEx (the AppInfo service gives that signed
 //! exe UI access, so keys reach it over elevated windows), restarts it when it dies and stops it on
-//! quit and reload; explorust itself keeps a plain token, and so does every app it starts. In a dev
-//! build outside Program Files, or when the exe cannot be kept running, the same hook runs in this
-//! process.
+//! quit and reload; explorust itself keeps a plain token, and so does every app it starts. Installed,
+//! a helper that is missing, refused or dying again and again is a problem (the guard hands the
+//! session to explorer). In a dev build outside Program Files the same hook runs in this process.
 
 use crate::log;
 use std::path::{Path, PathBuf};
@@ -26,13 +26,19 @@ const DEATH_WINDOW: Duration = Duration::from_secs(60);
 static STATE: Mutex<(isize, isize)> = Mutex::new((0, 0));
 
 /// Starts the hook: in `explorust-keys.exe` when explorust runs installed, else in-process.
+/// Installed, a helper that is missing or refused by Windows is a problem: the in-process hook
+/// would quietly lose the keys over elevated windows.
 pub fn start() {
-    match installed_exe() {
-        Some(exe) => {
+    match installed_dir() {
+        Some(dir) => {
+            let exe = dir.join(EXE);
+            if !exe.exists() {
+                crate::problem::report(format!("the keyboard helper {} is missing", exe.display()));
+                return;
+            }
             let spawned = std::thread::Builder::new().name("keys-host".into()).spawn(move || supervise(&exe));
             if let Err(e) = spawned {
-                log::line(&format!("keys host thread: {e}"));
-                in_process();
+                crate::problem::report(format!("the keyboard helper thread did not start: {e}"));
             }
         }
         None => in_process(),
@@ -61,10 +67,9 @@ fn in_process() {
     }
 }
 
-/// `explorust-keys.exe` beside this exe when it runs from Program Files.
-fn installed_exe() -> Option<PathBuf> {
+/// This exe's folder when it runs from Program Files (an install), None for a dev build.
+fn installed_dir() -> Option<PathBuf> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let exe = dir.join(EXE);
     let under = |var: &str| {
         std::env::var_os(var).is_some_and(|base| {
             let base = base.to_string_lossy().to_lowercase();
@@ -72,7 +77,7 @@ fn installed_exe() -> Option<PathBuf> {
             dir.starts_with(base.trim_end_matches('\\'))
         })
     };
-    (exe.exists() && (under("ProgramW6432") || under("ProgramFiles"))).then_some(exe)
+    (under("ProgramW6432") || under("ProgramFiles")).then_some(dir)
 }
 
 fn supervise(exe: &Path) {
@@ -83,8 +88,8 @@ fn supervise(exe: &Path) {
     let quit = match unsafe { CreateEventW(None, true, false, &name) } {
         Ok(h) => h,
         Err(e) => {
-            log::line(&format!("keys quit event: {e}"));
-            return in_process();
+            crate::problem::report(format!("the keyboard helper's quit event: {e}"));
+            return;
         }
     };
     STATE.lock().unwrap_or_else(|e| e.into_inner()).0 = quit.0 as isize;
@@ -93,8 +98,8 @@ fn supervise(exe: &Path) {
         let child = match launch(exe) {
             Ok(h) => h,
             Err(e) => {
-                log::line(&format!("{e}: hotkeys in-process instead"));
-                return in_process();
+                crate::problem::report(format!("the keyboard helper did not start: {e}"));
+                return;
             }
         };
         STATE.lock().unwrap_or_else(|e| e.into_inner()).1 = child.0 as isize;

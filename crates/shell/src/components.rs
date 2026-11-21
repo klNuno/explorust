@@ -5,7 +5,11 @@
 //! styles other apps, so its crashes stay a log line (at most 3 restarts in 5 minutes).
 
 use crate::{log, problem};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Set by `shutdown_all`: a part that returns after it was asked to close is not a problem.
+static STOPPING: AtomicBool = AtomicBool::new(false);
 
 const PARTS: [(bus::Owner, fn()); 6] = [
     (bus::Owner::Taskbar, taskbar::run),
@@ -48,7 +52,7 @@ pub fn spawn_all() {
         }
         let spawned = std::thread::Builder::new().name(name.into()).spawn(move || supervise(name, run, true));
         if let Err(e) = spawned {
-            log::line(&format!("{name}: thread not started: {e}"));
+            problem::report(format!("the {name} part did not start: {e}"));
         }
     }
     // The injector has no bus owner: it answers no hotkey, only window shows of other apps.
@@ -67,7 +71,12 @@ fn supervise(name: &str, run: fn(), critical: bool) {
     let max = if critical { MAX_CRASHES } else { INJECT_MAX_CRASHES };
     loop {
         match std::panic::catch_unwind(run) {
-            Ok(()) => return,
+            Ok(()) => {
+                if critical && !STOPPING.load(Ordering::SeqCst) {
+                    problem::report(format!("the {name} part stopped on its own"));
+                }
+                return;
+            }
             Err(_) => {
                 let now = Instant::now();
                 crashes.retain(|t| now.duration_since(*t) < CRASH_WINDOW);
@@ -86,22 +95,62 @@ fn supervise(name: &str, run: fn(), critical: bool) {
     }
 }
 
+/// The running parts (not off in parts-off.txt) and whether one of their command windows exists in
+/// this process: a stand-in dev exe of the same part in the session is not ours to probe.
+fn enabled() -> Vec<(usize, bus::Owner)> {
+    let off = parts_off();
+    PARTS.iter().enumerate().filter(|(_, (o, _))| !off.iter().any(|n| n == o.name())).map(|(i, (o, _))| (i, *o)).collect()
+}
+
+fn own_window(owner: bus::Owner) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let h = bus::target(owner)?;
+    let mut pid = 0u32;
+    // SAFETY: a lookup on a window that may be gone (pid stays 0).
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    (pid == std::process::id()).then_some(h)
+}
+
+/// Waits until every running part has its command window, at most `limit`. A part that did not
+/// come up is a problem before the shell says it is ready, so the guard never trusts a half shell.
+pub fn wait_ready(limit: Duration) -> Result<(), String> {
+    let t0 = Instant::now();
+    let parts = enabled();
+    loop {
+        let missing: Vec<&str> = parts.iter().filter(|(_, o)| own_window(*o).is_none()).map(|(_, o)| o.name()).collect();
+        if missing.is_empty() {
+            log::line(&format!("parts ready in {} ms", t0.elapsed().as_millis()));
+            return Ok(());
+        }
+        if t0.elapsed() >= limit {
+            return Err(format!("the {} part did not start within {} s", missing.join(", "), limit.as_secs()));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Every `problem::PROBE`, each running part's command window must answer within 2 s; one silent
-/// for `problem::HUNG_FOR` is a problem. Parts off in parts-off.txt have no window and are skipped.
+/// for `problem::HUNG_FOR` is a problem, and so is a part whose window is gone that long. Parts off
+/// in parts-off.txt are skipped.
 pub fn spawn_watchdog() {
     let _ = std::thread::Builder::new().name("watchdog".into()).spawn(|| {
         use windows::Win32::Foundation::{LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL};
+        let parts = enabled();
         let mut hung = problem::Hung::new(PARTS.len());
+        let t0 = Instant::now();
         loop {
             std::thread::sleep(problem::PROBE);
-            for (i, (owner, _)) in PARTS.iter().enumerate() {
-                let answered = bus::target(*owner).map(|h| {
+            if STOPPING.load(Ordering::SeqCst) {
+                return;
+            }
+            for (i, owner) in &parts {
+                let answered = own_window(*owner).is_some_and(|h| {
                     let mut out = 0usize;
                     // SAFETY: a bounded send to a window that may be gone (then it fails).
                     unsafe { SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000, Some(&mut out)) }.0 != 0
                 });
-                if hung.probe(i, answered) {
+                if hung.probe(*i, answered, t0.elapsed()) {
                     problem::report(format!("the {} part has not answered for {} s", owner.name(), problem::HUNG_FOR.as_secs()));
                     return;
                 }
@@ -112,6 +161,7 @@ pub fn spawn_watchdog() {
 
 /// Asks every part to close its windows, and gives them a moment to do it.
 pub fn shutdown_all() {
+    STOPPING.store(true, Ordering::SeqCst);
     explorust_inject::shutdown();
     let mut asked = 0;
     for (owner, _) in PARTS {

@@ -1,11 +1,13 @@
 //! `--uninstall`: the way back for anyone, from Settings > Apps, the Start menu shortcut or the
-//! problem notice. Not elevated, it asks Windows for the right (UAC) and runs itself again; refused,
-//! it still turns explorust off for this user (the Shell value) and brings explorer back now, and
-//! says the files stay until an uninstall with permission. `--yes` skips the question, `--quiet`
+//! problem notice. In the user's own process it first turns explorust off for this user (the Shell
+//! value) and brings explorer back, and only then asks Windows for the right (UAC) to remove the
+//! shared files (`--uninstall --machine`, `manage::restore_machine`). Refused, explorust stays off
+//! and the files stay until an uninstall with permission. `--yes` skips the question, `--quiet`
 //! shows nothing (Apps' QuietUninstallString).
 
+use crate::manage::{self, BUSY, FAILED, KEPT, OTHER_ACCOUNT};
 use crate::ui::{self, Icon, tr};
-use crate::{apps, install, log, reg, supervise};
+use crate::{account, install, log};
 use std::os::windows::process::CommandExt;
 use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED};
 use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
@@ -53,79 +55,171 @@ pub fn elevated_again(args: &str) -> Result<u32, bool> {
     }
 }
 
-pub fn run(yes: bool, quiet: bool) -> u32 {
+/// The elevated half: no dialog, the exit code tells the user's process what happened.
+pub fn machine(session_sid: Option<&str>) -> u32 {
     if !install::elevated() {
-        // The question is asked here, before Windows' own, and not again by the elevated run.
-        let mut args = String::from("--uninstall");
-        if !yes && !quiet && !confirm() {
-            log::line("uninstall: cancelled by the user");
-            return 1;
+        log::line("uninstall --machine: not elevated");
+        return FAILED;
+    }
+    match manage::restore_machine(session_sid) {
+        Ok(true) => 0,
+        Ok(false) => KEPT,
+        Err(e) if e.contains("another explorust install") => {
+            log::line(&format!("uninstall: {e}"));
+            BUSY
         }
-        args.push_str(if quiet { " --quiet" } else { " --yes" });
-        return match elevated_again(&args) {
-            Ok(code) => code,
-            Err(refused) => {
-                // No permission: this user's Shell value goes and explorer comes back now; the
-                // files and the machine-wide parts stay until an uninstall with permission.
-                let gone = reg::delete_shell();
-                let _ = crate::proc::Event::set_existing(supervise::FALLBACK_EVENT);
-                reg::set_problem_streak(0);
-                log::line(&format!("uninstall: not elevated (refused: {refused}), Shell value deleted: {gone:?}"));
-                if !quiet {
-                    ui::tell(
-                        Icon::Info,
-                        tr("explorust est désactivé", "explorust is turned off"),
-                        tr(
-                            "Windows est revenu et explorust ne se lancera plus. Ses fichiers restent sur l'ordinateur : pour les supprimer, Paramètres > Applications > explorust > Désinstaller, et acceptez la demande de Windows.",
-                            "Windows is back and explorust will not run again. Its files stay on the computer: to remove them, Settings > Apps > explorust > Uninstall, and accept Windows' request.",
-                        ),
-                        None,
-                    );
-                }
-                0
-            }
-        };
+        Err(e) => {
+            log::line(&format!("uninstall failed: {e}"));
+            FAILED
+        }
+    }
+}
+
+/// What the machine half gave.
+enum Machine {
+    Code(u32),
+    Refused,
+}
+
+pub fn run(yes: bool, quiet: bool) -> u32 {
+    if install::elevated() && !account::is_session_user() {
+        // This process's HKCU is another account's: the user's Shell value is out of reach here.
+        log::line("uninstall: elevated as another account");
+        if !quiet {
+            ui::tell(
+                Icon::Warning,
+                tr("Lancez la désinstallation depuis votre session", "Run the uninstall from your own account"),
+                tr(
+                    "Cette fenêtre tourne avec un autre compte. Ouvrez Paramètres > Applications > explorust > Désinstaller depuis votre propre session.",
+                    "This window runs as another account. Open Settings > Apps > explorust > Uninstall from your own account.",
+                ),
+                None,
+            );
+        }
+        return OTHER_ACCOUNT;
     }
     if !yes && !quiet && !confirm() {
         log::line("uninstall: cancelled by the user");
         return 1;
     }
-    let code = if quiet {
-        crate::restore()
+    let steps = || {
+        let user = manage::restore_user();
+        if user.is_err() {
+            return (user, Err("not tried".to_string()), Machine::Code(FAILED));
+        }
+        let back = manage::bring_back_explorer();
+        let machine = if install::elevated() {
+            Machine::Code(machine(account::own_sid().as_deref()))
+        } else {
+            let mut args = String::from("--uninstall --machine");
+            if let Some(sid) = account::own_sid() {
+                args.push_str(&format!(" --for {sid}"));
+            }
+            match elevated_again(&args) {
+                Ok(code) => Machine::Code(code),
+                Err(refused) => {
+                    log::line(&format!("uninstall: no permission for the files (refused: {refused})"));
+                    Machine::Refused
+                }
+            }
+        };
+        (user, back, machine)
+    };
+    let (user, back, machine) = if quiet {
+        steps()
     } else {
         ui::working(
             tr("Retour à Windows", "Going back to Windows"),
             tr("explorust se désinstalle, cela peut prendre une minute.", "explorust is being uninstalled, this can take a minute."),
-            crate::restore,
+            steps,
         )
     };
-    let apps = apps::unregister();
-    log::line(&format!("uninstall: {apps}"));
-    reg::set_problem_streak(0);
-    if !quiet {
-        if code == 0 {
-            ui::tell(
-                Icon::Info,
-                tr("C'est fait, Windows est revenu", "Done, Windows is back"),
-                tr(
-                    "explorust est désinstallé. La barre des tâches et l'Explorateur de Windows sont de retour. Les derniers fichiers seront effacés au prochain redémarrage.",
-                    "explorust is uninstalled. The Windows taskbar and File Explorer are back. The last files are deleted at the next restart.",
-                ),
-                None,
-            );
-        } else {
+    let log_path = log::dir().join("guard.log").display().to_string();
+    if let Err(e) = &user {
+        log::line(&format!("uninstall failed: {e}"));
+        if !quiet {
             ui::tell(
                 Icon::Warning,
-                tr("Désinstallation incomplète", "Uninstall incomplete"),
+                tr("explorust n'a pas pu être désactivé", "explorust could not be turned off"),
                 tr(
-                    "Windows est revenu, mais une étape a échoué. Le détail est dans le journal.",
-                    "Windows is back, but one step failed. The details are in the log.",
+                    "Rien n'a été supprimé. Réessayez, ou appuyez sur Ctrl+Alt+Maj+F12 pour revenir à Windows dans cette session.",
+                    "Nothing was removed. Try again, or press Ctrl+Alt+Shift+F12 to go back to Windows for this session.",
                 ),
-                Some(&log::dir().join("guard.log").display().to_string()),
+                Some(&format!("{e}\n\n{log_path}")),
             );
         }
+        return FAILED;
     }
-    code
+    let back_note = match &back {
+        Ok(_) => None,
+        Err(e) => Some(e.clone()),
+    };
+    log::line(&format!("uninstall: explorer {back:?}"));
+    let code = match machine {
+        Machine::Code(0) | Machine::Code(KEPT) => 0,
+        Machine::Code(c) => c,
+        Machine::Refused => FAILED,
+    };
+    if quiet {
+        return if back_note.is_some() { FAILED } else { code };
+    }
+    // A missing taskbar first: the user needs to know how to get it back.
+    let (icon, main, content): (Icon, &str, &str) = match (&machine, &back_note) {
+        (_, Some(_)) => (
+            Icon::Warning,
+            tr("explorust est désactivé, mais la barre des tâches n'est pas revenue", "explorust is turned off, but the taskbar did not come back"),
+            tr(
+                "Fermez la session et rouvrez-la : Windows démarrera normalement.",
+                "Sign out and sign in again: Windows will start normally.",
+            ),
+        ),
+        (Machine::Code(0), None) => (
+            Icon::Info,
+            tr("C'est fait, Windows est revenu", "Done, Windows is back"),
+            tr(
+                "explorust est désinstallé. La barre des tâches et l'Explorateur de Windows sont de retour. Les derniers fichiers seront effacés au prochain redémarrage.",
+                "explorust is uninstalled. The Windows taskbar and File Explorer are back. The last files are deleted at the next restart.",
+            ),
+        ),
+        (Machine::Code(KEPT), None) => (
+            Icon::Info,
+            tr("C'est fait, Windows est revenu", "Done, Windows is back"),
+            tr(
+                "explorust est désactivé pour vous. Un autre compte de cet ordinateur l'utilise encore, alors ses fichiers restent pour lui.",
+                "explorust is turned off for you. Another account on this computer still uses it, so its files stay for that account.",
+            ),
+        ),
+        (Machine::Refused, None) => (
+            Icon::Info,
+            tr("explorust est désactivé", "explorust is turned off"),
+            tr(
+                "Windows est revenu et explorust ne se lancera plus. Ses fichiers restent sur l'ordinateur : pour les supprimer, Paramètres > Applications > explorust > Désinstaller, et acceptez la demande de Windows.",
+                "Windows is back and explorust will not run again. Its files stay on the computer: to remove them, Settings > Apps > explorust > Uninstall, and accept Windows' request.",
+            ),
+        ),
+        (Machine::Code(BUSY), None) => (
+            Icon::Warning,
+            tr("explorust est désactivé, ses fichiers restent", "explorust is turned off, its files stay"),
+            tr(
+                "Une autre installation ou désinstallation était en cours. Relancez la désinstallation une fois qu'elle est finie.",
+                "Another install or uninstall was running. Run the uninstall again once it is done.",
+            ),
+        ),
+        (Machine::Code(_), None) => (
+            Icon::Warning,
+            tr("Désinstallation incomplète", "Uninstall incomplete"),
+            tr(
+                "Windows est revenu et explorust ne se lancera plus, mais la suppression de ses fichiers a échoué. Relancez la désinstallation, le détail est dans le journal.",
+                "Windows is back and explorust will not run again, but removing its files failed. Run the uninstall again; the details are in the log.",
+            ),
+        ),
+    };
+    let details = match &back_note {
+        Some(e) => format!("{e}\n\n{log_path}"),
+        None => log_path,
+    };
+    ui::tell(icon, main, content, Some(&details));
+    if back_note.is_some() { FAILED } else { code }
 }
 
 fn confirm() -> bool {
