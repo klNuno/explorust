@@ -63,10 +63,15 @@ pub fn probe(pid: u32) -> Probe {
 
 /// The pid of an explorer.exe whose taskbar answers, if any.
 pub fn explorer() -> Option<u32> {
+    explorer_except(None)
+}
+
+pub fn explorer_except(retiring: Option<u32>) -> Option<u32> {
     trays()
         .into_iter()
         .find(|(h, pid)| {
-            image_path(*pid).is_some_and(|path| path.rsplit('\\').next().is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe")))
+            retiring != Some(*pid)
+                && image_path(*pid).is_some_and(|path| path.rsplit('\\').next().is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe")))
                 && answers(*h, Duration::from_secs(2))
         })
         .map(|(_, pid)| pid)

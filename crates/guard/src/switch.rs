@@ -5,9 +5,9 @@ mod reopen_list;
 pub(crate) mod watcher;
 
 use crate::launch_timing::{self, FALLBACK_EVENT, build_verdict_event};
-use crate::proc::{Child, Event, wait_any};
+use crate::proc::{Child, Event};
 use crate::ui::{self, Icon, tr};
-use crate::{GUARD_MUTEX, account, install, log, manage, policy, reg, reopen, supervise, taskbar};
+use crate::{GUARD_MUTEX, account, install, log, policy, reg, reopen, supervise, taskbar};
 use std::path::Path;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ const VERDICT_LIMIT: Duration = Duration::from_secs(
         + launch_timing::VERDICT_BUDGET.as_secs()
         + 30,
 );
+const CANCEL_FOR_RESTORE: &str = r"Local\explorust-cancel-switch-for-restore";
 
 pub use explorer::can_launch_switch;
 
@@ -73,6 +74,7 @@ pub fn run_worker() -> u32 {
 enum Outcome {
     AlreadyRunning,
     Postponed,
+    CancelledForRestore,
     Running,
     Windows,
 }
@@ -80,6 +82,7 @@ enum Outcome {
 fn show(result: Result<Outcome, String>) -> u32 {
     let details = log::dir().join("guard.log").display().to_string();
     match result {
+        Ok(Outcome::CancelledForRestore) => {}
         Ok(Outcome::AlreadyRunning) => ui::tell(
             Icon::Info,
             tr("explorust est déjà lancé", "explorust is already running"),
@@ -162,16 +165,16 @@ fn switch(
         .ok_or("could not identify this guard for the Files handoff")?;
     let (mut watcher, previous) = loop {
         wait_for_file_operations(tray, pid, cancel)?;
-        if cancel.requested() {
-            return Ok(postponed());
+        if cancel_requested(cancel) {
+            return Ok(cancelled());
         }
         let Some(watcher) = watcher::Watcher::prepare(guard, stamp, tray, pid, cancel)? else {
-            return Ok(postponed());
+            return Ok(cancelled());
         };
         // Just collect the legacy guard's handle. The previous guard still watches Explorer
         // throughout the cancellable preparation, including if a new file operation starts.
         let previous = previous_guard(pid, guard)?;
-        if !explorer::file_operations() && cancel.commit() {
+        if !explorer::file_operations() && !cancel_requested(cancel) && cancel.commit() {
             break (watcher, previous);
         }
     };
@@ -199,16 +202,7 @@ fn switch(
             log::line(&format!("switch: {e}"));
             if let Err(e) = watcher.restore() {
                 log::line(&format!("switch: {e}; restoring Windows directly"));
-                if watcher.exit_requested() {
-                    // Exit Explorer may still be in flight. Wait before checking whether the
-                    // taskbar answers, so a retiring Explorer does not look like a recovery.
-                    let _ = wait_any(
-                        &[explorer_process.handle],
-                        Some(explorer::EXIT_BUDGET.as_millis() as u32),
-                    );
-                }
-                let status = manage::bring_back_explorer()?;
-                log::line(&format!("switch: guard restored Windows: {status}"));
+                watcher.recover(exe, &explorer_process)?;
             }
             Ok(Outcome::Windows)
         }
@@ -220,9 +214,29 @@ fn postponed() -> Outcome {
     Outcome::Postponed
 }
 
+fn cancel_requested(cancel: &ui::Cancel) -> bool {
+    cancel.requested() || Event::is_signalled(CANCEL_FOR_RESTORE)
+}
+
+fn cancelled() -> Outcome {
+    if Event::is_signalled(CANCEL_FOR_RESTORE) {
+        log::line("switch: cancelled because explorust is being turned off");
+        Outcome::CancelledForRestore
+    } else {
+        postponed()
+    }
+}
+
+/// Cancel a preparation or wait out a committed handoff before deleting this user's Shell value.
+pub fn lock_for_restore() -> Result<install::Lock, String> {
+    let cancel = Event::named(CANCEL_FOR_RESTORE)?;
+    cancel.signal()?;
+    install::lock_for(240_000)
+}
+
 fn wait_for_file_operations(tray: HWND, pid: u32, cancel: &ui::Cancel) -> Result<(), String> {
     let mut waiting = false;
-    while !cancel.requested() {
+    while !cancel_requested(cancel) {
         if taskbar::explorer_window() != Some((tray, pid)) {
             return Err("Explorer's taskbar changed while waiting".into());
         }

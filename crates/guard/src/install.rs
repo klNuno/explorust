@@ -209,10 +209,14 @@ impl Drop for Lock {
 }
 
 pub fn lock() -> Result<Lock, String> {
+    lock_for(0)
+}
+
+pub fn lock_for(timeout_ms: u32) -> Result<Lock, String> {
     // SAFETY: a named mutex; the handle moves into the Lock.
     unsafe {
         let h = CreateMutexW(None, false, &HSTRING::from(r"Global\explorust-setup")).map_err(|e| format!("setup lock: {e}"))?;
-        let w = WaitForSingleObject(h, 0);
+        let w = WaitForSingleObject(h, timeout_ms);
         if w == WAIT_OBJECT_0 || w == WAIT_ABANDONED {
             Ok(Lock(h))
         } else {

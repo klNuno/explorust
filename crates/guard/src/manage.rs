@@ -129,7 +129,7 @@ fn undo_machine() {
 /// This user's half, in this user's own process: Ok once the Shell value is gone (or was never
 /// there); the rest only warns. The notification package goes later (`remove_package`), once
 /// explorer is back: its removal can take half a minute.
-pub fn restore_user() -> Result<String, String> {
+fn restore_user() -> Result<String, String> {
     let shell = reg::delete_shell().map_err(|e| format!("the Shell value stays: {e}"))?;
     folders::handler(false);
     folders::viewer(&install::dir(), false);
@@ -138,6 +138,21 @@ pub fn restore_user() -> Result<String, String> {
     let r = format!("Shell value {}", if shell { "deleted" } else { "absent" });
     say(&format!("restore: {r}"));
     Ok(r)
+}
+
+/// Serializes the user cleanup and return to Explorer with a live handoff.
+pub fn restore_session() -> (Result<String, String>, Result<String, String>) {
+    let _lock = match crate::switch::lock_for_restore() {
+        Ok(lock) => lock,
+        Err(e) => return (Err(e), Err("not tried".into())),
+    };
+    let user = restore_user();
+    let back = if user.is_ok() {
+        bring_back_explorer()
+    } else {
+        Err("not tried".into())
+    };
+    (user, back)
 }
 
 /// This user's notification helper package; a failure only warns (it does nothing without the
@@ -230,14 +245,13 @@ pub fn restore_machine(session_sid: Option<&str>) -> Result<bool, String> {
 /// the machine when elevated. 0 only when every step worked.
 pub fn restore() -> u32 {
     let mine = !install::elevated() || account::is_session_user();
-    let user = if mine { restore_user().map(|_| ()) } else { Ok(()) };
-    let back = bring_back_explorer();
+    let (user, back) = if mine { restore_session() } else { (Ok(String::new()), bring_back_explorer()) };
     // Only once the shell is off for good and explorer answers: the package is explorust's.
     if mine && user.is_ok() && back.is_ok() {
         remove_package();
     }
     let machine = match (&user, &back, install::elevated()) {
-        (Ok(()), Ok(_), true) => restore_machine(None).map(|_| ()),
+        (Ok(_), Ok(_), true) => restore_machine(None).map(|_| ()),
         (Err(_), _, true) => Err("files kept: the Shell value is still there".to_string()),
         (_, Err(_), true) => Err("files kept: explorer is not back yet; sign out and in, then run it again".to_string()),
         (_, _, false) => {
@@ -248,7 +262,7 @@ pub fn restore() -> u32 {
         }
     };
     let mut code = 0;
-    for (what, r) in [("user", user), ("explorer", back.clone().map(|_| ())), ("machine", machine)] {
+    for (what, r) in [("user", user.map(|_| ())), ("explorer", back.clone().map(|_| ())), ("machine", machine)] {
         if let Err(e) = r {
             say(&format!("restore failed ({what}): {e}"));
             code = FAILED;

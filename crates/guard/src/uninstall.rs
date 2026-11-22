@@ -103,11 +103,10 @@ pub fn run(yes: bool, quiet: bool) -> u32 {
         return 1;
     }
     let steps = || {
-        let user = manage::restore_user();
+        let (user, back) = manage::restore_session();
         if user.is_err() {
-            return (user, Err("not tried".to_string()), Machine::Code(FAILED));
+            return (user, back, Machine::Code(FAILED));
         }
-        let back = manage::bring_back_explorer();
         if back.is_ok() {
             manage::remove_package();
         }

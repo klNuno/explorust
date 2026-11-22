@@ -1,9 +1,9 @@
 //! Keep an independent process alive from Explorer preparation through the build verdict.
 
-use super::explorer;
+use super::{explorer, reopen_list};
 use crate::proc::{Child, Event, wait_any};
 use crate::{account, install, log, manage, reopen, taskbar};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
 
@@ -49,6 +49,7 @@ pub struct Watcher {
     signals: Signals,
     stamp: u64,
     committed: bool,
+    folders: Vec<(isize, String)>,
 }
 
 impl Watcher {
@@ -65,16 +66,25 @@ impl Watcher {
             std::process::id(),
             tray.0 as usize,
         );
-        let watcher = Self {
+        let mut watcher = Self {
             child: Child::spawn(guard, &args)?,
             signals,
             stamp,
             committed: false,
+            folders: Vec::new(),
         };
         let start = Instant::now();
-        while !cancel.requested() {
+        while !super::cancel_requested(cancel) {
             match wait_any(&[watcher.signals.prepared.0, watcher.child.handle], Some(100)) {
-                Some(0) if !watcher.child.ended() => return Ok(Some(watcher)),
+                Some(0) if !watcher.child.ended() => {
+                    let path = snapshot_path(stamp);
+                    let snapshot = std::fs::read_to_string(&path)
+                        .and_then(|contents| reopen_list::decode(&contents))
+                        .map_err(|e| format!("read Explorer recovery snapshot: {e}"))?;
+                    watcher.folders = snapshot;
+                    let _ = std::fs::remove_file(path);
+                    return Ok(Some(watcher));
+                }
                 Some(_) => return Err("Explorer folder preparation failed".into()),
                 None if start.elapsed() >= PREPARE_BUDGET => {
                     return Err("Explorer did not return its folder windows within 15 s".into());
@@ -109,9 +119,11 @@ impl Watcher {
 
     pub fn restore(&self) -> Result<(), String> {
         self.signals.rollback.signal()?;
-        if wait_any(&[self.child.handle], Some(75_000)).is_some()
-            && self.child.exit_code() == RESTORED
-        {
+        if wait_any(&[self.child.handle], Some(90_000)).is_none() {
+            self.child.kill();
+            return Err("the independent switch watcher timed out restoring Windows".into());
+        }
+        if self.child.exit_code() == RESTORED {
             Ok(())
         } else {
             Err("the independent switch watcher could not restore Windows".into())
@@ -120,6 +132,12 @@ impl Watcher {
 
     pub fn exit_requested(&self) -> bool {
         wait_any(&[self.signals.exiting.0], Some(0)).is_some()
+    }
+
+    pub fn recover(&self, exe: &Path, explorer: &Child) -> Result<(), String> {
+        clear_snapshot(self.stamp);
+        let retiring = self.exit_requested().then_some(explorer);
+        restore_desktop(exe, retiring, &self.folders)
     }
 }
 
@@ -133,6 +151,7 @@ impl Drop for Watcher {
             self.child.kill();
         }
         clear_snapshot(self.stamp);
+        let _ = std::fs::remove_file(snapshot_path(self.stamp));
         let _ = std::fs::remove_file(log::dir().join(format!("reopen-{}.tmp", self.child.pid)));
     }
 }
@@ -172,9 +191,13 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         return Err("Explorer changed before the switch was prepared".into());
     }
     let signals = Signals::open(stamp)?;
+    let retiring = Child::monitor(explorer_pid)?;
     log::line(&format!("switch: watcher reading Explorer folders for guard pid {owner}"));
     let folders = explorer::open_folders()?;
     let paths: Vec<_> = folders.iter().map(|(_, path)| path.clone()).collect();
+    let snapshot = snapshot_path(stamp);
+    std::fs::write(&snapshot, reopen_list::encode(&folders))
+        .map_err(|e| format!("save Explorer recovery snapshot: {e}"))?;
     reopen::save(&log::dir(), stamp, &paths).map_err(|e| format!("save Files handoff: {e}"))?;
     log::line(&format!(
         "switch: watcher ready for guard pid {owner}, saved {} Explorer folder windows",
@@ -183,6 +206,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
     signals.prepared.signal()?;
     if wait_any(&[owner_process.handle, signals.rollback.0, signals.exit.0], None) != Some(2) {
         clear_snapshot(stamp);
+        let _ = std::fs::remove_file(snapshot);
         return Ok(0);
     }
     // A file operation may have appeared between the owner's check and this process waking.
@@ -213,7 +237,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
     }
     drop(exiting);
     clear_snapshot(stamp);
-    restore_desktop(&installed.join("explorust.exe"), &folders)?;
+    restore_desktop(&installed.join("explorust.exe"), Some(&retiring), &folders)?;
     if owner_process.ended() {
         super::show(Ok(super::Outcome::Windows));
     }
@@ -224,7 +248,25 @@ fn clear_snapshot(stamp: u64) {
     let _ = reopen::take(&log::dir(), stamp);
 }
 
-fn restore_desktop(exe: &Path, folders: &[(isize, String)]) -> Result<(), String> {
+fn snapshot_path(stamp: u64) -> PathBuf {
+    log::dir().join(format!("switch-{stamp}.folders"))
+}
+
+fn restore_desktop(exe: &Path, retiring: Option<&Child>, folders: &[(isize, String)]) -> Result<(), String> {
+    if let Some(retiring) = retiring {
+        let deadline = Instant::now() + explorer::EXIT_BUDGET;
+        while !retiring.ended() {
+            if let Some(pid) = taskbar::explorer_except(Some(retiring.pid)) {
+                log::line(&format!("switch: replacement Explorer pid {pid} already answers"));
+                explorer::restore_folders(folders);
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("no replacement taskbar while Explorer pid {} retires", retiring.pid));
+            }
+            let _ = wait_any(&[retiring.handle], Some(200));
+        }
+    }
     // A running shell can adopt a new guard after the original guard dies. Give it time to
     // offer the normal fallback event before closing an orphaned switch shell ourselves.
     let installed = |pid| {
@@ -242,9 +284,10 @@ fn restore_desktop(exe: &Path, folders: &[(isize, String)]) -> Result<(), String
                 break;
             }
             if Instant::now() >= deadline {
-                let child = Child::open(pid)?;
-                if installed(pid) {
-                    child.kill();
+                match Child::open(pid) {
+                    Ok(child) if installed(pid) => child.kill(),
+                    Err(e) if installed(pid) => log::line(&format!("switch: open orphaned shell: {e}")),
+                    _ => {}
                 }
                 break;
             }
@@ -252,7 +295,7 @@ fn restore_desktop(exe: &Path, folders: &[(isize, String)]) -> Result<(), String
         }
     }
     let status = manage::bring_back_explorer()?;
-    log::line(&format!("switch: watcher restored Windows: {status}"));
+    log::line(&format!("switch: restored Windows: {status}"));
     explorer::restore_folders(folders);
     Ok(())
 }
