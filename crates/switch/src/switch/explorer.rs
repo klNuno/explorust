@@ -108,10 +108,11 @@ fn folder_windows() -> Vec<(HWND, u32)> {
         .collect()
 }
 
-pub fn open_folders() -> Result<Vec<(isize, String)>, String> {
+/// Returns None if windows came or went while COM was reading their folders.
+pub fn open_folders() -> Result<Option<Vec<(isize, String)>>, String> {
     let open = folder_windows();
     if open.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     let _apartment = Apartment::new().map_err(|e| format!("initialize ShellWindows COM: {e}"))?;
     // SAFETY: the worker owns the apartment and drops all interfaces before uninitializing it.
@@ -147,13 +148,14 @@ pub fn open_folders() -> Result<Vec<(isize, String)>, String> {
                 )),
             }
         }
-        if folder_windows()
-            .iter()
-            .any(|(h, _)| !entries.iter().any(|(hwnd, _)| h.0 as isize == *hwnd))
-        {
+        let current = folder_windows();
+        if current.len() != open.len() || current.iter().any(|window| !open.contains(window)) {
+            return Ok(None);
+        }
+        if !reopen_list::same_windows(&entries, open.into_iter().map(|(h, _)| h.0 as isize)) {
             return Err("one or more Explorer windows could not be saved".into());
         }
-        Ok(reopen_list::folders(entries))
+        Ok(Some(reopen_list::folders(entries)))
     }
 }
 
@@ -192,7 +194,13 @@ unsafe fn active_folder(browser: &IWebBrowser2) -> windows::core::Result<String>
     }
 }
 
-pub fn exit(tray: HWND, pid: u32) -> Result<(), String> {
+/// Returns false when the captured window list is stale, before closing anything.
+pub fn exit(
+    tray: HWND,
+    pid: u32,
+    saved: &[(isize, String)],
+    commit: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
     if taskbar::explorer_window() != Some((tray, pid)) {
         return Err("Explorer's taskbar changed while preparing to switch".into());
     }
@@ -202,9 +210,13 @@ pub fn exit(tray: HWND, pid: u32) -> Result<(), String> {
         .filter(|&owner| taskbar::is_explorer(owner))
         .chain([pid])
         .collect();
-    // Ask separate folder windows to close while the desktop can still service their shell
-    // registrations. Their Explorer processes may keep COM objects alive after the window closes.
-    for (folder, owner) in folder_windows() {
+    let open = folder_windows();
+    if !reopen_list::same_windows(saved, open.iter().map(|(window, _)| window.0 as isize)) {
+        return Ok(false);
+    }
+    commit()?;
+    // The outgoing desktop can still service these separate processes as their windows close.
+    for (folder, owner) in open {
         if owner != pid {
             // SAFETY: standard close to a folder window in a separate Explorer process.
             if let Err(e) = unsafe { PostMessageW(Some(folder), WM_CLOSE, WPARAM(0), LPARAM(0)) } {
@@ -236,7 +248,7 @@ pub fn exit(tray: HWND, pid: u32) -> Result<(), String> {
                 "switch: Explorer desktop exited after {} ms (background Explorer pids: {pids:?})",
                 started.elapsed().as_millis()
             ));
-            return Ok(());
+            return Ok(true);
         }
         if started.elapsed() >= EXIT_BUDGET {
             return Err(format!(

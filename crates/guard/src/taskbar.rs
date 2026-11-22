@@ -114,10 +114,14 @@ pub enum Start {
 
 /// Waits for a freshly started explorer to own an answering taskbar.
 pub fn wait_explorer(child: &Child, limit: Duration) -> Start {
+    wait_explorer_except(child, limit, None)
+}
+
+pub fn wait_explorer_except(child: &Child, limit: Duration, retiring: Option<u32>) -> Start {
     let t0 = Instant::now();
     let mut ended: Option<Instant> = None;
     loop {
-        if let Some(pid) = explorer() {
+        if let Some(pid) = explorer_except(retiring) {
             return Start::Up(pid);
         }
         if ended.is_none() && child.ended() {
@@ -130,20 +134,6 @@ pub fn wait_explorer(child: &Child, limit: Duration) -> Start {
         }
         if t0.elapsed() >= limit {
             return Start::Timeout;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
-/// Waits up to `limit` for any explorer taskbar.
-pub fn wait_any_explorer(limit: Duration) -> Option<u32> {
-    let t0 = Instant::now();
-    loop {
-        if let Some(pid) = explorer() {
-            return Some(pid);
-        }
-        if t0.elapsed() >= limit {
-            return None;
         }
         std::thread::sleep(Duration::from_millis(500));
     }

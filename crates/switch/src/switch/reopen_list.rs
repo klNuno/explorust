@@ -14,6 +14,11 @@ pub fn folders(entries: impl IntoIterator<Item = (isize, String)>) -> Vec<(isize
         .collect()
 }
 
+pub fn same_windows(saved: &[(isize, String)], observed: impl Iterator<Item = isize>) -> bool {
+    let saved_handles: HashSet<_> = saved.iter().map(|(hwnd, _)| *hwnd).collect();
+    saved_handles == observed.collect()
+}
+
 /// Keep the window identity alongside its parsing name for recovery in either process.
 pub fn encode(entries: &[(isize, String)]) -> String {
     use std::fmt::Write;
@@ -39,6 +44,14 @@ pub fn decode(snapshot: &str) -> io::Result<Vec<(isize, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recapture_when_a_folder_window_opens_or_closes() {
+        let saved = [(1, "a".to_owned()), (2, "b".to_owned())];
+        assert!(same_windows(&saved, [2, 1].into_iter()));
+        assert!(!same_windows(&saved, [1, 2, 3].into_iter()));
+        assert!(!same_windows(&saved, [2].into_iter()));
+    }
 
     #[test]
     fn keeps_one_valid_parsing_name_per_window() {

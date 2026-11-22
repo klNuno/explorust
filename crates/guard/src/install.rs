@@ -214,15 +214,23 @@ pub fn lock() -> Result<Lock, String> {
 }
 
 pub fn lock_for(timeout_ms: u32) -> Result<Lock, String> {
+    named_lock(r"Global\explorust-setup", timeout_ms, "another explorust install or uninstall is running")
+}
+
+pub fn recovery_lock_for(timeout_ms: u32) -> Result<Lock, String> {
+    named_lock(crate::switch_events::RECOVERY_MUTEX, timeout_ms, "the independent desktop recovery is still running")
+}
+
+fn named_lock(name: &str, timeout_ms: u32, busy: &str) -> Result<Lock, String> {
     // SAFETY: a named mutex; the handle moves into the Lock.
     unsafe {
-        let h = CreateMutexW(None, false, &HSTRING::from(r"Global\explorust-setup")).map_err(|e| format!("setup lock: {e}"))?;
+        let h = CreateMutexW(None, false, &HSTRING::from(name)).map_err(|e| format!("{name}: {e}"))?;
         let w = WaitForSingleObject(h, timeout_ms);
         if w == WAIT_OBJECT_0 || w == WAIT_ABANDONED {
             Ok(Lock(h))
         } else {
             let _ = CloseHandle(h);
-            Err("another explorust install or uninstall is running".into())
+            Err(busy.into())
         }
     }
 }

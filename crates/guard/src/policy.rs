@@ -75,6 +75,24 @@ impl Watchdog {
     }
 }
 
+/// The next step when returning from a failed live switch or from an uninstall.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Recovery {
+    Ready(u32),
+    Wait,
+    Start,
+}
+
+pub fn recovery_step(replacement: Option<u32>, retiring_has_tray: bool, guard_waiting: bool) -> Recovery {
+    if let Some(pid) = replacement {
+        Recovery::Ready(pid)
+    } else if retiring_has_tray || guard_waiting {
+        Recovery::Wait
+    } else {
+        Recovery::Start
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +102,20 @@ mod tests {
         assert_eq!(at_logon(0), AtLogon::Run);
         assert_eq!(at_logon(2), AtLogon::Run);
         assert_eq!(at_logon(3), AtLogon::TurnOff);
+    }
+
+    #[test]
+    fn recovery_starts_once_the_retiring_taskbar_is_gone() {
+        assert_eq!(recovery_step(None, true, false), Recovery::Wait);
+        // The retiring process can still be alive without a desktop taskbar.
+        assert_eq!(recovery_step(None, false, false), Recovery::Start);
+        assert_eq!(recovery_step(Some(42), false, false), Recovery::Ready(42));
+    }
+
+    #[test]
+    fn recovery_starts_directly_when_the_signalled_guard_disappears() {
+        assert_eq!(recovery_step(None, false, true), Recovery::Wait);
+        assert_eq!(recovery_step(None, false, false), Recovery::Start);
     }
 
     fn secs(n: u64) -> Duration {

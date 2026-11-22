@@ -6,7 +6,8 @@
 
 use crate::{account, apps, folders, install, log, package, proc, reg, supervise, taskbar};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use crate::policy::{Recovery, recovery_step};
 
 /// Exit codes shared by `--install`, `--setup` and `--uninstall`.
 pub const FAILED: u32 = 1;
@@ -145,9 +146,11 @@ pub fn restore_session() -> (Result<String, String>, Result<String, String>) {
     let lock = || {
         let cancel = proc::Event::named(crate::switch_events::CANCEL_FOR_RESTORE)?;
         cancel.signal()?;
-        install::lock_for(240_000)
+        let setup = install::lock_for(240_000)?;
+        let recovery = install::recovery_lock_for(240_000)?;
+        Ok((setup, recovery))
     };
-    let _lock = match lock() {
+    let _locks = match lock() {
         Ok(lock) => lock,
         Err(e) => return (Err(e), Err("not tried".into())),
     };
@@ -172,30 +175,63 @@ pub fn remove_package() {
 /// Brings explorer's taskbar back now and says so only once it answers. A running guard does it
 /// (it ends explorust and keeps explorer up); with no guard and no taskbar, explorer starts here.
 pub fn bring_back_explorer() -> Result<String, String> {
-    if let Some(pid) = taskbar::explorer() {
-        return Ok(format!("explorer's taskbar already answers (pid {pid})"));
+    bring_back_explorer_except(None)
+}
+
+/// During rollback the original Explorer's taskbar cannot confirm recovery.
+pub fn bring_back_explorer_except(retiring: Option<&proc::Child>) -> Result<String, String> {
+    let result = restore_desktop(retiring);
+    match &result {
+        Ok(status) | Err(status) => say(&format!("restore: {status}")),
     }
-    let r = match proc::Event::set_existing(supervise::FALLBACK_EVENT) {
-        Ok(()) => match taskbar::wait_any_explorer(Duration::from_secs(45)) {
-            Some(pid) => Ok(format!("the guard brought explorer back (pid {pid})")),
-            None => Err("the guard was asked to bring explorer back, but its taskbar is not up after 45 s".into()),
-        },
-        Err(_) if taskbar::any() => Err("a taskbar runs without its guard: sign out and in again to finish".into()),
-        // Started from an elevated process, explorer would run elevated as the shell.
-        Err(_) if install::elevated() => Err("no shell runs: start explorer.exe from Task Manager".into()),
-        Err(_) => match proc::Child::spawn(&supervise::explorer_path(), "") {
-            Ok(child) => match taskbar::wait_explorer(&child, Duration::from_secs(45)) {
-                taskbar::Start::Up(pid) => Ok(format!("explorer started (pid {pid})")),
-                _ => Err("explorer started but its taskbar did not come".into()),
-            },
-            Err(e) => Err(format!("explorer did not start: {e}")),
-        },
-    };
-    say(&format!("restore: {}", match &r {
-        Ok(s) => s.clone(),
-        Err(e) => e.clone(),
-    }));
-    r
+    result
+}
+
+fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
+    let retiring_pid = retiring.map(|process| process.pid);
+    let started = Instant::now();
+    let mut requested = false;
+    loop {
+        let ready = taskbar::explorer_except(retiring_pid);
+        let retiring_tray = retiring_pid.is_some_and(taskbar::owns_tray);
+        // Do not keep the event open here. Its disappearance means the guard exited and we
+        // must start Windows directly, even if the guard accepted a fallback signal earlier.
+        // A live switch starts its new guard only after the old process exits. If the
+        // process remains without its taskbar, any guard is still waiting on the old desktop.
+        let prior_guard = retiring.is_some_and(|process| !process.ended());
+        let guard_waiting = if ready.is_some() || retiring_tray || prior_guard {
+            false
+        } else if requested {
+            proc::Event::open_for_signal(supervise::FALLBACK_EVENT).is_ok()
+        } else {
+            requested = proc::Event::set_existing(supervise::FALLBACK_EVENT).is_ok();
+            requested
+        };
+        match recovery_step(ready, retiring_tray, guard_waiting) {
+            Recovery::Ready(pid) if requested => return Ok(format!("the guard brought explorer back (pid {pid})")),
+            Recovery::Ready(pid) => return Ok(format!("explorer's taskbar already answers (pid {pid})")),
+            Recovery::Start => break,
+            Recovery::Wait if started.elapsed() >= Duration::from_secs(45) => {
+                return Err("no replacement Explorer taskbar is answering after 45 s".into());
+            }
+            Recovery::Wait => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    if taskbar::any() {
+        return taskbar::explorer_except(retiring_pid)
+            .map(|pid| format!("explorer's taskbar already answers (pid {pid})"))
+            .ok_or_else(|| "a taskbar runs without its guard: sign out and in again to finish".into());
+    }
+    // Explorer must run unelevated as the shell.
+    if install::elevated() {
+        return Err("no shell runs: start explorer.exe from Task Manager".into());
+    }
+    let child = proc::Child::spawn(&supervise::explorer_path(), "")
+        .map_err(|e| format!("explorer did not start: {e}"))?;
+    match taskbar::wait_explorer_except(&child, Duration::from_secs(45), retiring_pid) {
+        taskbar::Start::Up(pid) => Ok(format!("explorer started (pid {pid})")),
+        _ => Err("explorer started but its taskbar did not come".into()),
+    }
 }
 
 /// The machine half, elevated. Kept (Ok(false)) while another account's Shell value still points to
