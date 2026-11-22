@@ -856,11 +856,13 @@ impl Frame {
             return true;
         }
         let Some(view) = items else { return false };
-        if ctrl && !alt && !key_down(VK_SHIFT) {
-            let command = match vk {
-                VK_X => Some(Cmd::Cut),
-                VK_C => Some(Cmd::Copy),
-                VK_V if self.tab().is_some_and(|t| t.path.is_some() && t.query.is_empty()) => Some(Cmd::Paste),
+        if !alt && !key_down(VK_SHIFT) {
+            let command = match (ctrl, vk) {
+                (true, VK_X) => Some(Cmd::Cut),
+                (true, VK_C) => Some(Cmd::Copy),
+                (true, VK_V) if self.tab().is_some_and(|t| t.path.is_some() && t.query.is_empty()) => Some(Cmd::Paste),
+                // A synthetic results folder needs the completion to remove the deleted row.
+                (false, VK_DELETE) if self.tab().and_then(Tab::index_results_id).is_some() => Some(Cmd::Delete),
                 _ => None,
             };
             if let Some(command) = command {
