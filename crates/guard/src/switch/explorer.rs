@@ -26,6 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BSTR, Interface, PCWSTR, w};
 
 const EXIT_EXPLORER: u32 = 0x5B4;
+pub const EXIT_BUDGET: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 pub struct Process {
@@ -325,7 +326,7 @@ pub fn exit(tray: HWND, pid: u32) -> Result<(), String> {
             ));
             return Ok(());
         }
-        if started.elapsed() >= Duration::from_secs(30) {
+        if started.elapsed() >= EXIT_BUDGET {
             return Err(format!(
                 "Explorer's desktop did not exit within 30 s (remaining pids {pids:?})"
             ));

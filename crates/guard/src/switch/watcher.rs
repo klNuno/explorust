@@ -18,6 +18,7 @@ pub const EXITING_EXPLORER: &str = r"Local\explorust-switch-exiting-explorer";
 struct Signals {
     prepared: Event,
     exit: Event,
+    exiting: Event,
     exited: Event,
     accepted: Event,
     rollback: Event,
@@ -29,6 +30,7 @@ impl Signals {
         Ok(Self {
             prepared: get("prepared")?,
             exit: get("exit")?,
+            exiting: get("exiting")?,
             exited: get("exited")?,
             accepted: get("accepted")?,
             rollback: get("rollback")?,
@@ -115,6 +117,10 @@ impl Watcher {
             Err("the independent switch watcher could not restore Windows".into())
         }
     }
+
+    pub fn exit_requested(&self) -> bool {
+        wait_any(&[self.signals.exiting.0], Some(0)).is_some()
+    }
 }
 
 impl Drop for Watcher {
@@ -186,6 +192,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         return Ok(POSTPONED);
     }
     let exiting = Event::named(EXITING_EXPLORER)?;
+    signals.exiting.signal()?;
     exiting.signal()?;
     let started = explorer::exit(tray, explorer_pid);
     if let Err(e) = started {

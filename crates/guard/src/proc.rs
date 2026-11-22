@@ -85,7 +85,15 @@ impl Child {
 
     /// Takes over a running process (an explorust whose guard died) as if this guard had started it.
     pub fn open(pid: u32) -> Result<Child, String> {
-        let access = PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+        Self::open_with(pid, PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION)
+    }
+
+    /// Opens a process handle only for waiting until it exits.
+    pub fn monitor(pid: u32) -> Result<Child, String> {
+        Self::open_with(pid, PROCESS_SYNCHRONIZE)
+    }
+
+    fn open_with(pid: u32, access: windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS) -> Result<Child, String> {
         // SAFETY: Windows validates the pid and the requested rights.
         let handle = unsafe { OpenProcess(access, false, pid) }.map_err(|e| format!("open pid {pid}: {e}"))?;
         Ok(Child { handle, pid })

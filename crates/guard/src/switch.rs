@@ -5,9 +5,9 @@ mod reopen_list;
 pub(crate) mod watcher;
 
 use crate::launch_timing::{self, FALLBACK_EVENT, build_verdict_event};
-use crate::proc::{Child, Event};
+use crate::proc::{Child, Event, wait_any};
 use crate::ui::{self, Icon, tr};
-use crate::{GUARD_MUTEX, account, install, log, policy, reg, reopen, supervise, taskbar};
+use crate::{GUARD_MUTEX, account, install, log, manage, policy, reg, reopen, supervise, taskbar};
 use std::path::Path;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -33,6 +33,9 @@ pub fn launch_from_setup() -> Result<(), String> {
 
 pub fn run() -> u32 {
     if install::elevated() {
+        if taskbar::explorust(&install::dir().join("explorust.exe")).is_some() {
+            return show(Ok(Outcome::AlreadyRunning));
+        }
         return match launch_from_setup() {
             Ok(()) => 0,
             Err(e) => show(Err(e)),
@@ -153,6 +156,7 @@ fn switch(
     let Some((tray, pid)) = taskbar::explorer_window() else {
         return Err("no Explorer taskbar in this session".into());
     };
+    let explorer_process = Child::monitor(pid)?;
     let guard_pid = std::process::id();
     let stamp = reopen::guard_stamp(guard_pid)
         .ok_or("could not identify this guard for the Files handoff")?;
@@ -193,7 +197,19 @@ fn switch(
         Ok(outcome) => Ok(outcome),
         Err(e) => {
             log::line(&format!("switch: {e}"));
-            watcher.restore()?;
+            if let Err(e) = watcher.restore() {
+                log::line(&format!("switch: {e}; restoring Windows directly"));
+                if watcher.exit_requested() {
+                    // Exit Explorer may still be in flight. Wait before checking whether the
+                    // taskbar answers, so a retiring Explorer does not look like a recovery.
+                    let _ = wait_any(
+                        &[explorer_process.handle],
+                        Some(explorer::EXIT_BUDGET.as_millis() as u32),
+                    );
+                }
+                let status = manage::bring_back_explorer()?;
+                log::line(&format!("switch: guard restored Windows: {status}"));
+            }
             Ok(Outcome::Windows)
         }
     }
