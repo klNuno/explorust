@@ -30,7 +30,7 @@ pub mod uri;
 mod win;
 
 #[cfg(target_os = "windows")]
-pub use win::dark_mode_for_process;
+pub use win::{dark_mode_for_process, prepare_reload, reopen_folders};
 
 /// Opens an initial folder in isolation when running the standalone Files test application.
 /// With no path, the dev instance can serve the Files command bus as before.

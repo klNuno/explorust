@@ -20,9 +20,9 @@ mod views;
 
 use crate::handover;
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use views::{Destination, Open, Windows};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::*;
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
@@ -37,6 +37,25 @@ const SPARE_DELAY_MS: u32 = 800;
 
 thread_local! {
     static VIEWS: RefCell<Option<Arc<Windows>>> = const { RefCell::new(None) };
+}
+
+static RUNNING: Mutex<Weak<Windows>> = Mutex::new(Weak::new());
+
+pub fn prepare_reload(limit: Duration) -> Option<Vec<String>> {
+    if !operations::drain_for_reload(limit) {
+        return None;
+    }
+    let windows = RUNNING.lock().unwrap().upgrade();
+    Some(windows.map(|windows| windows.folders_for_reload()).unwrap_or_default())
+}
+
+pub fn reopen_folders(folders: Vec<String>) {
+    let windows = RUNNING.lock().unwrap().upgrade();
+    if let Some(windows) = windows {
+        for path in folders {
+            windows.open(Open { destination: Destination::Path(path, false), position: None, requested: Instant::now(), queued_ms: 0 });
+        }
+    }
 }
 
 /// Dark menus and controls for the process; the dev exe calls it before `run`, the shell should.
@@ -170,6 +189,7 @@ pub fn run_with_initial(initial: Option<&str>) {
         let _ = ChangeWindowMessageFilterEx(cmd, WM_COPYDATA, MSGFLT_ALLOW, None);
     }
     let windows = Windows::new(cmd);
+    *RUNNING.lock().unwrap() = Arc::downgrade(&windows);
     VIEWS.with(|views| *views.borrow_mut() = Some(windows.clone()));
     log::line(&format!("files: listening in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
     windows.prewarm();

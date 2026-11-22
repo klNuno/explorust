@@ -2,7 +2,8 @@
 //! the boundary so a provider cannot block by calling back through the view's COM apartment.
 
 use super::{clipboard, inbox::Inbox, log, shell::{self, Pidl}};
-use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicUsize, Ordering}};
+use std::time::Duration;
 use windows::Win32::Foundation::{ERROR_TIMEOUT, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::UI::Shell::SHMultiFileProperties;
@@ -19,6 +20,12 @@ pub enum Action {
     Properties(Vec<Pidl>),
 }
 
+impl Action {
+    fn mutates_files(&self) -> bool {
+        matches!(self, Self::Delete { .. } | Self::Paste(..) | Self::NewFolder(..))
+    }
+}
+
 pub enum Response {
     Address { tab: usize, request: usize, destination: Result<Option<Pidl>> },
     Refresh { tab: usize, folder: Pidl },
@@ -29,6 +36,56 @@ pub enum Response {
 struct Job {
     tab: usize,
     action: Action,
+    mutation: Option<Mutation>,
+}
+
+struct Drain {
+    sealed: bool,
+    pending: usize,
+}
+
+static DRAIN: Mutex<Drain> = Mutex::new(Drain { sealed: false, pending: 0 });
+static DRAINED: Condvar = Condvar::new();
+
+/// Lives from acceptance through execution, even when the submitting frame closes.
+struct Mutation;
+
+impl Mutation {
+    fn accept() -> Option<Self> {
+        let mut drain = DRAIN.lock().unwrap();
+        if drain.sealed {
+            return None;
+        }
+        drain.pending += 1;
+        Some(Self)
+    }
+}
+
+impl Drop for Mutation {
+    fn drop(&mut self) {
+        let mut drain = DRAIN.lock().unwrap();
+        drain.pending -= 1;
+        if drain.pending == 0 {
+            DRAINED.notify_all();
+        }
+    }
+}
+
+/// Run outside all Files STAs so their message pumps keep servicing clipboard and operation calls.
+pub fn drain_for_reload(limit: Duration) -> bool {
+    let mut drain = DRAIN.lock().unwrap();
+    drain.sealed = true;
+    if drain.pending == 0 {
+        return true;
+    }
+    log::line(&format!("reload: waiting for {} accepted file operations", drain.pending));
+    let (mut drain, _) = DRAINED.wait_timeout_while(drain, limit, |state| state.pending != 0).unwrap();
+    if drain.pending != 0 {
+        drain.sealed = false;
+        return false;
+    }
+    log::line("reload: accepted file operations finished");
+    true
 }
 
 pub struct Worker {
@@ -52,10 +109,12 @@ pub enum PasteTarget {
 
 impl PasteDestination {
     pub fn submit(&self) {
+        let Some(mutation) = Mutation::accept() else { return };
         let source = clipboard::snapshot(HWND(self.commands as _));
         if !self.input.send(Some(Job {
             tab: self.tab,
             action: Action::Paste(self.target.clone(), source),
+            mutation: Some(mutation),
         })) {
             log::line("Files paste destination closed before submission");
         }
@@ -78,7 +137,14 @@ impl Worker {
     }
 
     pub fn submit(&self, tab: usize, action: Action) {
-        if !self.input.send(Some(Job { tab, action })) {
+        let mut mutation = None;
+        if action.mutates_files() {
+            mutation = Mutation::accept();
+            if mutation.is_none() {
+                return;
+            }
+        }
+        if !self.input.send(Some(Job { tab, action, mutation })) {
             log::line("Files operation worker is unavailable");
         }
     }
@@ -96,8 +162,7 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.output.lock().unwrap().take();
         // Keep accepted mutations in FIFO order. Work that only serves the closed frame can go.
-        self.input.close(None, |job| job.as_ref().is_some_and(|job| matches!(job.action,
-            Action::Delete { .. } | Action::Paste(..) | Action::NewFolder(..))));
+        self.input.close(None, |job| job.as_ref().is_some_and(|job| job.mutation.is_some()));
     }
 }
 
@@ -173,7 +238,7 @@ fn with_dialog_owner<T>(owner: HWND, operation: impl FnOnce() -> T) -> T {
 }
 
 fn perform(owner: HWND, job: Job) -> Option<Response> {
-    let Job { tab, action } = job;
+    let Job { tab, action, mutation: _mutation } = job;
     let (verb, result, refresh) = match action {
         Action::Address { text, request } => {
             let destination = Pidl::parse_result(&text).and_then(|item| {
@@ -233,7 +298,7 @@ fn perform(owner: HWND, job: Job) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf, time::{Duration, Instant}};
+    use std::{fs, path::PathBuf, time::Instant};
 
     struct Fixture(PathBuf);
 
@@ -244,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_paste_and_new_folder_finish_after_window_closes() {
+    fn reload_waits_for_accepted_paste_and_new_folder_after_window_closes() {
         let dir = std::env::temp_dir().join(format!("explorust-files-drain-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let fixture = Fixture(dir);
@@ -266,14 +331,28 @@ mod tests {
         worker.submit(1, Action::NewFolder(target, "queued folder"));
         drop(worker);
         drop(frame);
+
+        assert!(!drain_for_reload(Duration::ZERO));
+        drop(Mutation::accept().expect("a cancelled reload must accept new file operations"));
+
+        let (done, drained) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            assert!(drain_for_reload(Duration::from_secs(10)));
+            // Reopen the static test process's gate for other tests.
+            DRAIN.lock().unwrap().sealed = false;
+            done.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !DRAIN.lock().unwrap().sealed && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(DRAIN.lock().unwrap().sealed, "reload must wait for the accepted paste");
+        assert!(Mutation::accept().is_none(), "reload must seal the queue before waiting");
         release.send(clipboard::Source::test_cut(vec![source])).unwrap_or_else(|_| panic!("operation worker exited before draining"));
+        drained.recv_timeout(Duration::from_secs(10)).unwrap();
 
         let moved = target_path.join("move.txt");
         let created = target_path.join("queued folder");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !created.is_dir() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
         assert!(created.is_dir(), "queued New Folder did not finish");
         assert!(!source_path.exists(), "Paste did not move the accepted selection");
         assert_eq!(fs::read_to_string(moved).unwrap(), "move me");
