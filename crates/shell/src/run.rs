@@ -1,7 +1,8 @@
 //! Argument parsing and the process lifetime: host thread up, optional self-test, ready signal,
 //! then wait for a quit request or the host's end.
 
-use crate::{actions, components, events, guardwatch, keyhost, launch_timing, log, minimized, problem, selftest, startup};
+use crate::startup_retry::SessionStartup;
+use crate::{actions, components, events, guardwatch, keyhost, launch_timing, log, minimized, problem, selftest};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
@@ -100,7 +101,8 @@ fn shell(args: &Args) -> i32 {
     let exits = ExitRequests { quit, reload };
     let offered = args.ready_event.as_deref()
         .and_then(|name| events::Owned::open_for_signal(&launch_timing::staged_event(name)));
-    let staged = args.ready_event.as_deref().filter(|_| args.staged_ready || offered.is_some());
+    let negotiated = offered.is_some();
+    let staged = args.ready_event.as_deref().filter(|_| args.staged_ready || negotiated);
     let phases = match staged.map(PhaseEvents::open).transpose() {
         Ok(phases) => phases,
         Err(e) => {
@@ -147,10 +149,17 @@ fn shell(args: &Args) -> i32 {
     components::spawn_watchdog(false);
     if let Some(phases) = &phases {
         signal(&phases.native, "native ready");
-    } else if args.guard.is_some() {
-        // An installed guard can outlive a live shell update. It has no native event to wait on.
-        startup::spawn_legacy_runner();
     }
+    let mut startup = SessionStartup::default();
+    if args.guard.is_some() && !negotiated {
+        // Earlier guards either leave startup to the shell or launch a single unobserved runner.
+        match std::env::current_exe() {
+            Ok(exe) => startup.desktop_ready(&exe),
+            Err(e) => log::line(&format!("session startup claim unacknowledged: {e}. Will retry on reload.")),
+        }
+    }
+    let legacy_ready_sent = launch_timing::legacy_ready_at_native(args.guard.is_some(), phases.is_some(), args.self_test)
+        && signal_legacy_ready(args.ready_event.as_deref());
     match exits.wait_reply(&ready_rx, launch_timing::HOST, HOST_FAILED, "immersive host startup") {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -190,8 +199,8 @@ fn shell(args: &Args) -> i32 {
     }
     if let Some(phases) = &phases {
         signal(&phases.verified, "build verdict");
-    } else if let Some(name) = &args.ready_event && let Err(e) = events::set_existing(name) {
-        log::line(&format!("ready event: {e}"));
+    } else if !legacy_ready_sent {
+        signal_legacy_ready(args.ready_event.as_deref());
     }
     loop {
         if let Some(code) = exits.requested(250) {
@@ -201,6 +210,17 @@ fn shell(args: &Args) -> i32 {
         if !matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
             log::line("uwp host thread ended: stopping");
             return shutdown(HOST_FAILED);
+        }
+    }
+}
+
+fn signal_legacy_ready(name: Option<&str>) -> bool {
+    let Some(name) = name else { return false };
+    match events::set_existing(name) {
+        Ok(()) => true,
+        Err(e) => {
+            log::line(&format!("ready event: {e}"));
+            false
         }
     }
 }

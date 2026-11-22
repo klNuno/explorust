@@ -32,13 +32,6 @@ use windows::Win32::{
 };
 use windows::core::{GUID, HSTRING, PCWSTR};
 
-pub fn spawn_legacy_runner() {
-    let result = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg("--startup-apps").spawn());
-    if let Err(e) = result {
-        log::line(&format!("startup: could not launch the session runner: {e}"));
-    }
-}
-
 pub fn run(ack: Option<&str>) -> i32 {
     if events::Owned::is_signalled(launch_timing::FALLBACK_EVENT) {
         log::line("startup: handoff requested before claim; Explorer owns startup");

@@ -2,7 +2,8 @@
 //! (`uwp-host`), so Settings and Store apps work with no explorer.exe; the taskbar, Start and the
 //! rest join it step by step.
 //!
-//! - `--ready-event <name>`: set that named event once the host is up (and the self-test passed).
+//! - `--ready-event <name>`: signal final readiness, or native readiness for a pre-stage guard
+//!   that already verified this Windows build.
 //! - `--staged-ready`: also signal native and immersive readiness on separate events.
 //! - `--guard <pid>`: the guard that started it; if it ends, explorust starts one that adopts it.
 //! - `--self-test`: before signalling ready, open Calculator and wait for its frame on screen.
@@ -31,7 +32,7 @@ mod events;
 mod guardwatch;
 #[cfg(target_os = "windows")]
 mod keyhost;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 #[path = "../../guard/src/launch_timing.rs"]
 #[allow(dead_code)]
 mod launch_timing;
@@ -48,6 +49,9 @@ mod run;
 mod selftest;
 #[cfg(target_os = "windows")]
 mod startup;
+#[cfg(any(target_os = "windows", test))]
+#[path = "../../guard/src/startup_retry.rs"]
+mod startup_retry;
 #[cfg(any(target_os = "windows", test))]
 mod startup_rules;
 

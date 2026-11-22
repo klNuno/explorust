@@ -1,3 +1,4 @@
+use crate::launch_timing::{STARTUP_MARKER, startup_session_key};
 use crate::startup_rules;
 use windows::Win32::{
     Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS},
@@ -29,9 +30,9 @@ pub fn claim() -> windows::core::Result<bool> {
     let mut session = 0;
     // SAFETY: session is a writable DWORD; create_key owns the returned HKEY.
     unsafe { ProcessIdToSessionId(std::process::id(), &mut session)? };
-    let window_session = format!(r"{VERSION}\Explorer\SessionInfo\{session}");
+    let window_session = startup_session_key(session);
     let (key, _) = create_key(HKEY_CURRENT_USER, &window_session, KEY_CREATE_SUB_KEY)?;
-    let (_, first) = create_key(key.0, "RunStuffHasBeenRun", KEY_CREATE_SUB_KEY)?;
+    let (_, first) = create_key(key.0, STARTUP_MARKER, KEY_CREATE_SUB_KEY)?;
     Ok(first)
 }
 
