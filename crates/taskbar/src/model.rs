@@ -38,6 +38,18 @@ pub enum Action {
     Minimize(Hwnd),
 }
 
+/// A running window can supply a launcher when its app identity cannot be opened.
+#[cfg(any(windows, test))]
+pub(crate) fn relaunch_exe(path: &str) -> Option<&str> {
+    let name = path.rsplit(['\\', '/']).next()?;
+    if name.is_empty() || name.eq_ignore_ascii_case("ApplicationFrameHost.exe")
+        || name.eq_ignore_ascii_case("explorer.exe")
+    {
+        return None;
+    }
+    Some(path)
+}
+
 impl Model {
     /// Adds a window or updates its key; true when the buttons change.
     pub fn upsert(&mut self, hwnd: Hwnd, key: &str) -> bool {
@@ -148,6 +160,15 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relaunch_uses_the_app_exe_and_skips_shell_hosts() {
+        let app = r"C:\Apps\Discord.exe";
+        assert_eq!(relaunch_exe(app), Some(app));
+        assert_eq!(relaunch_exe(""), None);
+        assert_eq!(relaunch_exe(r"C:\Windows\System32\ApplicationFrameHost.EXE"), None);
+        assert_eq!(relaunch_exe(r"C:\Windows\EXPLORER.EXE"), None);
+    }
 
     fn model() -> Model {
         let mut m = Model { pins: vec!["edge".into(), "calc".into()], ..Default::default() };

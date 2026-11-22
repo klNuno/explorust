@@ -912,7 +912,10 @@ impl Bar {
                     self.effects.push(Effect::Launch(pin.launch.clone()));
                 } else if !g.key.contains('\\') {
                     let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
-                    self.effects.push(Effect::Launch(Launch::Aumid(id)));
+                    let exe = g.wins.iter().filter_map(|h| self.exes.get(h))
+                        .find_map(|path| crate::model::relaunch_exe(path))
+                        .map(str::to_owned);
+                    self.effects.push(Effect::Launch(Launch::Aumid { id, exe }));
                 } else if let Some(exe) = g.wins.first().and_then(|h| self.exes.get(h)) {
                     self.effects.push(Effect::Launch(Launch::Path(exe.clone())));
                 }
