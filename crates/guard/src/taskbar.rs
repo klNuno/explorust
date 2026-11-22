@@ -4,6 +4,7 @@
 
 use crate::policy::{ANSWER_WITHIN, Probe};
 use crate::proc::Child;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
@@ -38,8 +39,7 @@ fn answers(h: HWND, within: Duration) -> bool {
     r.0 != 0
 }
 
-/// The file name of a process's image, lowercase.
-fn image_name(pid: u32) -> Option<String> {
+fn image_path(pid: u32) -> Option<String> {
     // SAFETY: the handle is closed; the buffer has the length given.
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
@@ -48,8 +48,7 @@ fn image_name(pid: u32) -> Option<String> {
         let r = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
         let _ = CloseHandle(h);
         r.ok()?;
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        Some(path.rsplit('\\').next().unwrap_or_default().to_ascii_lowercase())
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
     }
 }
 
@@ -66,8 +65,23 @@ pub fn probe(pid: u32) -> Probe {
 pub fn explorer() -> Option<u32> {
     trays()
         .into_iter()
-        .find(|(h, pid)| image_name(*pid).as_deref() == Some("explorer.exe") && answers(*h, Duration::from_secs(2)))
+        .find(|(h, pid)| {
+            image_path(*pid).is_some_and(|path| path.rsplit('\\').next().is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe")))
+                && answers(*h, Duration::from_secs(2))
+        })
         .map(|(_, pid)| pid)
+}
+
+/// The installed shell's taskbar owner. A dev shell launched elsewhere would reload its own exe.
+pub fn explorust(exe: &Path) -> Option<u32> {
+    let expected = exe.to_string_lossy();
+    trays().into_iter().find_map(|(_, pid)| {
+        image_path(pid).filter(|path| path.eq_ignore_ascii_case(&expected)).map(|_| pid)
+    })
+}
+
+pub fn owns_tray(pid: u32) -> bool {
+    trays().into_iter().any(|(_, owner)| owner == pid)
 }
 
 /// True when some taskbar window exists, whoever owns it.

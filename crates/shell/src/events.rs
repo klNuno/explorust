@@ -6,7 +6,7 @@ use windows::Win32::System::Threading::SYNCHRONIZATION_SYNCHRONIZE;
 use windows::core::HSTRING;
 
 pub const QUIT_EVENT: &str = r"Local\explorust-quit";
-pub const RELOAD_EVENT: &str = r"Local\explorust-reload";
+pub use crate::launch_timing::RELOAD_EVENT;
 
 /// Sets an event another process created (the guard's ready event, or a running shell's quit event).
 pub fn set_existing(name: &str) -> Result<(), String> {

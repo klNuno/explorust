@@ -16,7 +16,7 @@ use render::style::{self, Native, Part, WindowStyle};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
@@ -51,6 +51,7 @@ pub struct Frame {
     canvas: Canvas,
     tabs: Vec<Tab>,
     active: usize,
+    reload_folder: Arc<Mutex<Option<String>>>,
     next_id: usize,
     hover: Hit,
     pressed: Hit,
@@ -174,7 +175,7 @@ fn client(hwnd: HWND) -> RECT {
 }
 
 /// Creates a hidden window on `place`, its view loading; `show` puts it on screen.
-pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
+pub fn create(place: &Pidl, x: i32, y: i32, reload_folder: Arc<Mutex<Option<String>>>) -> windows_core::Result<HWND> {
     let (sh, s) = SHARED.with(|x| x.borrow().clone()).ok_or_else(windows_core::Error::empty)?;
     unsafe {
         let inst = GetModuleHandleW(None)?;
@@ -216,6 +217,7 @@ pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
             canvas,
             tabs: Vec::new(),
             active: 0,
+            reload_folder,
             next_id: 1,
             hover: Hit::None,
             pressed: Hit::None,
@@ -558,6 +560,10 @@ impl Frame {
 
     fn title(&self) {
         if let Some(t) = self.tab() {
+            // Capture the active folder here, on its own STA. Reload needs no call into the
+            // view or its namespace provider while the shell is shutting down.
+            let folder = t.path.clone().or_else(|| t.history.current().map(Pidl::display)).filter(|s| !s.is_empty());
+            *self.reload_folder.lock().unwrap() = folder;
             let w = shelldata::wide(&format!("{} - File Explorer", t.title));
             unsafe {
                 let _ = SetWindowTextW(self.hwnd, PCWSTR(w.as_ptr()));
@@ -1581,6 +1587,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 NAVIGATION.with(|pending| pending.borrow_mut().retain(|(window, _, _)| *window != hwnd));
                 if let Some(Some(c)) = with(hwnd, |f| {
                     f.operations.take();
+                    f.reload_folder.lock().unwrap().take();
                     f.sw_cookie.take()
                 }) {
                     shellwindows::revoke(c);

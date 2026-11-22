@@ -32,10 +32,11 @@ enum Job {
 struct Window {
     inbox: Arc<Inbox<Job>>,
     prepared: Arc<AtomicBool>,
+    folder: Arc<Mutex<Option<String>>>,
 }
 
 struct Sessions {
-    open: Vec<Arc<Inbox<Job>>>,
+    open: Vec<Window>,
     spare: Option<Window>,
     offset: u8,
     closing: bool,
@@ -80,7 +81,7 @@ impl Windows {
         if state.closing {
             return;
         }
-        state.open.retain(|inbox| !inbox.closed());
+        state.open.retain(|window| !window.inbox.closed());
         let window = if matches!(request.destination, Destination::Home)
             && state.spare.as_ref().is_some_and(|w| w.prepared.load(Ordering::Acquire) && !w.inbox.closed())
         {
@@ -92,8 +93,15 @@ impl Windows {
             self.spawn(at, Some(request))
         };
         if let Some(window) = window {
-            state.open.push(window.inbox);
+            state.open.push(window);
         }
+    }
+
+    pub fn folders_for_reload(&self) -> Vec<String> {
+        let mut state = self.sessions.lock().unwrap();
+        state.closing = true;
+        state.open.iter().filter(|window| !window.inbox.closed())
+            .filter_map(|window| window.folder.lock().unwrap().clone()).collect()
     }
 
     pub fn shutdown(&self) {
@@ -103,7 +111,7 @@ impl Windows {
             window.inbox.stop(Job::Close);
         }
         for window in state.open.drain(..) {
-            window.stop(Job::Close);
+            window.inbox.stop(Job::Close);
         }
     }
 
@@ -115,15 +123,17 @@ impl Windows {
         let prepared = Arc::new(AtomicBool::new(false));
         let worker = inbox.clone();
         let signal = prepared.clone();
+        let folder = Arc::new(Mutex::new(None));
+        let location = folder.clone();
         let owner = Arc::downgrade(self);
         let cmd = self.cmd;
         if let Err(error) = std::thread::Builder::new().name("files-view".into()).spawn(move || {
-            run(owner, cmd, worker, signal, at);
+            run(owner, cmd, worker, signal, location, at);
         }) {
             log::line(&format!("could not start a Files view thread: {error}"));
             return None;
         }
-        Some(Window { inbox, prepared })
+        Some(Window { inbox, prepared, folder })
     }
 }
 
@@ -143,7 +153,7 @@ impl Drop for Ole {
     }
 }
 
-fn run(owner: Weak<Windows>, cmd: isize, inbox: Arc<Inbox<Job>>, prepared: Arc<AtomicBool>, at: (i32, i32)) {
+fn run(owner: Weak<Windows>, cmd: isize, inbox: Arc<Inbox<Job>>, prepared: Arc<AtomicBool>, folder: Arc<Mutex<Option<String>>>, at: (i32, i32)) {
     let jobs = inbox.attach();
     if let Err(error) = unsafe { OleInitialize(None) } {
         log::line(&format!("Files view OLE initialization failed: {error}"));
@@ -177,7 +187,7 @@ fn run(owner: Weak<Windows>, cmd: isize, inbox: Arc<Inbox<Job>>, prepared: Arc<A
         }
     };
     frame::init(sh, crate::text::for_language(&ui_language()), HWND(cmd as _));
-    let hwnd = match frame::create(&place, at.0, at.1) {
+    let hwnd = match frame::create(&place, at.0, at.1, folder) {
         Ok(hwnd) => hwnd,
         Err(error) => {
             log::line(&format!("opening {label:?} failed: {error}"));

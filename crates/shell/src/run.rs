@@ -2,7 +2,7 @@
 //! then wait for a quit request or the host's end.
 
 use crate::startup_retry::SessionStartup;
-use crate::{actions, components, events, guardwatch, keyhost, launch_timing, log, minimized, problem, selftest};
+use crate::{actions, components, events, guardwatch, keyhost, launch_timing, log, minimized, problem, reopen, selftest};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
@@ -99,6 +99,9 @@ fn shell(args: &Args) -> i32 {
         }
     };
     let exits = ExitRequests { quit, reload };
+    let _reload_capability = events::Owned::create(&launch_timing::reload_preserves_files_event(std::process::id()))
+        .inspect_err(|error| log::line(&format!("reload capability: {error}")))
+        .ok();
     let offered = args.ready_event.as_deref()
         .and_then(|name| events::Owned::open_for_signal(&launch_timing::staged_event(name)));
     let negotiated = offered.is_some();
@@ -144,6 +147,16 @@ fn shell(args: &Args) -> i32 {
     keyhost::start();
     if let Err(code) = exits.wait_parts(false) {
         return code;
+    }
+    if let Some(guard) = reopen::guard_stamp(guardwatch::pid()) {
+        match reopen::take(&log::dir(), guard) {
+            Ok(folders) if !folders.is_empty() => {
+                log::line(&format!("reload: reopening {} Files windows", folders.len()));
+                files::reopen_folders(folders);
+            }
+            Ok(_) => {}
+            Err(error) => log::line(&format!("reload: could not read Files windows: {error}")),
+        }
     }
     log::line(&format!("native desktop ready in {} ms", launched.elapsed().as_millis()));
     components::spawn_watchdog(false);
@@ -293,9 +306,18 @@ impl ExitRequests {
 }
 
 fn shutdown(code: i32) -> i32 {
+    let folders = (code == RELOAD).then(files::prepare_reload);
     keyhost::stop();
     components::shutdown_all();
-    if code != RELOAD {
+    if let Some(folders) = folders {
+        if let Some(guard) = reopen::guard_stamp(guardwatch::pid()) {
+            match reopen::save(&log::dir(), guard, &folders) {
+                Ok(()) if !folders.is_empty() => log::line(&format!("reload: saved {} Files windows", folders.len())),
+                Ok(()) => {}
+                Err(error) => log::line(&format!("reload: could not save Files windows: {error}")),
+            }
+        }
+    } else {
         minimized::restore();
     }
     code

@@ -138,13 +138,14 @@ impl Event {
     }
 
     pub fn set_existing(name: &str) -> Result<(), String> {
-        // SAFETY: opens and sets an event another process created.
-        unsafe {
-            let h = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(name)).map_err(|e| format!("{name}: {e}"))?;
-            let r = SetEvent(h).map_err(|e| e.to_string());
-            let _ = CloseHandle(h);
-            r
-        }
+        Self::open_for_signal(name)?.signal()
+    }
+
+    pub fn open_for_signal(name: &str) -> Result<Event, String> {
+        // SAFETY: the returned event owns its handle and closes it on drop.
+        unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(name)) }
+            .map(Event)
+            .map_err(|e| format!("{name}: {e}"))
     }
 
     pub fn signal(&self) -> Result<(), String> {
