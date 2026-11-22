@@ -40,12 +40,18 @@ thread_local! {
 
 static RUNNING: Mutex<Weak<Windows>> = Mutex::new(Weak::new());
 
-pub fn prepare_reload(limit: Duration) -> Option<Vec<String>> {
-    if !operations::drain_for_reload(limit) {
-        return None;
-    }
+fn folders_for_restart() -> Vec<String> {
     let windows = RUNNING.lock().unwrap().upgrade();
-    Some(windows.map(|windows| windows.folders_for_reload()).unwrap_or_default())
+    windows.map(|windows| windows.folders_for_reload()).unwrap_or_default()
+}
+
+pub fn prepare_graphics_restart() -> Vec<String> {
+    operations::drain_for_graphics_restart();
+    folders_for_restart()
+}
+
+pub fn prepare_reload(limit: Duration, graphics_lost: impl FnOnce() -> bool) -> Option<Vec<String>> {
+    operations::drain_for_reload(limit, graphics_lost).then(folders_for_restart)
 }
 
 pub fn reopen_folders(folders: Vec<String>) {

@@ -313,11 +313,7 @@ impl ExitRequests {
             log::line("quit requested");
             CLEAN
         } else if GRAPHICS_LOST.load(Ordering::Acquire) {
-            let folders = files::prepare_reload(FILE_DRAIN_LIMIT).unwrap_or_else(|| {
-                log::line("graphics restart: file operations did not finish before the deadline");
-                Vec::new()
-            });
-            return Some(restart(launch_timing::GRAPHICS_LOST as i32, &folders));
+            return Some(self.recover_graphics());
         } else if self.reload.wait(0) {
             return self.try_reload();
         } else if let Some(why) = problem::take() {
@@ -329,6 +325,12 @@ impl ExitRequests {
         Some(shutdown(code))
     }
 
+    fn recover_graphics(&self) -> i32 {
+        // File operations own native dialogs and can finish while the renderer is unavailable.
+        let folders = files::prepare_graphics_restart();
+        restart(graphics_restart_code(&self.reload), &folders)
+    }
+
     fn try_reload(&self) -> Option<i32> {
         log::line("reload requested");
         if let Some(event) = &self.postponed
@@ -336,7 +338,10 @@ impl ExitRequests {
         {
             log::line(&format!("reset reload postponed event: {error}"));
         }
-        let Some(folders) = files::prepare_reload(FILE_DRAIN_LIMIT) else {
+        let Some(folders) = files::prepare_reload(FILE_DRAIN_LIMIT, || GRAPHICS_LOST.load(Ordering::Acquire)) else {
+            if GRAPHICS_LOST.load(Ordering::Acquire) {
+                return Some(self.recover_graphics());
+            }
             log::line("reload postponed: accepted file operations still running");
             if let Err(error) = self.reload.reset() {
                 log::line(&format!("reset reload event: {error}"));
@@ -347,6 +352,14 @@ impl ExitRequests {
             return None;
         };
         Some(restart(RELOAD, &folders))
+    }
+}
+
+fn graphics_restart_code(reload: &events::Owned) -> i32 {
+    if reload.wait(0) {
+        RELOAD
+    } else {
+        launch_timing::GRAPHICS_LOST as i32
     }
 }
 
@@ -369,4 +382,21 @@ fn shutdown(code: i32) -> i32 {
         minimized::restore();
     }
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphics_recovery_uses_the_pending_reload_after_draining() {
+        let reload = events::Owned::create(&format!(
+            r"Local\explorust-test-graphics-reload-{}",
+            std::process::id(),
+        )).unwrap();
+
+        assert_eq!(graphics_restart_code(&reload), launch_timing::GRAPHICS_LOST as i32);
+        reload.signal().unwrap();
+        assert_eq!(graphics_restart_code(&reload), RELOAD);
+    }
 }
