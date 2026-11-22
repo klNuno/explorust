@@ -18,7 +18,7 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_LWIN,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetCursorPos, GetWindowRect, GetWindowThreadProcessId, KillTimer, SetForegroundWindow, SetTimer, ShowWindow, SW_SHOW};
+use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, GetClassNameW, GetCursorPos, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsZoomed, KillTimer, SetForegroundWindow, SetTimer, ShowWindow, SW_SHOW, WS_CAPTION};
 
 pub const TIMER_TIP: usize = 3;
 const TIP_DELAY_MS: u32 = 500;
@@ -444,8 +444,13 @@ fn is_fullscreen(fg: HWND, monitor: RECT, bar: HWND) -> bool {
         return false;
     }
     let mut r = RECT::default();
-    let _ = unsafe { GetWindowRect(fg, &mut r) };
-    if !to_rect(r).covers(&to_rect(monitor)) {
+    let maximized_framed = unsafe {
+        if GetWindowRect(fg, &mut r).is_err() {
+            return false;
+        }
+        IsZoomed(fg).as_bool() && GetWindowLongW(fg, GWL_STYLE) as u32 & WS_CAPTION.0 == WS_CAPTION.0
+    };
+    if !crate::settings::fullscreen_cover(to_rect(r), to_rect(monitor), maximized_framed) {
         return false;
     }
     let mut pid = 0u32;
@@ -460,7 +465,6 @@ fn is_fullscreen(fg: HWND, monitor: RECT, bar: HWND) -> bool {
     if SHELL_HOSTS.contains(&file.as_str()) {
         return false;
     }
-    log::line(&format!("fullscreen window {:#x} {class} {file}", fg.0 as usize));
     true
 }
 
