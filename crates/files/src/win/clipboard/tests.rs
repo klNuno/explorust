@@ -1,7 +1,7 @@
 use super::*;
 use crate::win::{
     inbox::Inbox,
-    operations::{Action, PasteTarget, Response, Worker},
+    operations::{Action, FILE_OPERATION_TEST_LOCK, PasteTarget, Response, Worker},
 };
 use std::{
     fs,
@@ -19,8 +19,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
 };
 use windows_core::{BOOL, HRESULT, Ref, implement};
-
-static CLIPBOARD: Mutex<()> = Mutex::new(());
 
 struct Fixture(PathBuf);
 
@@ -93,7 +91,7 @@ fn submit(worker: &Worker, folder: Pidl) {
 
 #[test]
 fn a_native_move_consumes_the_cut_even_when_the_source_path_is_recreated() {
-    let _clipboard = CLIPBOARD.lock().unwrap_or_else(|lock| lock.into_inner());
+    let _lock = FILE_OPERATION_TEST_LOCK.lock().unwrap_or_else(|lock| lock.into_inner());
     let fixture = Fixture::new("native-cut");
     let item = fixture.file("native-move.txt");
     let destination = fixture.folder("destination");
@@ -140,7 +138,7 @@ fn a_native_move_consumes_the_cut_even_when_the_source_path_is_recreated() {
 
 #[test]
 fn a_cut_can_only_be_reserved_by_one_destination_at_a_time() {
-    let _clipboard = CLIPBOARD.lock().unwrap_or_else(|lock| lock.into_inner());
+    let _lock = FILE_OPERATION_TEST_LOCK.lock().unwrap_or_else(|lock| lock.into_inner());
     let fixture = Fixture::new("cut");
     let item = fixture.file("move-only-once.txt");
     let winner = fixture.folder("winner");
@@ -180,7 +178,7 @@ fn a_cut_can_only_be_reserved_by_one_destination_at_a_time() {
 
 #[test]
 fn a_newer_native_copy_is_not_replaced_by_retiring_an_older_cut() {
-    let _clipboard = CLIPBOARD.lock().unwrap_or_else(|lock| lock.into_inner());
+    let _lock = FILE_OPERATION_TEST_LOCK.lock().unwrap_or_else(|lock| lock.into_inner());
     let fixture = Fixture::new("native-copy-wins");
     let old = fixture.file("old-cut.txt");
     let next = fixture.file("native-copy.txt");
@@ -225,7 +223,7 @@ fn a_newer_native_copy_is_not_replaced_by_retiring_an_older_cut() {
 
 #[test]
 fn repeated_pastes_from_a_held_provider_do_not_block_the_next_clipboard_owner() {
-    let _clipboard = CLIPBOARD.lock().unwrap_or_else(|lock| lock.into_inner());
+    let _lock = FILE_OPERATION_TEST_LOCK.lock().unwrap_or_else(|lock| lock.into_inner());
     let fixture = Fixture::new("clipboard-delay");
     let foreign = fixture.file("foreign-render.txt");
     let next = fixture.file("healthy-native.txt");

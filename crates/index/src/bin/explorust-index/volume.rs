@@ -4,9 +4,9 @@ use crate::retry::{self, LinkRetry};
 use crate::{log, metadata};
 use fsindex::table::{RecState, Table};
 use fsindex::usn::{self, Record};
+use parking_lot::{RwLock, RwLockWriteGuard};
 use std::collections::HashMap;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::RwLock;
 use std::time::Instant;
 use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE, ERROR_MORE_DATA, GENERIC_READ, HANDLE,
@@ -182,7 +182,7 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -
     let mut buf = vec![0u8; 8 << 10];
     let (mut looked, mut added, mut failed) = (0, 0, 0);
     {
-        let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+        let mut t = table.write();
         if t.id() != id {
             return (0, 0, failed);
         }
@@ -190,7 +190,7 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -
     }
     for chunk in frns.chunks(256) {
         let (pruned, since) = {
-            let t = table.read().unwrap_or_else(|p| p.into_inner());
+            let t = table.read();
             if t.id() != id {
                 break;
             }
@@ -207,7 +207,7 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -
         if found.is_empty() {
             continue;
         }
-        let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+        let mut t = table.write();
         if t.id() != id {
             break;
         }
@@ -217,7 +217,7 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -
             }
         }
     }
-    let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+    let mut t = table.write();
     if t.id() == id {
         t.watch_touches(false);
     }
@@ -351,7 +351,7 @@ impl Volume {
             records.push(r);
         });
         let now = Instant::now();
-        let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+        let mut t = table.write();
         let mut refs = HashMap::new();
         for r in &records {
             let rec = r.rec as u32;
@@ -388,7 +388,7 @@ impl Volume {
         let due: Vec<_> = retries.extract_if(|_, job| job.due <= now).collect();
         for (rec, job) in due {
             if let Some(info) = lookup(job.frn) {
-                let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+                let mut t = table.write();
                 t.touch(rec);
                 if info.names.len() > 1 {
                     t.mark_alias_parents(info.names.iter().map(|&(parent, _)| parent));
@@ -406,7 +406,7 @@ impl Volume {
                 let next = job.after_failure(Instant::now());
                 if next.recovering() && !job.recovering() {
                     if job.repair_name {
-                        let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+                        let mut t = table.write();
                         t.touch(rec);
                         t.prune(rec);
                     }
@@ -440,7 +440,7 @@ impl Volume {
             let got = match ioctl(self.h, FSCTL_READ_USN_JOURNAL, &rd, &mut buf) {
                 Ok(n) => n,
                 Err(e) => {
-                    table.write().unwrap_or_else(|p| p.into_inner()).journal_current = false;
+                    table.write().journal_current = false;
                     return e;
                 }
             };
@@ -450,18 +450,30 @@ impl Volume {
             if got > 8 {
                 changes += self.changes(&buf[8..got], table, &mut retries);
             } else if !caught_up {
-                table.write().unwrap_or_else(|p| p.into_inner()).journal_current = true;
+                table.write().journal_current = true;
                 caught_up = true;
             }
-            if !retries.is_empty() {
+            let had_retries = !retries.is_empty();
+            if had_retries {
                 self.retry_links(table, &mut retries, |frn| hard_links(self.h, frn, &mut links_buf));
+            }
+            if got > 8 || had_retries {
+                loop {
+                    let mut names = table.write();
+                    let more = names.compact_pending_slice();
+                    // Pass the lock to any waiting reader before this writer can reacquire it.
+                    RwLockWriteGuard::unlock_fair(names);
+                    if !more {
+                        break;
+                    }
+                }
             }
             if got <= 8 && let Some(deadline) = retries.values().map(|r| r.due).min() {
                 // Keep following unrelated journal changes while a long retry is pending.
                 std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(retry::RETRY_INTERVAL));
             }
             if since.elapsed().as_secs() >= 600 {
-                log::line(&format!("{}: {changes} journal records in the last {} s, {} names", self.letter, since.elapsed().as_secs(), table.read().map(|t| t.len()).unwrap_or(0)));
+                log::line(&format!("{}: {changes} journal records in the last {} s, {} names", self.letter, since.elapsed().as_secs(), table.read().len()));
                 changes = 0;
                 since = Instant::now();
             }
@@ -540,7 +552,7 @@ mod tests {
         volume.retry_links(&table, &mut retries, |frn| hard_links(volume.h, frn, &mut buffer));
 
         assert!(retries.is_empty());
-        let names = table.read().unwrap();
+        let names = table.read();
         let hits = names.query_scope("survivor", 10, "C:\\", "C:\\Second").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(names.path(hits[0].rec, "C:\\").as_deref(), Some("C:\\Second\\survivor.txt"));
@@ -568,8 +580,8 @@ mod tests {
             volume.retry_links(&table, &mut retries, |_| None);
         }
         assert!(retries[&rec].recovering());
-        assert_eq!(table.read().unwrap().state(rec), RecState::Pruned);
-        assert!(table.read().unwrap().query_scope("unrelated", 10, "C:\\", "C:\\Other").is_none());
+        assert_eq!(table.read().state(rec), RecState::Pruned);
+        assert!(table.read().query_scope("unrelated", 10, "C:\\", "C:\\Other").is_none());
 
         retries.get_mut(&rec).unwrap().due = Instant::now();
         volume.retry_links(&table, &mut retries, |_| Some(LinkInfo {
@@ -577,7 +589,7 @@ mod tests {
             modified: 1,
         }));
         assert!(retries.is_empty());
-        let names = table.read().unwrap();
+        let names = table.read();
         assert_eq!(names.query_scope("unrelated", 10, "C:\\", "C:\\Other").unwrap().len(), 1);
         assert_eq!(names.name(rec).as_deref(), Some("survivor.txt"));
     }

@@ -571,6 +571,9 @@ impl Bar {
 
     fn rebuild(&mut self) {
         self.groups = self.model.groups();
+        if let Some(scene) = &mut self.scene {
+            scene.keep_window_icons(&self.groups);
+        }
         let n = self.groups.len() + 1;
         self.hover_v.resize(n, 0.0);
         self.press_v.resize(n, 0.0);

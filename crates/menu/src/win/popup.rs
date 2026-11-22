@@ -65,7 +65,6 @@ pub struct Commands {
 struct Win {
     hwnd: HWND,
     surface: Surface,
-    size: (u32, u32),
     /// Handler icons as D2D bitmaps of this window's device, by hash of their pixels: made once,
     /// kept across opens.
     icons: HashMap<u64, ID2D1Bitmap1>,
@@ -170,7 +169,7 @@ fn new_window(root: bool) -> windows_core::Result<Win> {
         let dark = 1u32;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
         let surface = Surface::new(hwnd, 64, 64)?;
-        Ok(Win { hwnd, surface, size: (64, 64), icons: HashMap::new() })
+        Ok(Win { hwnd, surface, icons: HashMap::new() })
     }
 }
 
@@ -281,10 +280,7 @@ impl Ui {
             model::place(at.left, at.top, w, h, area)
         };
         let win = &mut self.pool[depth];
-        if win.size != (w as u32, h as u32) {
-            win.surface.resize(w as u32, h as u32)?;
-            win.size = (w as u32, h as u32);
-        }
+        win.surface.resize(w as u32, h as u32)?;
         let (bitmaps, _) = win.icons_of(&entries);
         let level = Level { win: depth, entries, top, layout, hover: None, open: None, bitmaps, origin: (x, y) };
         self.levels.push(level);
@@ -328,9 +324,13 @@ impl Ui {
         }
         while self.levels.len() > depth {
             let l = self.levels.pop().unwrap();
+            let win = &mut self.pool[l.win];
             // SAFETY: hides our own popup.
             unsafe {
-                let _ = ShowWindow(self.pool[l.win].hwnd, SW_HIDE);
+                let _ = ShowWindow(win.hwnd, SW_HIDE);
+            }
+            if let Err(e) = win.surface.resize(64, 64) {
+                log::line(&format!("hidden menu resize: {e}"));
             }
         }
         if let Some(parent) = depth.checked_sub(1).and_then(|d| self.levels.get_mut(d)) {
@@ -460,11 +460,8 @@ impl Ui {
         let area = work_area(self.at.x, self.at.y);
         let (x, y) = model::place(self.at.x, self.at.y, w, h, area);
         let win = &mut self.pool[0];
-        if win.size != (w as u32, h as u32) {
-            if let Err(e) = win.surface.resize(w as u32, h as u32) {
-                log::line(&format!("merge resize: {e}"));
-            }
-            win.size = (w as u32, h as u32);
+        if let Err(e) = win.surface.resize(w as u32, h as u32) {
+            log::line(&format!("merge resize: {e}"));
         }
         let (bitmaps, icons) = win.icons_of(&list);
         let hover = match (hover, hover_verb) {

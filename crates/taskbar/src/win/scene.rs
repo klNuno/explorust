@@ -90,6 +90,14 @@ impl Scene {
         self.icons.insert(key.to_string(), bmp);
     }
 
+    pub fn keep_window_icons(&mut self, groups: &[crate::model::Group]) {
+        // Keep previously used icons hot across app reopens, but bound entries that are no
+        // longer pinned or running. The currently visible icons are never evicted.
+        if self.icons.len() > groups.len() + 128 {
+            self.icons.retain(|key, _| groups.iter().any(|group| group.key == *key));
+        }
+    }
+
     pub fn set_overlay(&mut self, hwnd: isize, img: Option<shelldata::Image>) {
         match img.and_then(|i| self.surface.bitmap(i.width, i.height, &i.to_premultiplied_bgra()).ok()) {
             Some(b) => {

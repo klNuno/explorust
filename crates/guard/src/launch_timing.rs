@@ -4,6 +4,7 @@ use std::io::{self, Read};
 use std::time::Duration;
 
 pub const FALLBACK_EVENT: &str = r"Local\explorust-guard-fallback";
+pub const GRAPHICS_LOST: u32 = 7;
 pub const RELOAD_EVENT: &str = r"Local\explorust-reload";
 
 pub fn reload_preserves_files_event(pid: u32) -> String {

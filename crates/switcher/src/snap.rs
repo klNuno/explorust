@@ -24,9 +24,6 @@ use windows_core::{PCWSTR, w};
 
 const CLASS: PCWSTR = w!("explorust.switcher.snap");
 const TINT: u32 = 0xCC20_2020;
-/// Largest flyout surface, in DIPs; the window clips it.
-const SURFACE: f32 = 400.0;
-
 struct Snap {
     hwnd: HWND,
     shown: bool,
@@ -148,9 +145,12 @@ pub fn toggle() {
             let y = (frame.top + (32.0 * sc) as i32 + 4).clamp(s.work.top + 8, s.work.bottom - fh - 8);
             let _ = SetWindowPos(s.hwnd, Some(HWND_TOPMOST), x, y, fw, fh, SWP_NOACTIVATE);
             pos = (x, y);
-            if s.painter.is_none() {
-                let side = (SURFACE * sc).round() as u32;
-                match Painter::new(s.hwnd, side, side) {
+            if let Some(painter) = &s.painter {
+                if let Err(e) = painter.resize(fw as u32, fh as u32) {
+                    log::line(&format!("snap resize: {e}"));
+                }
+            } else {
+                match Painter::new(s.hwnd, fw as u32, fh as u32) {
                     Ok(p) => s.painter = Some(p),
                     Err(e) => log::line(&format!("snap painter: {e}")),
                 }
@@ -202,6 +202,9 @@ fn hide(refocus: bool) {
         // SAFETY: our own window.
         unsafe {
             let _ = ShowWindow(s.hwnd, SW_HIDE);
+        }
+        if let Some(painter) = &s.painter && let Err(e) = painter.resize(1, 1) {
+            log::line(&format!("hidden snap resize: {e}"));
         }
         Some(s.target)
     })

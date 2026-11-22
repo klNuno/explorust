@@ -131,7 +131,7 @@ fn r(x: &Rect) -> D2D_RECT_F {
 
 impl Start {
     pub fn new(hwnd: HWND, scale: f32, s: &'static Strings, user: String) -> Result<Self> {
-        let surface = Surface::with_buffers(hwnd, (L::W * scale).round() as u32, (L::H * scale).round() as u32, 3)?;
+        let surface = Surface::with_buffers(hwnd, 1, 1, 3)?;
         let text = Text::new()?;
         let brush = surface.brush(WHITE)?;
         let base: ID2D1Brush = brush.cast()?;
@@ -199,6 +199,10 @@ impl Start {
 
     pub fn bitmap(&self, img: &shelldata::Image) -> Option<ID2D1Bitmap1> {
         self.surface.bitmap(img.width, img.height, &img.to_premultiplied_bgra()).ok()
+    }
+
+    pub fn resize_surface(&self, width: u32, height: u32) -> Result<()> {
+        self.surface.resize(width, height)
     }
 
     pub fn set_apps(&mut self, apps: Vec<App>, recents: Vec<Recent>, now: i64) {

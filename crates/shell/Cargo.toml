@@ -18,6 +18,7 @@ start = { path = "../start" }
 switcher = { path = "../switcher" }
 notify = { path = "../notify" }
 files = { path = "../files" }
+render = { path = "../render" }
 inject = { path = "../inject" }
 windows = { workspace = true, features = [
   "Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_System_SystemInformation",

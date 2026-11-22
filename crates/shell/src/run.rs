@@ -4,6 +4,7 @@
 use crate::startup_retry::SessionStartup;
 use crate::{actions, components, events, guardwatch, keyhost, launch_timing, log, minimized, problem, reopen, selftest};
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
 
@@ -16,6 +17,7 @@ pub const RELOAD: i32 = 5;
 /// A problem found inside (`problem`): the guard starts explorer.exe and tells the user.
 pub const PROBLEM: i32 = 6;
 const FILE_DRAIN_LIMIT: Duration = Duration::from_secs(120);
+static GRAPHICS_LOST: AtomicBool = AtomicBool::new(false);
 struct Args {
     ready_event: Option<String>,
     staged_ready: bool,
@@ -99,6 +101,13 @@ fn shell(args: &Args) -> i32 {
             return HOST_FAILED;
         }
     };
+    if components::parts_off().iter().any(|line| line == "render-stats") {
+        render::Device::trace(log::line);
+    }
+    render::Device::on_device_lost(|error| {
+        log::line(&format!("graphics device lost: {error}"));
+        GRAPHICS_LOST.store(true, Ordering::Release);
+    });
     let postponed = events::Owned::create(&launch_timing::reload_postponed_event(std::process::id()))
         .inspect_err(|error| log::line(&format!("reload postponed event: {error}")))
         .ok();
@@ -303,6 +312,8 @@ impl ExitRequests {
         let code = if self.quit.wait(wait) {
             log::line("quit requested");
             CLEAN
+        } else if GRAPHICS_LOST.load(Ordering::Acquire) {
+            return Some(self.recover_graphics());
         } else if self.reload.wait(0) {
             return self.try_reload();
         } else if let Some(why) = problem::take() {
@@ -314,6 +325,12 @@ impl ExitRequests {
         Some(shutdown(code))
     }
 
+    fn recover_graphics(&self) -> i32 {
+        // File operations own native dialogs and can finish while the renderer is unavailable.
+        let folders = files::prepare_graphics_restart();
+        restart(graphics_restart_code(&self.reload), &folders)
+    }
+
     fn try_reload(&self) -> Option<i32> {
         log::line("reload requested");
         if let Some(event) = &self.postponed
@@ -321,7 +338,10 @@ impl ExitRequests {
         {
             log::line(&format!("reset reload postponed event: {error}"));
         }
-        let Some(folders) = files::prepare_reload(FILE_DRAIN_LIMIT) else {
+        let Some(folders) = files::prepare_reload(FILE_DRAIN_LIMIT, || GRAPHICS_LOST.load(Ordering::Acquire)) else {
+            if GRAPHICS_LOST.load(Ordering::Acquire) {
+                return Some(self.recover_graphics());
+            }
             log::line("reload postponed: accepted file operations still running");
             if let Err(error) = self.reload.reset() {
                 log::line(&format!("reset reload event: {error}"));
@@ -331,23 +351,52 @@ impl ExitRequests {
             }
             return None;
         };
-        let code = shutdown(RELOAD);
-        if let Some(guard) = reopen::guard_stamp(guardwatch::pid()) {
-            match reopen::save(&log::dir(), guard, &folders) {
-                Ok(()) if !folders.is_empty() => log::line(&format!("reload: saved {} Files windows", folders.len())),
-                Ok(()) => {}
-                Err(error) => log::line(&format!("reload: could not save Files windows: {error}")),
-            }
-        }
-        Some(code)
+        Some(restart(RELOAD, &folders))
     }
+}
+
+fn graphics_restart_code(reload: &events::Owned) -> i32 {
+    if reload.wait(0) {
+        RELOAD
+    } else {
+        launch_timing::GRAPHICS_LOST as i32
+    }
+}
+
+fn restart(code: i32, folders: &[String]) -> i32 {
+    let code = shutdown(code);
+    if let Some(guard) = reopen::guard_stamp(guardwatch::pid()) {
+        match reopen::save(&log::dir(), guard, folders) {
+            Ok(()) if !folders.is_empty() => log::line(&format!("restart: saved {} Files windows", folders.len())),
+            Ok(()) => {}
+            Err(error) => log::line(&format!("restart: could not save Files windows: {error}")),
+        }
+    }
+    code
 }
 
 fn shutdown(code: i32) -> i32 {
     keyhost::stop();
     components::shutdown_all();
-    if code != RELOAD {
+    if code != RELOAD && code != launch_timing::GRAPHICS_LOST as i32 {
         minimized::restore();
     }
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphics_recovery_uses_the_pending_reload_after_draining() {
+        let reload = events::Owned::create(&format!(
+            r"Local\explorust-test-graphics-reload-{}",
+            std::process::id(),
+        )).unwrap();
+
+        assert_eq!(graphics_restart_code(&reload), launch_timing::GRAPHICS_LOST as i32);
+        reload.signal().unwrap();
+        assert_eq!(graphics_restart_code(&reload), RELOAD);
+    }
 }

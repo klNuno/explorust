@@ -3,8 +3,8 @@
 use super::{frame, gfx, inbox::Inbox, log, shell, ui_language};
 use shell::Pidl;
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::DwmFlush;
@@ -25,13 +25,14 @@ pub struct Open {
 }
 
 enum Job {
-    Open(Open),
+    OpenHome(Open),
     Close,
 }
 
+#[derive(Clone)]
 struct Window {
     inbox: Arc<Inbox<Job>>,
-    prepared: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
     folder: Arc<Mutex<Option<String>>>,
 }
 
@@ -69,7 +70,7 @@ impl Windows {
 
     pub fn prewarm(self: &Arc<Self>) {
         let mut state = self.sessions.lock().unwrap();
-        if state.closing || state.spare.as_ref().is_some_and(|window| !window.inbox.closed()) {
+        if state.closing || state.spare.as_ref().is_some_and(|spare| !spare.inbox.closed()) {
             return;
         }
         let at = state.position();
@@ -82,17 +83,16 @@ impl Windows {
             return;
         }
         state.open.retain(|window| !window.inbox.closed());
-        let window = if matches!(request.destination, Destination::Home)
-            && state.spare.as_ref().is_some_and(|w| w.prepared.load(Ordering::Acquire) && !w.inbox.closed())
+        if matches!(request.destination, Destination::Home)
+            && request.position.is_none()
+            && let Some(spare) = state.spare.take_if(|spare| spare.ready.load(Ordering::Acquire))
+            && spare.inbox.send(Job::OpenHome(Open { destination: Destination::Home, ..request }))
         {
-            let window = state.spare.take().unwrap();
-            window.inbox.send(Job::Open(request));
-            Some(window)
-        } else {
-            let at = request.position.unwrap_or_else(|| state.position());
-            self.spawn(at, Some(request))
-        };
-        if let Some(window) = window {
+            state.open.push(spare);
+            return;
+        }
+        let at = request.position.unwrap_or_else(|| state.position());
+        if let Some(window) = self.spawn(at, Some(request)) {
             state.open.push(window);
         }
     }
@@ -107,8 +107,8 @@ impl Windows {
     pub fn shutdown(&self) {
         let mut state = self.sessions.lock().unwrap();
         state.closing = true;
-        if let Some(window) = state.spare.take() {
-            window.inbox.stop(Job::Close);
+        if let Some(spare) = state.spare.take() {
+            spare.inbox.stop(Job::Close);
         }
         for window in state.open.drain(..) {
             window.inbox.stop(Job::Close);
@@ -116,24 +116,21 @@ impl Windows {
     }
 
     fn spawn(self: &Arc<Self>, at: (i32, i32), request: Option<Open>) -> Option<Window> {
-        let inbox = Arc::new(Inbox::default());
-        if let Some(request) = request {
-            inbox.send(Job::Open(request));
-        }
-        let prepared = Arc::new(AtomicBool::new(false));
-        let worker = inbox.clone();
-        let signal = prepared.clone();
-        let folder = Arc::new(Mutex::new(None));
-        let location = folder.clone();
+        let window = Window {
+            inbox: Arc::new(Inbox::default()),
+            ready: Arc::new(AtomicBool::new(false)),
+            folder: Arc::new(Mutex::new(None)),
+        };
+        let worker = window.clone();
         let owner = Arc::downgrade(self);
         let cmd = self.cmd;
         if let Err(error) = std::thread::Builder::new().name("files-view".into()).spawn(move || {
-            run(owner, cmd, worker, signal, location, at);
+            run(owner, cmd, worker, request, at);
         }) {
             log::line(&format!("could not start a Files view thread: {error}"));
             return None;
         }
-        Some(Window { inbox, prepared, folder })
+        Some(window)
     }
 }
 
@@ -153,30 +150,22 @@ impl Drop for Ole {
     }
 }
 
-fn run(owner: Weak<Windows>, cmd: isize, inbox: Arc<Inbox<Job>>, prepared: Arc<AtomicBool>, folder: Arc<Mutex<Option<String>>>, at: (i32, i32)) {
-    let jobs = inbox.attach();
+fn run(owner: Weak<Windows>, cmd: isize, window: Window, request: Option<Open>, at: (i32, i32)) {
+    let jobs = window.inbox.attach();
+    if window.inbox.closed() {
+        return;
+    }
     if let Err(error) = unsafe { OleInitialize(None) } {
         log::line(&format!("Files view OLE initialization failed: {error}"));
         return;
     }
     let _ole = Ole;
     OWNER.with(|slot| *slot.borrow_mut() = owner);
-    let t0 = Instant::now();
-    let initial = jobs.next();
-    let (request, place, selection, label) = match initial {
-        Some(Job::Close) => return,
-        Some(Job::Open(request)) => {
-            // No native view exists yet for explicit opens. A blocking provider cannot delay
-            // the bus, a warmed Home window, or any other view.
-            let Some((place, selection, label)) = resolve(&request.destination) else { return };
-            (Some(request), place, selection, label)
-        }
-        None => {
-            let Some(home) = shell::home() else { return };
-            (None, home, None, String::from("Home"))
-        }
-    };
-    if inbox.closed() {
+    let start = Instant::now();
+    // A blocking provider can only delay its own window.
+    let destination = request.as_ref().map_or(&Destination::Home, |request| &request.destination);
+    let Some((place, selection, label)) = resolve(destination) else { return };
+    if window.inbox.closed() {
         return;
     }
     let sh = match gfx::Shared::new() {
@@ -187,7 +176,7 @@ fn run(owner: Weak<Windows>, cmd: isize, inbox: Arc<Inbox<Job>>, prepared: Arc<A
         }
     };
     frame::init(sh, crate::text::for_language(&ui_language()), HWND(cmd as _));
-    let hwnd = match frame::create(&place, at.0, at.1, folder) {
+    let hwnd = match frame::create(&place, at.0, at.1, request.is_none(), window.folder) {
         Ok(hwnd) => hwnd,
         Err(error) => {
             log::line(&format!("opening {label:?} failed: {error}"));
@@ -198,19 +187,15 @@ fn run(owner: Weak<Windows>, cmd: isize, inbox: Arc<Inbox<Job>>, prepared: Arc<A
     if let Some(request) = request {
         show(hwnd, &place, selection, &label, &request, false);
     } else {
-        log::line(&format!("spare window prepared in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
-        prepared.store(true, Ordering::Release);
+        window.ready.store(true, Ordering::Release);
+        log::line(&format!("Home spare prepared in {:.1} ms", start.elapsed().as_secs_f64() * 1000.0));
     }
     let mut msg = MSG::default();
     loop {
-        while let Some(job) = jobs.next() {
-            match job {
-                Job::Open(request) => show(hwnd, &place, None, "Home", &request, true),
-                Job::Close => {
-                    frame::clear_thread();
-                    return;
-                }
-            }
+        match jobs.next() {
+            Some(Job::OpenHome(request)) => show(hwnd, &place, None, "Home", &request, true),
+            Some(Job::Close) => break,
+            None => {}
         }
         if unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 <= 0 {
             break;
@@ -244,7 +229,7 @@ fn resolve(destination: &Destination) -> Option<(Pidl, Option<Pidl>, String)> {
     }
 }
 
-fn show(hwnd: HWND, place: &Pidl, selection: Option<Pidl>, label: &str, request: &Open, spare: bool) {
+fn show(hwnd: HWND, place: &Pidl, selection: Option<Pidl>, label: &str, request: &Open, prepared: bool) {
     frame::set_opened(hwnd, request.requested);
     if let Some(item) = selection {
         frame::select_after(hwnd, item);
@@ -254,9 +239,9 @@ fn show(hwnd: HWND, place: &Pidl, selection: Option<Pidl>, label: &str, request:
     let presented = before + show_ms + draw_ms;
     let _ = unsafe { DwmFlush() };
     let composed = request.requested.elapsed().as_secs_f64() * 1000.0;
-    let from = if spare { "ready window" } else { "new window" };
+    let origin = if prepared { "prepared window" } else { "new window" };
     log::line(&format!(
-        "open {label}: first frame presented {presented:.1} ms after the command ({from}, queued {} ms; \
+        "open {label}: first frame presented {presented:.1} ms after the command ({origin}, queued {} ms; \
          prepare {before:.1}, ShowWindow {show_ms:.1}, draw and Present {draw_ms:.1}), activated after it in \
          {activate_ms:.1} ms, composed by {composed:.1} ms", request.queued_ms
     ));

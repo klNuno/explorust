@@ -84,6 +84,14 @@ impl Painter {
         Ok(Self { surface, text, title, center, glyph, big_glyph, bitmaps: HashMap::new() })
     }
 
+    pub fn resize(&self, w_px: u32, h_px: u32) -> Result<()> {
+        self.surface.resize(w_px, h_px)
+    }
+
+    pub fn keep_icons(&mut self, icons: &HashMap<String, Option<Image>>) {
+        self.bitmaps.retain(|key, _| icons.contains_key(key));
+    }
+
     fn bitmap(&mut self, key: &str, icons: &HashMap<String, Option<Image>>) -> Option<ID2D1Bitmap1> {
         if let Some(b) = self.bitmaps.get(key) {
             return Some(b.clone());

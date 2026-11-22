@@ -1,5 +1,5 @@
 //! The Files part on its UI thread: the command window `explorust.files` (bus commands and the
-//! `WM_COPYDATA` handover), a hidden window kept ready, and the message loop.
+//! `WM_COPYDATA` handover) and the message loop.
 
 mod chrome;
 mod clipboard;
@@ -32,7 +32,6 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_core::HSTRING;
 
 const TIMER_SPARE: usize = 1;
-/// The next ready window is made this long after a window opened, off its first frames.
 const SPARE_DELAY_MS: u32 = 800;
 
 thread_local! {
@@ -41,12 +40,18 @@ thread_local! {
 
 static RUNNING: Mutex<Weak<Windows>> = Mutex::new(Weak::new());
 
-pub fn prepare_reload(limit: Duration) -> Option<Vec<String>> {
-    if !operations::drain_for_reload(limit) {
-        return None;
-    }
+fn folders_for_restart() -> Vec<String> {
     let windows = RUNNING.lock().unwrap().upgrade();
-    Some(windows.map(|windows| windows.folders_for_reload()).unwrap_or_default())
+    windows.map(|windows| windows.folders_for_reload()).unwrap_or_default()
+}
+
+pub fn prepare_graphics_restart() -> Vec<String> {
+    operations::drain_for_graphics_restart();
+    folders_for_restart()
+}
+
+pub fn prepare_reload(limit: Duration, graphics_lost: impl FnOnce() -> bool) -> Option<Vec<String>> {
+    operations::drain_for_reload(limit, graphics_lost).then(folders_for_restart)
 }
 
 pub fn reopen_folders(folders: Vec<String>) {
@@ -72,13 +77,12 @@ pub fn ui_language() -> String {
     }
 }
 
-fn request_open(hwnd: HWND, destination: Destination, requested: Instant, queued_ms: u32) {
+fn request_open(destination: Destination, requested: Instant, queued_ms: u32) {
     VIEWS.with(|views| {
         if let Some(views) = views.borrow().as_ref() {
             views.open(Open { destination, position: None, requested, queued_ms });
         }
     });
-    let _ = unsafe { SetTimer(Some(hwnd), TIMER_SPARE, SPARE_DELAY_MS, None) };
 }
 
 unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -92,7 +96,8 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         if arg != 0 {
                             log::line(&format!("FilesOpen lParam {arg}: no path protocol yet, opening Home"));
                         }
-                        request_open(hwnd, Destination::Home, t0, queued);
+                        request_open(Destination::Home, t0, queued);
+                        let _ = SetTimer(Some(hwnd), TIMER_SPARE, SPARE_DELAY_MS, None);
                     }
                     Some((bus::Command::Shutdown, _)) => {
                         log::line("shutdown");
@@ -113,7 +118,7 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 let Some(path) = handover::decode(bytes) else { return LRESULT(0) };
                 // Reply first: the sender waits in SendMessage.
                 let _ = ReplyMessage(LRESULT(1));
-                request_open(hwnd, Destination::Path(path, select), t0, 0);
+                request_open(Destination::Path(path, select), t0, 0);
                 LRESULT(1)
             }
             clipboard::MSG_COMMAND => {
@@ -123,7 +128,9 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             WM_TIMER if wp.0 == TIMER_SPARE => {
                 let _ = KillTimer(Some(hwnd), TIMER_SPARE);
                 VIEWS.with(|views| {
-                    if let Some(views) = views.borrow().as_ref() { views.prewarm() }
+                    if let Some(views) = views.borrow().as_ref() {
+                        views.prewarm();
+                    }
                 });
                 LRESULT(0)
             }
@@ -192,9 +199,10 @@ pub fn run_with_initial(initial: Option<&str>) {
     *RUNNING.lock().unwrap() = Arc::downgrade(&windows);
     VIEWS.with(|views| *views.borrow_mut() = Some(windows.clone()));
     log::line(&format!("files: listening in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
-    windows.prewarm();
     if let Some(path) = initial {
-        request_open(cmd, Destination::Path(path.to_owned(), false), Instant::now(), 0);
+        request_open(Destination::Path(path.to_owned(), false), Instant::now(), 0);
+    } else {
+        windows.prewarm();
     }
     let mut msg = MSG::default();
     unsafe {

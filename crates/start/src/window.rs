@@ -135,8 +135,7 @@ fn create() -> windows_core::Result<()> {
         let (x, y, w, h) = L::place(0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), scale);
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         let s = strings::for_langid(GetUserDefaultUILanguage());
-        let mut start = Start::new(hwnd, scale, s, user_name())?;
-        start.draw()?;
+        let start = Start::new(hwnd, scale, s, user_name())?;
         ST.with(|c| *c.borrow_mut() = Some(start));
         log::line(&format!("start: resident window ready, cloaked, scale {scale}, {}", if s.french { "fr" } else { "en" }));
         spawn_loader(hwnd, (L::TILE_ICON * scale).round() as i32);
@@ -206,7 +205,9 @@ fn on_loaded(l: Loaded) {
             s.recs.len()
         ));
         s.warm();
-        let _ = s.draw();
+        if s.shown {
+            let _ = s.draw();
+        }
     });
 }
 
@@ -276,20 +277,25 @@ fn open(search: bool, msg_time: i32) {
     search::reset_input();
     // SAFETY: tick count and window queries.
     let (queued, prev) = unsafe { ((GetTickCount() as i32).wrapping_sub(msg_time), GetForegroundWindow()) };
-    let Some((hwnd, scale, drew)) = with(|s| {
+    let Some(Some((hwnd, scale))) = with(|s| {
         s.reset();
+        let w = (L::W * s.scale).round() as u32;
+        let h = (L::H * s.scale).round() as u32;
+        if let Err(e) = s.resize_surface(w, h) {
+            log::line(&format!("start resize: {e}"));
+            return None;
+        }
         if search {
             s.search_focus = true;
             s.focus = Hit::Search;
-            s.dirty = true;
         }
-        let drew = s.dirty;
-        if drew {
-            let _ = s.draw();
+        if let Err(e) = s.draw() {
+            log::line(&format!("start draw: {e}"));
+            return None;
         }
         s.shown = true;
         s.prev_fg = prev;
-        (s.hwnd, s.scale, drew)
+        Some((s.hwnd, s.scale))
     }) else {
         return;
     };
@@ -321,7 +327,7 @@ fn open(search: bool, msg_time: i32) {
             frames += 1;
         }
         log::line(&format!(
-            "open{}: key to handler {queued} ms (message time), handler to first presented frame {first:.1} ms (redraw {drew}), foreground {fg}, slide {frames} frames in {:.0} ms",
+            "open{}: key to handler {queued} ms (message time), handler to first presented frame {first:.1} ms, foreground {fg}, slide {frames} frames in {:.0} ms",
             if search { " on search" } else { "" },
             a.elapsed().as_secs_f32() * 1000.0
         ));
@@ -359,8 +365,8 @@ fn hide(restore: bool, why: &str) {
     log::line(&format!("hide: {why}"));
     with(|s| {
         s.reset();
-        if s.dirty {
-            let _ = s.draw();
+        if let Err(e) = s.resize_surface(1, 1) {
+            log::line(&format!("hidden start resize: {e}"));
         }
     });
 }

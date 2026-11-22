@@ -21,6 +21,8 @@ enum End {
     Fallback(String),
     /// explorust exited with code 5 (`explorust --reload`).
     Reload,
+    /// All render targets in this process need a fresh graphics device.
+    GraphicsLost,
 }
 
 /// The exit code of `explorust --reload`.
@@ -44,6 +46,7 @@ pub fn run(adopt: Option<(u32, Option<String>)>) -> u32 {
     let mut attempt = 0u32;
     let mut adopted = None;
     let mut startup = SessionStartup::default();
+    let mut graphics_restarted_at = None;
     if let Some((pid, name)) = adopt {
         log::line(&format!("guard adopts explorust pid {pid}: its guard ended"));
         match Child::open(pid) {
@@ -86,25 +89,37 @@ pub fn run(adopt: Option<(u32, Option<String>)>) -> u32 {
                 run_once(&exe, attempt, self_test, &build, &fallback, &mut startup)
             }
         };
-        match end {
-            End::Reload => swap_next(&exe),
+        let why = match end {
+            End::Reload => {
+                swap_next(&exe);
+                continue;
+            }
             End::Fallback(why) => {
                 let _ = fallback.signal();
                 log::line(&format!("fallback: {why}"));
                 return explorer_forever(None);
             }
-            End::Problem(why) => {
-                let _ = fallback.signal();
-                let streak = reg::problem_streak() + 1;
-                reg::set_problem_streak(streak);
-                reg::set_logon_had_problem(true);
-                log::line(&format!("problem: {why}; plain explorer for this session (problem logons in a row: {streak})"));
-                if streak >= MAX_STREAK {
-                    return explorer_forever(Some(turn_off(&format!("{why} (a problem at {streak} sign-ins in a row)"))));
+            End::GraphicsLost => {
+                let now = Instant::now();
+                let recovery = launch_timing::NATIVE_BUDGET + launch_timing::IMMERSIVE_BUDGET;
+                if graphics_restarted_at.is_none_or(|then| now.duration_since(then) >= recovery) {
+                    graphics_restarted_at = Some(now);
+                    log::line("graphics device lost: restarting explorust");
+                    continue;
                 }
-                return explorer_forever(Some(Notice::Problem(why)));
+                "graphics device lost again during shell recovery".into()
             }
+            End::Problem(why) => why,
+        };
+        let _ = fallback.signal();
+        let streak = reg::problem_streak() + 1;
+        reg::set_problem_streak(streak);
+        reg::set_logon_had_problem(true);
+        log::line(&format!("problem: {why}; plain explorer for this session (problem logons in a row: {streak})"));
+        if streak >= MAX_STREAK {
+            return explorer_forever(Some(turn_off(&format!("{why} (a problem at {streak} sign-ins in a row)"))));
         }
+        return explorer_forever(Some(Notice::Problem(why)));
     }
 }
 
@@ -277,6 +292,7 @@ fn ended(child: &Child, starting: Option<&str>) -> End {
     match code {
         0 if starting.is_none() => End::Fallback("explorust exited cleanly".into()),
         RELOAD => End::Reload,
+        launch_timing::GRAPHICS_LOST => End::GraphicsLost,
         _ => {
             let reason = problem_reason(code).unwrap_or_else(|| format!("exit code {code:#x}"));
             match starting {

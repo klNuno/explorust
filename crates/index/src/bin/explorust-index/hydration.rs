@@ -1,6 +1,7 @@
 use fsindex::table::Table;
+use parking_lot::RwLock;
 use std::ops::Range;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 pub const BATCH: usize = 256;
 
@@ -16,23 +17,23 @@ impl Hydration {
         let generation = names.id();
         let revision = names.touches();
         names.watch_touches(true);
-        *table.write().unwrap_or_else(|p| p.into_inner()) = names;
+        *table.write() = names;
         Self { table, generation, revision }
     }
 
     pub fn is_current(&self) -> bool {
-        self.table.read().unwrap_or_else(|p| p.into_inner()).id() == self.generation
+        self.table.read().id() == self.generation
     }
 
     pub fn pending(&self, records: Range<usize>) -> Option<Vec<u32>> {
-        let table = self.table.read().unwrap_or_else(|p| p.into_inner());
+        let table = self.table.read();
         (table.id() == self.generation).then(|| {
             records.map(|rec| rec as u32).filter(|&rec| self.missing(&table, rec)).collect()
         })
     }
 
     pub fn apply(&self, dates: &[(u32, i64)]) -> Option<usize> {
-        let mut table = self.table.write().unwrap_or_else(|p| p.into_inner());
+        let mut table = self.table.write();
         if table.id() != self.generation {
             return None;
         }
@@ -47,7 +48,7 @@ impl Hydration {
 
     #[cfg(target_os = "windows")]
     pub fn finish_links(&self, alias_parents: impl IntoIterator<Item = u32>) -> bool {
-        let mut table = self.table.write().unwrap_or_else(|p| p.into_inner());
+        let mut table = self.table.write();
         if table.id() != self.generation {
             return false;
         }
@@ -64,7 +65,7 @@ impl Hydration {
 
 impl Drop for Hydration {
     fn drop(&mut self) {
-        let mut table = self.table.write().unwrap_or_else(|p| p.into_inner());
+        let mut table = self.table.write();
         if table.id() == self.generation {
             table.watch_touches(false);
         }
@@ -94,12 +95,12 @@ mod tests {
             hydration.apply(&[(20, 10), (21, 20)])
         });
 
-        let hits = table.read().unwrap().query("notes", 2);
+        let hits = table.read().query("notes", 2);
         begin.send(()).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.modified() == 0));
         assert_eq!(worker.join().unwrap(), Some(2));
-        assert_eq!(table.read().unwrap().query("notes", 1)[0].rec, 21);
+        assert_eq!(table.read().query("notes", 1)[0].rec, 21);
     }
 
     #[test]
@@ -107,7 +108,7 @@ mod tests {
         let table = Arc::new(RwLock::new(Table::new()));
         let hydration = Hydration::publish(table.clone(), load_names());
         {
-            let mut table = table.write().unwrap();
+            let mut table = table.write();
             table.touch(20);
             table.set_modified(20, 5);
             table.touch(21);
@@ -116,16 +117,16 @@ mod tests {
         }
         assert_eq!(hydration.pending(20..22), Some(Vec::new()));
         assert_eq!(hydration.apply(&[(20, 100), (21, 200)]), Some(0));
-        assert_eq!(table.read().unwrap().query("notes", 1)[0].modified(), 5);
-        assert_eq!(table.read().unwrap().query("replacement", 1)[0].modified(), 0);
+        assert_eq!(table.read().query("notes", 1)[0].modified(), 5);
+        assert_eq!(table.read().query("replacement", 1)[0].modified(), 0);
 
         let next = Hydration::publish(table.clone(), load_names());
         assert!(!hydration.is_current());
         assert_eq!(hydration.pending(20..22), None);
         assert_eq!(hydration.apply(&[(20, 100)]), None);
-        assert_eq!(table.read().unwrap().query("notes", 1)[0].modified(), 0);
+        assert_eq!(table.read().query("notes", 1)[0].modified(), 0);
         drop(hydration);
-        table.write().unwrap().touch(20);
+        table.write().touch(20);
         assert_eq!(next.apply(&[(20, 100), (21, 200)]), Some(1));
     }
 }

@@ -2,7 +2,7 @@
 //! the boundary so a provider cannot block by calling back through the view's COM apartment.
 
 use super::{clipboard, inbox::Inbox, log, shell::{self, Pidl}};
-use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicUsize, Ordering}};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, atomic::{AtomicUsize, Ordering}};
 use std::time::Duration;
 use windows::Win32::Foundation::{ERROR_TIMEOUT, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
@@ -47,6 +47,10 @@ struct Drain {
 static DRAIN: Mutex<Drain> = Mutex::new(Drain { sealed: false, pending: 0 });
 static DRAINED: Condvar = Condvar::new();
 
+// Clipboard tests submit mutations to the same process-wide queue that the drain test seals.
+#[cfg(test)]
+pub(super) static FILE_OPERATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Lives from acceptance through execution, even when the submitting frame closes.
 struct Mutation;
 
@@ -71,20 +75,42 @@ impl Drop for Mutation {
     }
 }
 
-/// Run outside all Files STAs so their message pumps keep servicing clipboard and operation calls.
-pub fn drain_for_reload(limit: Duration) -> bool {
+fn seal_for_restart() -> MutexGuard<'static, Drain> {
     let mut drain = DRAIN.lock().unwrap();
     drain.sealed = true;
+    if drain.pending != 0 {
+        log::line(&format!("restart: waiting for {} accepted file operations", drain.pending));
+    }
+    drain
+}
+
+fn wait_for_pending(drain: MutexGuard<'_, Drain>) {
+    drop(DRAINED.wait_while(drain, |state| state.pending != 0).unwrap());
+    log::line("restart: accepted file operations finished");
+}
+
+/// Run outside all Files STAs so their message pumps keep servicing clipboard and operation calls.
+pub fn drain_for_graphics_restart() {
+    let drain = seal_for_restart();
+    if drain.pending != 0 {
+        wait_for_pending(drain);
+    }
+}
+
+pub fn drain_for_reload(limit: Duration, graphics_lost: impl FnOnce() -> bool) -> bool {
+    let drain = seal_for_restart();
     if drain.pending == 0 {
         return true;
     }
-    log::line(&format!("reload: waiting for {} accepted file operations", drain.pending));
     let (mut drain, _) = DRAINED.wait_timeout_while(drain, limit, |state| state.pending != 0).unwrap();
-    if drain.pending != 0 {
+    if drain.pending == 0 {
+        log::line("restart: accepted file operations finished");
+    } else if graphics_lost() {
+        wait_for_pending(drain);
+    } else {
         drain.sealed = false;
         return false;
     }
-    log::line("reload: accepted file operations finished");
     true
 }
 
@@ -309,7 +335,8 @@ mod tests {
     }
 
     #[test]
-    fn reload_waits_for_accepted_paste_and_new_folder_after_window_closes() {
+    fn graphics_restart_waits_for_accepted_paste_and_new_folder_after_window_closes() {
+        let _lock = FILE_OPERATION_TEST_LOCK.lock().unwrap_or_else(|lock| lock.into_inner());
         let dir = std::env::temp_dir().join(format!("explorust-files-drain-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let fixture = Fixture(dir);
@@ -332,12 +359,13 @@ mod tests {
         drop(worker);
         drop(frame);
 
-        assert!(!drain_for_reload(Duration::ZERO));
+        assert!(!drain_for_reload(Duration::ZERO, || false));
         drop(Mutation::accept().expect("a cancelled reload must accept new file operations"));
 
         let (done, drained) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            assert!(drain_for_reload(Duration::from_secs(10)));
+            drain_for_graphics_restart();
+            assert!(Mutation::accept().is_none(), "a completed drain must stay sealed");
             // Reopen the static test process's gate for other tests.
             DRAIN.lock().unwrap().sealed = false;
             done.send(()).unwrap();
@@ -346,8 +374,8 @@ mod tests {
         while !DRAIN.lock().unwrap().sealed && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(DRAIN.lock().unwrap().sealed, "reload must wait for the accepted paste");
-        assert!(Mutation::accept().is_none(), "reload must seal the queue before waiting");
+        assert!(DRAIN.lock().unwrap().sealed, "recovery must wait for the accepted paste");
+        assert!(Mutation::accept().is_none(), "recovery must seal the queue before waiting");
         release.send(clipboard::Source::test_cut(vec![source])).unwrap_or_else(|_| panic!("operation worker exited before draining"));
         drained.recv_timeout(Duration::from_secs(10)).unwrap();
 
@@ -356,5 +384,26 @@ mod tests {
         assert!(created.is_dir(), "queued New Folder did not finish");
         assert!(!source_path.exists(), "Paste did not move the accepted selection");
         assert_eq!(fs::read_to_string(moved).unwrap(), "move me");
+    }
+
+    #[test]
+    fn graphics_loss_keeps_an_expired_reload_sealed() {
+        let _lock = FILE_OPERATION_TEST_LOCK.lock().unwrap_or_else(|lock| lock.into_inner());
+        let mutation = Mutation::accept().unwrap();
+        let (expired, wait_for_expiry) = std::sync::mpsc::channel();
+        let drain = std::thread::spawn(move || {
+            drain_for_reload(Duration::ZERO, || {
+                expired.send(()).unwrap();
+                true
+            })
+        });
+
+        wait_for_expiry.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(Mutation::accept().is_none());
+        assert!(!drain.is_finished());
+        drop(mutation);
+        assert!(drain.join().unwrap());
+        assert!(Mutation::accept().is_none());
+        DRAIN.lock().unwrap().sealed = false;
     }
 }

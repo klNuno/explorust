@@ -70,6 +70,7 @@ pub struct Frame {
     icons: HashMap<usize, ID2D1Bitmap1>,
     window_active: bool,
     tracking: bool,
+    parked: bool,
     /// Client size and DPI of the last layout.
     laid_out: (i32, i32, u32),
     /// When the window was asked for, until its view is ready (logged then).
@@ -175,7 +176,7 @@ fn client(hwnd: HWND) -> RECT {
 }
 
 /// Creates a hidden window on `place`, its view loading; `show` puts it on screen.
-pub fn create(place: &Pidl, x: i32, y: i32, reload_folder: Arc<Mutex<Option<String>>>) -> windows_core::Result<HWND> {
+pub fn create(place: &Pidl, x: i32, y: i32, parked: bool, reload_folder: Arc<Mutex<Option<String>>>) -> windows_core::Result<HWND> {
     let (sh, s) = SHARED.with(|x| x.borrow().clone()).ok_or_else(windows_core::Error::empty)?;
     unsafe {
         let inst = GetModuleHandleW(None)?;
@@ -205,7 +206,8 @@ pub fn create(place: &Pidl, x: i32, y: i32, reload_folder: Arc<Mutex<Option<Stri
         shell::allow_dark(hwnd);
         let rc = client(hwnd);
         let chrome_height = (L::CHROME_H * k).ceil() as u32;
-        let canvas = match Canvas::new(sh, hwnd, rc.right as u32, chrome_height, 96.0 * k) {
+        let (width, height) = if parked { (1, 1) } else { (rc.right as u32, chrome_height) };
+        let canvas = match Canvas::new(sh, hwnd, width, height, 96.0 * k) {
             Ok(canvas) => canvas,
             Err(error) => {
                 let _ = DestroyWindow(hwnd);
@@ -236,6 +238,7 @@ pub fn create(place: &Pidl, x: i32, y: i32, reload_folder: Arc<Mutex<Option<Stri
             icons: HashMap::new(),
             window_active: false,
             tracking: false,
+            parked,
             laid_out: (0, 0, 0),
             opened: None,
             sw_cookie: None,
@@ -271,6 +274,10 @@ pub fn show(hwnd: HWND) -> (f64, f64, f64) {
     }
     let shown = ms(t);
     with(hwnd, |f| {
+        if f.parked {
+            f.parked = false;
+            f.resize_canvas(client(hwnd).right, scale(hwnd));
+        }
         f.window_active = true;
         f.draw();
     });
@@ -572,6 +579,9 @@ impl Frame {
     }
 
     pub fn draw(&mut self) {
+        if self.parked {
+            return;
+        }
         let k = self.scale();
         let w = client(self.hwnd).right as f32 / k;
         let tabs: Vec<TabView> =
@@ -631,8 +641,8 @@ impl Frame {
             return;
         }
         self.laid_out = now;
-        if let Err(e) = self.canvas.resize(r.right as u32, (L::CHROME_H * k).ceil() as u32, 96.0 * k) {
-            log::line(&format!("resize failed: {e}"));
+        if !self.parked {
+            self.resize_canvas(r.right, k);
         }
         let details = self.detail_rect();
         if let Some(pane) = self.details.as_mut() {
@@ -645,6 +655,12 @@ impl Frame {
             t.set_rect(self.view_rect());
         }
         self.draw();
+    }
+
+    fn resize_canvas(&mut self, width: i32, scale: f32) {
+        if let Err(error) = self.canvas.resize(width as u32, (L::CHROME_H * scale).ceil() as u32, 96.0 * scale) {
+            log::line(&format!("resize failed: {error}"));
+        }
     }
 
     fn hit(&self, x_px: i32, y_px: i32) -> Hit {

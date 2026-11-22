@@ -1,19 +1,14 @@
-//! Drawing: one D3D11, D2D, DirectComposition and DirectWrite device set per UI thread, shared by
-//! every window (a window then only costs a swap chain and a visual, which keeps the open under a
-//! frame), and the drawing helpers the chrome uses.
+//! Files composition layers and the drawing helpers used by its chrome.
 
-use render::Color;
+use render::{Color, Device, SwapChain};
 use std::rc::Rc;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::Graphics::Dxgi::*;
-use windows_core::{HSTRING, Interface, Result};
+use windows_core::{HSTRING, Result};
 use windows_numerics::Vector2;
 
 pub const UI_FONT: &str = "Segoe UI Variable Text";
@@ -35,9 +30,7 @@ pub struct Fonts {
 }
 
 pub struct Shared {
-    dxgi: IDXGIDevice,
-    dxgi_factory: IDXGIFactory2,
-    d2d: ID2D1Device,
+    device: Device,
     pub dcomp: IDCompositionDevice,
     pub dwrite: IDWriteFactory,
     pub fonts: Fonts,
@@ -70,36 +63,18 @@ fn format(dw: &IDWriteFactory, family: &str, size: f32, center: bool) -> Result<
 
 impl Shared {
     pub fn new() -> Result<Rc<Shared>> {
-        unsafe {
-            let mut d3d = None;
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                Default::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut d3d),
-                None,
-                None,
-            )?;
-            let d3d = d3d.ok_or_else(windows_core::Error::empty)?;
-            let dxgi: IDXGIDevice = d3d.cast()?;
-            let dxgi_factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let d2d = factory.CreateDevice(&dxgi)?;
-            let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi)?;
-            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let fonts = Fonts {
-                ui12: format(&dwrite, UI_FONT, 12.0, false)?,
-                ui14: format(&dwrite, UI_FONT, 14.0, false)?,
-                glyph10: format(&dwrite, ICON_FONT, 10.0, true)?,
-                glyph12: format(&dwrite, ICON_FONT, 12.0, true)?,
-                glyph14: format(&dwrite, ICON_FONT, 14.0, true)?,
-                glyph16: format(&dwrite, ICON_FONT, 16.0, true)?,
-            };
-            Ok(Rc::new(Shared { dxgi, dxgi_factory, d2d, dcomp, dwrite, fonts }))
-        }
+        let device = Device::new()?;
+        let dcomp = device.create_composition_device()?;
+        let dwrite = device.text.factory.clone();
+        let fonts = Fonts {
+            ui12: format(&dwrite, UI_FONT, 12.0, false)?,
+            ui14: format(&dwrite, UI_FONT, 14.0, false)?,
+            glyph10: format(&dwrite, ICON_FONT, 10.0, true)?,
+            glyph12: format(&dwrite, ICON_FONT, 12.0, true)?,
+            glyph14: format(&dwrite, ICON_FONT, 14.0, true)?,
+            glyph16: format(&dwrite, ICON_FONT, 16.0, true)?,
+        };
+        Ok(Rc::new(Shared { device, dcomp, dwrite, fonts }))
     }
 }
 
@@ -107,7 +82,7 @@ impl Shared {
 pub struct Canvas {
     pub sh: Rc<Shared>,
     pub ctx: ID2D1DeviceContext,
-    swap: IDXGISwapChain1,
+    swap: SwapChain,
     _target: Option<IDCompositionTarget>,
     visual: IDCompositionVisual,
     pub dpi: f32,
@@ -117,9 +92,10 @@ impl Canvas {
     pub fn new(sh: Rc<Shared>, hwnd: HWND, w: u32, h: u32, dpi: f32) -> Result<Canvas> {
         let mut root = Self::layer(sh, w, h, dpi)?;
         unsafe {
-            let target = root.sh.dcomp.CreateTargetForHwnd(hwnd, true)?;
-            target.SetRoot(&root.visual)?;
-            root.sh.dcomp.Commit()?;
+            let dev = &root.sh.device;
+            let target = dev.check(root.sh.dcomp.CreateTargetForHwnd(hwnd, true))?;
+            dev.check(target.SetRoot(&root.visual))?;
+            dev.check(root.sh.dcomp.Commit())?;
             root._target = Some(target);
         }
         Ok(root)
@@ -127,44 +103,32 @@ impl Canvas {
 
     pub fn add_layer(&self, w: u32, h: u32, dpi: f32) -> Result<Canvas> {
         let layer = Self::layer(self.sh.clone(), w, h, dpi)?;
-        unsafe { self.visual.AddVisual(&layer.visual, true, None::<&IDCompositionVisual>)?; }
+        self.sh.device.check(unsafe { self.visual.AddVisual(&layer.visual, true, None::<&IDCompositionVisual>) })?;
         Ok(layer)
     }
 
     pub fn remove_layer(&self, layer: &Canvas) -> Result<()> {
         unsafe {
-            self.visual.RemoveVisual(&layer.visual)?;
-            self.sh.dcomp.Commit()
+            self.sh.device.check(self.visual.RemoveVisual(&layer.visual))?;
+            self.sh.device.check(self.sh.dcomp.Commit())
         }
     }
 
     pub fn set_origin(&self, x: i32, y: i32) -> Result<()> {
         unsafe {
-            self.visual.SetOffsetX2(x as f32)?;
-            self.visual.SetOffsetY2(y as f32)?;
-            self.sh.dcomp.Commit()
+            self.sh.device.check(self.visual.SetOffsetX2(x as f32))?;
+            self.sh.device.check(self.visual.SetOffsetY2(y as f32))?;
+            self.sh.device.check(self.sh.dcomp.Commit())
         }
     }
 
     fn layer(sh: Rc<Shared>, w: u32, h: u32, dpi: f32) -> Result<Canvas> {
         unsafe {
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: w.max(1),
-                Height: h.max(1),
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: 2,
-                Scaling: DXGI_SCALING_STRETCH,
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-                ..Default::default()
-            };
-            let swap = sh.dxgi_factory.CreateSwapChainForComposition(&sh.dxgi, &desc, None)?;
-            let ctx = sh.d2d.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+            let swap = sh.device.create_swap_chain(w, h, 2)?;
+            let ctx = sh.device.create_context()?;
             ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            let visual = sh.dcomp.CreateVisual()?;
-            visual.SetContent(&swap)?;
+            let visual = sh.device.check(sh.dcomp.CreateVisual())?;
+            swap.attach(&visual)?;
             let c = Canvas { sh, ctx, swap, _target: None, visual, dpi };
             c.bind()?;
             Ok(c)
@@ -172,27 +136,12 @@ impl Canvas {
     }
 
     fn bind(&self) -> Result<()> {
-        unsafe {
-            let buffer: IDXGISurface = self.swap.GetBuffer(0)?;
-            let props = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
-                dpiX: self.dpi,
-                dpiY: self.dpi,
-                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                ..Default::default()
-            };
-            let target = self.ctx.CreateBitmapFromDxgiSurface(&buffer, Some(&props))?;
-            self.ctx.SetTarget(&target);
-            self.ctx.SetDpi(self.dpi, self.dpi);
-        }
-        Ok(())
+        self.swap.bind(&self.ctx, self.dpi)
     }
 
     pub fn resize(&mut self, w: u32, h: u32, dpi: f32) -> Result<()> {
-        unsafe {
-            self.ctx.SetTarget(None);
-            self.swap.ResizeBuffers(0, w.max(1), h.max(1), DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))?;
-        }
+        unsafe { self.ctx.SetTarget(None) };
+        self.swap.resize(w, h)?;
         self.dpi = dpi;
         self.bind()
     }
@@ -205,10 +154,8 @@ impl Canvas {
     }
 
     pub fn end(&self) -> Result<()> {
-        unsafe {
-            self.ctx.EndDraw(None, None)?;
-            self.swap.Present(1, DXGI_PRESENT(0)).ok()
-        }
+        self.sh.device.check(unsafe { self.ctx.EndDraw(None, None) })?;
+        self.swap.present()
     }
 
     pub fn bitmap(&self, width: u32, height: u32, premul_bgra: &[u8]) -> Result<ID2D1Bitmap1> {
@@ -219,7 +166,7 @@ impl Canvas {
                 dpiY: 96.0,
                 ..Default::default()
             };
-            self.ctx.CreateBitmap(D2D_SIZE_U { width, height }, Some(premul_bgra.as_ptr().cast()), width * 4, &props)
+            self.sh.device.check(self.ctx.CreateBitmap(D2D_SIZE_U { width, height }, Some(premul_bgra.as_ptr().cast()), width * 4, &props))
         }
     }
 

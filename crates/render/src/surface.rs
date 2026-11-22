@@ -1,83 +1,24 @@
 //! A Direct2D device context drawing into a premultiplied-alpha composition swap chain,
 //! shown through a DirectComposition visual so the DWM backdrop shows through.
 
+pub use crate::device::Device;
+use crate::device::SwapChain;
+use std::cell::Cell;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::Graphics::Dxgi::*;
-use windows_core::{Interface, Result};
+use windows_core::Result;
 
 pub struct Surface {
     pub ctx: ID2D1DeviceContext,
     pub factory: ID2D1Factory1,
-    swap: IDXGISwapChain1,
+    swap: SwapChain,
+    size: Cell<(u32, u32)>,
     _dcomp: IDCompositionDevice,
     _target: IDCompositionTarget,
     _visual: IDCompositionVisual,
-}
-
-/// The device half of a `Surface`: the D3D11 device (through its DXGI interface), DXGI and D2D
-/// factories, D2D device and DirectWrite's shared factory (a process singleton). Made on a worker thread while
-/// the UI thread creates its window (the viewer's and taskman's first frame), then handed to
-/// `Surface::on`. Nothing in it is used by two threads at once: the worker drops it after the
-/// send.
-pub struct Device {
-    dxgi: IDXGIDevice,
-    dxgi_factory: IDXGIFactory2,
-    factory: ID2D1Factory1,
-    d2d: ID2D1Device,
-    pub text: crate::text::Text,
-}
-
-// SAFETY: the D3D11 device is free threaded, the DWrite shared factory is thread safe, and the
-// single-threaded D2D factory and device are only used by one thread at a time (made on the
-// worker, then used by the UI thread alone).
-unsafe impl Send for Device {}
-
-impl Device {
-    pub fn new() -> Result<Self> {
-        unsafe {
-            let mut d3d = None;
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                Default::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut d3d),
-                None,
-                None,
-            )?;
-            let d3d = d3d.unwrap();
-            let dxgi: IDXGIDevice = d3d.cast()?;
-            let dxgi_factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let d2d = factory.CreateDevice(&dxgi)?;
-            let text = crate::text::Text::new()?;
-            Ok(Self { dxgi, dxgi_factory, factory, d2d, text })
-        }
-    }
-
-    /// `Device::new` on its own thread; `warm` font families get a format made there so the
-    /// UI thread's first `CreateTextFormat` finds the font collection loaded.
-    pub fn spawn(warm: &'static [&'static str]) -> std::sync::mpsc::Receiver<Result<Self>> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let _ = std::thread::Builder::new().name("render-device".into()).spawn(move || {
-            let d = Self::new();
-            if let Ok(d) = &d {
-                for f in warm {
-                    let _ = d.text.format(f, 14.0, windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL, crate::text::Align::Leading);
-                }
-            }
-            let _ = tx.send(d);
-        });
-        rx
-    }
 }
 
 impl Surface {
@@ -96,59 +37,35 @@ impl Surface {
     /// before (`Device::spawn`).
     pub fn on(dev: &Device, hwnd: HWND, width: u32, height: u32, buffers: u32) -> Result<Self> {
         unsafe {
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: width,
-                Height: height,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: buffers,
-                Scaling: DXGI_SCALING_STRETCH,
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-                ..Default::default()
-            };
-            let swap = dev.dxgi_factory.CreateSwapChainForComposition(&dev.dxgi, &desc, None)?;
-            let factory = dev.factory.clone();
-            let ctx = dev.d2d.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
-            let buffer: IDXGISurface = swap.GetBuffer(0)?;
-            let props = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                ..Default::default()
-            };
-            let target = ctx.CreateBitmapFromDxgiSurface(&buffer, Some(&props))?;
-            ctx.SetTarget(&target);
+            let swap = dev.create_swap_chain(width, height, buffers)?;
+            let factory = dev.factory();
+            let ctx = dev.create_context()?;
+            swap.bind(&ctx, 96.0)?;
             ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dev.dxgi)?;
-            let dtarget = dcomp.CreateTargetForHwnd(hwnd, true)?;
-            let visual = dcomp.CreateVisual()?;
-            visual.SetContent(&swap)?;
-            dtarget.SetRoot(&visual)?;
-            dcomp.Commit()?;
-            Ok(Self { ctx, factory, swap, _dcomp: dcomp, _target: dtarget, _visual: visual })
+            let dcomp = dev.create_composition_device()?;
+            let dtarget = dev.check(dcomp.CreateTargetForHwnd(hwnd, true))?;
+            let visual = dev.check(dcomp.CreateVisual())?;
+            swap.attach(&visual)?;
+            dev.check(dtarget.SetRoot(&visual))?;
+            dev.check(dcomp.Commit())?;
+            Ok(Self { ctx, factory, swap, size: Cell::new((width.max(1), height.max(1))), _dcomp: dcomp, _target: dtarget, _visual: visual })
         }
     }
 
     /// Resizes the swap chain's buffers and retargets the device context to the new back buffer.
     pub fn resize(&self, width: u32, height: u32) -> Result<()> {
-        unsafe {
-            self.ctx.SetTarget(None);
-            self.swap.ResizeBuffers(0, width.max(1), height.max(1), DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))?;
-            let buffer: IDXGISurface = self.swap.GetBuffer(0)?;
-            let props = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                ..Default::default()
-            };
-            let target = self.ctx.CreateBitmapFromDxgiSurface(&buffer, Some(&props))?;
-            self.ctx.SetTarget(&target);
-            Ok(())
+        let size = (width.max(1), height.max(1));
+        if self.size.get() == size {
+            return Ok(());
         }
+        unsafe { self.ctx.SetTarget(None) };
+        self.size.set((0, 0));
+        let resized = self.swap.resize(size.0, size.1);
+        // After a failed resize, rebind the old buffer so the previous size can still draw.
+        let bound = self.swap.bind(&self.ctx, 96.0);
+        resized.and(bound)?;
+        self.size.set(size);
+        Ok(())
     }
 
     pub fn begin(&self) {
@@ -159,10 +76,8 @@ impl Surface {
     }
 
     pub fn end(&self) -> Result<()> {
-        unsafe {
-            self.ctx.EndDraw(None, None)?;
-            self.swap.Present(1, DXGI_PRESENT(0)).ok()
-        }
+        self.swap.check(unsafe { self.ctx.EndDraw(None, None) })?;
+        self.swap.present()
     }
 
     /// A D2D bitmap from premultiplied BGRA pixels.
@@ -174,19 +89,19 @@ impl Surface {
                 dpiY: 96.0,
                 ..Default::default()
             };
-            self.ctx.CreateBitmap(
+            self.swap.check(self.ctx.CreateBitmap(
                 D2D_SIZE_U { width, height },
                 Some(premul_bgra.as_ptr().cast()),
                 width * 4,
                 &props,
-            )
+            ))
         }
     }
 
     /// Open animation of the content: slides in from `from_y` pixels with a cubic ease-out over
     /// `slide_s` seconds and fades in over `fade_s`, run by DirectComposition (no timers).
     pub fn slide_in(&self, from_y: f32, slide_s: f32, fade_s: f32) -> Result<()> {
-        unsafe {
+        self.swap.check((|| unsafe {
             let t = slide_s.max(0.001);
             // y(t) = from_y * (1 - t/T)^3 expanded into cubic coefficients.
             let slide = self._dcomp.CreateAnimation()?;
@@ -201,10 +116,10 @@ impl Surface {
             group.SetOpacity(&fade)?;
             self._visual.SetEffect(&group)?;
             self._dcomp.Commit()
-        }
+        })())
     }
 
     pub fn brush(&self, c: D2D1_COLOR_F) -> Result<ID2D1SolidColorBrush> {
-        unsafe { self.ctx.CreateSolidColorBrush(&c, None) }
+        self.swap.check(unsafe { self.ctx.CreateSolidColorBrush(&c, None) })
     }
 }
