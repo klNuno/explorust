@@ -1,5 +1,6 @@
 //! Hand the current desktop from Explorer to explorust without ending the logon session.
 
+mod close_progress;
 mod explorer;
 pub(crate) mod folder_close;
 mod reopen_list;

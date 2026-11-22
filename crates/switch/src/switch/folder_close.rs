@@ -1,6 +1,7 @@
 //! Keep each WM_CLOSE receipt alive through rollback, even if the watcher exits.
 
 use super::{
+    close_progress::{Close, CloseProgress},
     explorer,
     reopen_list::Folder,
     watcher::{Signals, read_snapshot},
@@ -8,8 +9,8 @@ use super::{
 use guard::proc::{Child, Event, wait_any};
 use guard::switch_events::{SWITCH_EXE, switch_event};
 use guard::{account, install, log, reopen, taskbar};
-use std::cell::{Cell, RefCell};
-use std::time::Duration;
+use std::cell::Cell;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetPropW, MSG, PM_NOREMOVE, PeekMessageW, RemovePropW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
@@ -108,17 +109,23 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
         "switch: requested close of Explorer folder HWND {hwnd:#x} in pid {}",
         folder.owner
     ));
-    // The callback runs on this thread from PeekMessageW. A reply with the original HWND
-    // still alive settles the request, so a later user close cannot trigger a reopen.
+    let started = Instant::now();
+    let mut progress = CloseProgress::default();
+    // Explorer may reply before it actually destroys the folder. Keep observing the original
+    // window after the reply, even when the watcher has already started rollback.
     loop {
         if signals.completed.signalled() {
             return Ok(());
         }
-        match window.close_reply() {
-            Some(false) => return Ok(()),
-            Some(true) => break,
-            None if !window.exists() => break,
-            None => {}
+        match progress.observe(started.elapsed(), window.close_reply(), window.exists()) {
+            Close::Kept => {
+                log::line(&format!(
+                    "switch: Explorer acknowledged the close but kept folder HWND {hwnd:#x}"
+                ));
+                return Ok(());
+            }
+            Close::Destroyed => break,
+            Close::Pending => {}
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -137,18 +144,10 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     }
 }
 
-thread_local! {
-    static TRACKED_PROPERTY: RefCell<Option<HSTRING>> = const { RefCell::new(None) };
-    static REPLY_CLOSED: Cell<Option<bool>> = const { Cell::new(None) };
-}
+thread_local! { static REPLIED: Cell<bool> = const { Cell::new(false) }; }
 
-unsafe extern "system" fn replied(hwnd: HWND, _: u32, _: usize, _: LRESULT) {
-    TRACKED_PROPERTY.with_borrow(|property| {
-        if let Some(property) = property {
-            // SAFETY: this reads the marker even if the original HWND has already gone.
-            REPLY_CLOSED.set(Some(unsafe { GetPropW(hwnd, property).is_invalid() }));
-        }
-    });
+unsafe extern "system" fn replied(_: HWND, _: u32, _: usize, _: LRESULT) {
+    REPLIED.set(true);
 }
 
 /// Windows can reuse an HWND. The property is attached only to this window instance.
@@ -188,16 +187,15 @@ impl TrackedWindow {
     }
 
     fn request_close(&self) -> Result<(), String> {
-        TRACKED_PROPERTY.set(Some(self.property.clone()));
         // SAFETY: WM_CLOSE has no pointer arguments, and the callback depends only on thread-local state.
         unsafe { SendMessageCallbackW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0), Some(replied), 0) }
             .map_err(|e| format!("request Explorer folder close: {e}"))
     }
 
-    fn close_reply(&self) -> Option<bool> {
+    fn close_reply(&self) -> bool {
         // SAFETY: PeekMessageW dispatches the callback on the sending thread.
         let _ = unsafe { PeekMessageW(&mut MSG::default(), None, 0, 0, PM_NOREMOVE) };
-        REPLY_CLOSED.get()
+        REPLIED.get()
     }
 }
 
