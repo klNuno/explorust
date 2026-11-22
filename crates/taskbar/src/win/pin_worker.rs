@@ -1,4 +1,5 @@
 use super::{actions::Launch, log};
+use crate::pins::{Read, ReadUpdate, Reads};
 use shelldata::{
     Image, icons,
     items::{self, PinItem},
@@ -13,6 +14,7 @@ use windows::Win32::UI::Shell::IShellItem;
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 pub const MESSAGE: u32 = WM_APP + 5;
+const READERS: usize = 4;
 
 pub struct PinData {
     pub name: String,
@@ -24,6 +26,7 @@ pub struct PinData {
 pub enum Update {
     Slots(usize),
     Resolved(usize, Option<(String, PinData)>),
+    FileExplorer(usize),
     Icon(usize, Image),
 }
 
@@ -52,7 +55,7 @@ pub fn start(hwnd: HWND, px: i32, inbox: &Inbox) {
     };
     spawn_sta("taskbar-pin-list", move || {
         let pidls = taskband::pin_pidls(&items::taskband_blob());
-        load_pins(sink, pidls, px, items::resolve_pin, |job, px| {
+        load_pins(sink, pidls, px, items::resolve_taskbar_pin, |job, px| {
             let item = items::item_from_pidl(&job.pidl)?;
             image_for_key(&item, &job.key, px)
         });
@@ -65,17 +68,48 @@ struct IconJob {
     pidl: Vec<u8>,
 }
 
-struct PendingPins {
-    pidls: Vec<Vec<u8>>,
-    local: Vec<bool>,
-    next: AtomicUsize,
+struct PinJob {
+    pidl: Vec<u8>,
+    result: Mutex<PinResult>,
+}
+
+#[derive(Default)]
+struct PinResult {
+    reads: Reads,
+    file_explorer: bool,
+}
+
+impl PinJob {
+    fn post(
+        &self,
+        sink: &Sink,
+        slot: usize,
+        read: Read,
+        mut data: Option<(String, PinData)>,
+    ) -> bool {
+        // Keep delivery in the same order as the state changes for this slot.
+        let mut result = self.result.lock().unwrap();
+        let update = result.reads.complete(read, data.is_some());
+        let was_explorer = result.file_explorer;
+        if let Some((_, pin)) = &mut data {
+            result.file_explorer |= pin.file_explorer;
+            pin.file_explorer = result.file_explorer;
+        }
+        match update {
+            ReadUpdate::Publish | ReadUpdate::Remove => sink.post(Update::Resolved(slot, data)),
+            ReadUpdate::Merge if !was_explorer && result.file_explorer => {
+                sink.post(Update::FileExplorer(slot))
+            }
+            ReadUpdate::Merge | ReadUpdate::Skip => true,
+        }
+    }
 }
 
 fn load_pins(
     sink: Sink,
     pidls: Vec<Vec<u8>>,
     px: i32,
-    resolve: impl Fn(Vec<u8>) -> Option<PinItem> + Send + Sync + 'static,
+    resolve: impl Fn(Vec<u8>) -> Option<(PinItem, bool)> + Send + Sync + 'static,
     read_icon: impl Fn(&IconJob, i32) -> Option<Image> + Send + Sync + 'static,
 ) {
     let count = pidls.len();
@@ -84,26 +118,17 @@ fn load_pins(
     }
     log::line(&format!("published {count} pin slots"));
 
-    // Publish local shortcut launch targets before providers can occupy all resolution workers.
-    let folder = items::LocalPinFolder::taskbar();
-    let prepared: Vec<_> = pidls
-        .iter()
-        .enumerate()
-        .map(|(slot, pidl)| {
-            folder.as_ref().is_some_and(|folder| folder.contains(pidl))
-                && publish_local(&sink, slot, pidl)
+    let jobs = pidls
+        .into_iter()
+        .map(|pidl| PinJob {
+            pidl,
+            result: Mutex::default(),
         })
-        .collect();
-    let pending = Arc::new(PendingPins {
-        pidls,
-        local: prepared,
-        next: AtomicUsize::new(0),
-    });
+        .collect::<Arc<[_]>>();
     let (send, receive) = mpsc::channel();
     let receive = Arc::new(Mutex::new(receive));
     let read_icon = Arc::new(read_icon);
-    let resolve = Arc::new(resolve);
-    for _ in 0..count.min(4) {
+    for _ in 0..count.min(READERS) {
         let icon_sink = sink.clone();
         let receive = receive.clone();
         let read_icon = read_icon.clone();
@@ -127,60 +152,75 @@ fn load_pins(
                 }
             }
         });
+    }
 
-        let sink = sink.clone();
-        let pending = pending.clone();
-        let send = send.clone();
-        let resolve = resolve.clone();
-        spawn_sta("taskbar-pin-identity", move || {
+    // Even a fixed-drive link can sit behind a reparse point or a hydration provider.
+    // Keep shortcut reads out of the identity queue so either result can make a pin usable.
+    run_readers(
+        "taskbar-pin-identity",
+        sink.clone(),
+        jobs.clone(),
+        move |sink, slot, job| {
+            let start = Instant::now();
+            let Some((item, file_explorer)) = resolve(job.pidl.clone()) else {
+                return job.post(sink, slot, Read::Identity, None);
+            };
+            let data = PinData {
+                name: item.name,
+                launch: Launch::Pidl(item.pidl.clone()),
+                file_explorer,
+                icon: None,
+            };
+            if !job.post(sink, slot, Read::Identity, Some((item.key.clone(), data))) {
+                return false;
+            }
+            log::line(&format!(
+                "pin slot {slot} resolved in {} ms",
+                start.elapsed().as_millis()
+            ));
+            let _ = send.send(IconJob {
+                slot,
+                key: item.key,
+                pidl: item.pidl,
+            });
+            true
+        },
+    );
+    run_readers("taskbar-pin-shortcut", sink, jobs, |sink, slot, job| {
+        let data = items::local_shortcut(&job.pidl).map(|shortcut| {
+            let key = shortcut.path.to_lowercase();
+            let data = PinData {
+                name: shortcut.name,
+                launch: Launch::Path(shortcut.path),
+                file_explorer: shortcut.explorer,
+                icon: None,
+            };
+            (key, data)
+        });
+        job.post(sink, slot, Read::Shortcut, data)
+    });
+}
+
+fn run_readers(
+    name: &'static str,
+    sink: Sink,
+    jobs: Arc<[PinJob]>,
+    read: impl Fn(&Sink, usize, &PinJob) -> bool + Send + Sync + 'static,
+) {
+    let read = Arc::new(read);
+    let next = Arc::new(AtomicUsize::new(0));
+    for _ in 0..jobs.len().min(READERS) {
+        let (sink, jobs, next, read) = (sink.clone(), jobs.clone(), next.clone(), read.clone());
+        spawn_sta(name, move || {
             while sink.inbox.strong_count() > 0 {
-                let slot = pending.next.fetch_add(1, Ordering::Relaxed);
-                let Some(pidl) = pending.pidls.get(slot) else {
-                    break;
-                };
-                let local = pending.local[slot] || publish_local(&sink, slot, pidl);
-                let start = Instant::now();
-                let Some(item) = resolve(pidl.clone()) else {
-                    if !local && !sink.post(Update::Resolved(slot, None)) {
-                        break;
-                    }
-                    continue;
-                };
-                let data = PinData {
-                    name: item.name,
-                    launch: Launch::Pidl(item.pidl.clone()),
-                    file_explorer: false,
-                    icon: None,
-                };
-                if !sink.post(Update::Resolved(slot, Some((item.key.clone(), data)))) {
+                let slot = next.fetch_add(1, Ordering::Relaxed);
+                let Some(job) = jobs.get(slot) else { break };
+                if !read(&sink, slot, job) {
                     break;
                 }
-                log::line(&format!(
-                    "pin slot {slot} resolved in {} ms",
-                    start.elapsed().as_millis()
-                ));
-                let _ = send.send(IconJob {
-                    slot,
-                    key: item.key,
-                    pidl: item.pidl,
-                });
             }
         });
     }
-}
-
-fn publish_local(sink: &Sink, slot: usize, pidl: &[u8]) -> bool {
-    let Some(shortcut) = items::local_shortcut(pidl) else {
-        return false;
-    };
-    let key = shortcut.path.to_lowercase();
-    let data = PinData {
-        name: shortcut.name,
-        launch: Launch::Path(shortcut.path),
-        file_explorer: shortcut.explorer,
-        icon: None,
-    };
-    sink.post(Update::Resolved(slot, Some((key, data))))
 }
 
 fn spawn_sta(name: &'static str, run: impl FnOnce() + Send + 'static) {
@@ -217,12 +257,22 @@ fn image_for_key(item: &IShellItem, key: &str, px: i32) -> Option<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{File, OpenOptions};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::{Path, PathBuf};
     use std::sync::Condvar;
     use std::time::Duration;
+    use windows::Win32::Foundation::{ERROR_IO_PENDING, HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile,
     };
+    use windows::Win32::System::IO::{
+        CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED,
+    };
+    use windows::Win32::System::Ioctl::FSCTL_REQUEST_OPLOCK_LEVEL_1;
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows::Win32::UI::Shell::{ILGetSize, IShellLinkW, SHParseDisplayName, ShellLink};
     use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, HWND_MESSAGE};
     use windows_core::{HSTRING, Interface, w};
@@ -296,6 +346,198 @@ mod tests {
         }
     }
 
+    struct LockedShortcut {
+        file: File,
+        event: OwnedHandle,
+        request: Box<OVERLAPPED>,
+    }
+
+    impl LockedShortcut {
+        fn new(path: &Path) -> Self {
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_OVERLAPPED.0)
+                .open(path)
+                .unwrap();
+            // SAFETY: take ownership of the new event and keep the overlapped buffer on the heap.
+            let event = unsafe {
+                OwnedHandle::from_raw_handle(CreateEventW(None, true, false, None).unwrap().0)
+            };
+            let mut request = Box::new(OVERLAPPED {
+                hEvent: HANDLE(event.as_raw_handle()),
+                ..Default::default()
+            });
+            // SAFETY: Drop waits for this request before freeing its buffer or closing the file.
+            let result = unsafe {
+                DeviceIoControl(
+                    HANDLE(file.as_raw_handle()),
+                    FSCTL_REQUEST_OPLOCK_LEVEL_1,
+                    None,
+                    0,
+                    None,
+                    0,
+                    None,
+                    Some(&mut *request),
+                )
+            };
+            assert_eq!(result.unwrap_err().code(), ERROR_IO_PENDING.to_hresult());
+            Self {
+                file,
+                event,
+                request,
+            }
+        }
+
+        fn wait_for_reader(&self) {
+            // The break is pending until we acknowledge it or close the file handle.
+            assert_eq!(
+                unsafe { WaitForSingleObject(HANDLE(self.event.as_raw_handle()), 5000) },
+                WAIT_OBJECT_0,
+                "Windows did not report a competing open of the first shortcut"
+            );
+        }
+    }
+
+    impl Drop for LockedShortcut {
+        fn drop(&mut self) {
+            // SAFETY: drain the overlapped request before its memory goes away, even on panic.
+            unsafe {
+                let file = HANDLE(self.file.as_raw_handle());
+                let _ = CancelIoEx(file, Some(&*self.request));
+                let _ = GetOverlappedResult(file, &*self.request, &mut 0, true);
+            }
+        }
+    }
+
+    #[test]
+    fn held_shortcut_read_does_not_block_later_pins() {
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap() };
+        let folder = PathBuf::from(std::env::var_os("APPDATA").unwrap())
+            .join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar");
+        std::fs::create_dir_all(&folder).unwrap();
+        let system = std::env::var("SystemRoot").unwrap();
+        let tag = format!("explorust-held-pin-{}", std::process::id());
+        let marker = std::env::temp_dir().join(format!("{tag}.txt"));
+        let fixture = Fixture(vec![
+            folder.join(format!("{tag}-first.lnk")),
+            folder.join(format!("{tag}-second.lnk")),
+            folder.join(format!("{tag}-third.lnk")),
+            marker.clone(),
+        ]);
+        let pidls: Vec<_> = fixture.0[..3]
+            .iter()
+            .enumerate()
+            .map(|(slot, path)| {
+                let command = if slot == 1 {
+                    format!("/d /c echo launched > \"{}\"", marker.display())
+                } else {
+                    "/d /c exit".into()
+                };
+                shortcut(path, &format!(r"{system}\System32\cmd.exe"), &command)
+            })
+            .collect();
+        let local_folder = items::LocalPinFolder::taskbar().unwrap();
+        assert!(pidls.iter().all(|pidl| local_folder.contains(pidl)));
+        let locked_shortcut = LockedShortcut::new(&fixture.0[0]);
+        let inbox = Inbox::default();
+        let hwnd = Mailbox(unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!(""),
+                Default::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+        let sink = Sink {
+            hwnd: hwnd.0.0 as isize,
+            inbox: Arc::downgrade(&inbox),
+        };
+        let second = pidls[1].clone();
+        spawn_sta("taskbar-held-shortcut-test", move || {
+            load_pins(
+                sink,
+                pidls,
+                24,
+                move |pidl| {
+                    // The second pin must launch without needing its ordinary identity.
+                    if pidl == second {
+                        None
+                    } else {
+                        items::resolve_taskbar_pin(pidl)
+                    }
+                },
+                |_, _| None,
+            );
+        });
+
+        locked_shortcut.wait_for_reader();
+        let fallback = wait_for(|| {
+            let updates = inbox.lock().unwrap();
+            assert!(
+                !updates
+                    .iter()
+                    .any(|update| matches!(update, Update::Resolved(0, _)))
+            );
+            updates.iter().find_map(|update| match update {
+                Update::Resolved(1, Some((_, data))) if matches!(data.launch, Launch::Path(_)) => {
+                    Some(data.launch.clone())
+                }
+                _ => None,
+            })
+        });
+        wait_for(|| {
+            inbox
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|update| match update {
+                    Update::Resolved(2, Some((_, data)))
+                        if matches!(data.launch, Launch::Pidl(_)) =>
+                    {
+                        Some(())
+                    }
+                    _ => None,
+                })
+        });
+        super::super::actions::launch(fallback);
+        wait_for(|| {
+            std::fs::read_to_string(&marker)
+                .ok()
+                .filter(|text| text.contains("launched"))
+        });
+        assert!(
+            !inbox
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|update| matches!(update, Update::Resolved(0, _)))
+        );
+        println!(
+            "First shortcut open still held by NTFS, second pin launched with its saved arguments, third pin resolved"
+        );
+        drop(locked_shortcut);
+        wait_for(|| {
+            inbox
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|update| match update {
+                    Update::Resolved(0, Some(_)) => Some(()),
+                    _ => None,
+                })
+        });
+        unsafe { CoUninitialize() };
+    }
+
     #[test]
     fn four_held_icons_do_not_block_a_local_pins_identity_or_launch() {
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap() };
@@ -357,7 +599,7 @@ mod tests {
                 if pidl == fifth {
                     identity.wait();
                 }
-                items::resolve_pin(pidl)
+                items::resolve_taskbar_pin(pidl)
             },
             move |job, _| {
                 icon_started.send(job.slot).unwrap();
@@ -371,20 +613,21 @@ mod tests {
             .collect();
         held.sort_unstable();
         assert_eq!(held, [0, 1, 2, 3]);
-        let fallback = inbox
-            .lock()
-            .unwrap()
-            .iter()
-            .find_map(|update| match update {
-                Update::Resolved(4, Some((key, data)))
-                    if matches!(data.launch, Launch::Path(_)) =>
-                {
-                    assert_eq!(key, &paths[4].to_string_lossy().to_lowercase());
-                    Some(data.launch.clone())
-                }
-                _ => None,
-            })
-            .expect("the fifth pin already has a validated launch target");
+        let fallback = wait_for(|| {
+            inbox
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|update| match update {
+                    Update::Resolved(4, Some((key, data)))
+                        if matches!(data.launch, Launch::Path(_)) =>
+                    {
+                        assert_eq!(key, &paths[4].to_string_lossy().to_lowercase());
+                        Some(data.launch.clone())
+                    }
+                    _ => None,
+                })
+        });
         super::super::actions::launch(fallback);
         wait_for(|| {
             std::fs::read_to_string(&marker)

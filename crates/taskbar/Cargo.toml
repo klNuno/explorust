@@ -32,3 +32,6 @@ path = "src/bin/taskbar-probe.rs"
 [[bin]]
 name = "tray-test"
 path = "src/bin/tray-test.rs"
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_System_IO", "Win32_System_Ioctl"] }

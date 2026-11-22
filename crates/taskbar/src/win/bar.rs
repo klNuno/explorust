@@ -606,6 +606,12 @@ impl Bar {
                     }
                     changed |= pins::resolve(&mut self.pins, slot, item);
                 }
+                Update::FileExplorer(slot) => {
+                    if let Some(item) = self.pins.iter_mut().find(|pin| pin.source == Some(slot))
+                        .and_then(|pin| pin.item.as_mut()) {
+                        item.file_explorer = true;
+                    }
+                }
                 Update::Icon(slot, icon) => {
                     if let Some(item) = self.pins.iter_mut().find(|pin| pin.source == Some(slot))
                         .and_then(|pin| pin.item.as_mut()) {

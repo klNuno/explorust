@@ -62,6 +62,42 @@ pub fn resolve<T>(pins: &mut Vec<Pin<T>>, slot: usize, item: Option<(String, T)>
     true
 }
 
+#[derive(Clone, Copy)]
+pub enum Read {
+    Shortcut,
+    Identity,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadUpdate {
+    Publish,
+    Merge,
+    Remove,
+    Skip,
+}
+
+#[derive(Default)]
+pub struct Reads {
+    shortcut: Option<bool>,
+    identity: Option<bool>,
+}
+
+impl Reads {
+    pub fn complete(&mut self, read: Read, found: bool) -> ReadUpdate {
+        let (current, other) = match read {
+            Read::Shortcut => (&mut self.shortcut, self.identity),
+            Read::Identity => (&mut self.identity, self.shortcut),
+        };
+        *current = Some(found);
+        match (read, found, other) {
+            (Read::Shortcut, true, Some(true)) => ReadUpdate::Merge,
+            (_, true, _) => ReadUpdate::Publish,
+            (_, false, Some(false)) => ReadUpdate::Remove,
+            (_, false, _) => ReadUpdate::Skip,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +147,39 @@ mod tests {
             pins.iter().map(|pin| pin.item.unwrap()).collect::<Vec<_>>(),
             [1, 3]
         );
+    }
+
+    #[test]
+    fn a_pin_can_launch_when_only_the_shortcut_is_readable() {
+        let mut reads = Reads::default();
+        assert_eq!(reads.complete(Read::Identity, false), ReadUpdate::Skip);
+        assert_eq!(reads.complete(Read::Shortcut, true), ReadUpdate::Publish);
+
+        let mut reads = Reads::default();
+        assert_eq!(reads.complete(Read::Shortcut, true), ReadUpdate::Publish);
+        assert_eq!(reads.complete(Read::Identity, false), ReadUpdate::Skip);
+    }
+
+    #[test]
+    fn a_late_shortcut_does_not_replace_the_resolved_identity() {
+        let mut reads = Reads::default();
+        assert_eq!(reads.complete(Read::Identity, true), ReadUpdate::Publish);
+        assert_eq!(reads.complete(Read::Shortcut, true), ReadUpdate::Merge);
+
+        let mut reads = Reads::default();
+        assert_eq!(reads.complete(Read::Shortcut, true), ReadUpdate::Publish);
+        assert_eq!(reads.complete(Read::Identity, true), ReadUpdate::Publish);
+    }
+
+    #[test]
+    fn a_pin_is_removed_only_when_both_reads_fail() {
+        for (first, second) in [
+            (Read::Shortcut, Read::Identity),
+            (Read::Identity, Read::Shortcut),
+        ] {
+            let mut reads = Reads::default();
+            assert_eq!(reads.complete(first, false), ReadUpdate::Skip);
+            assert_eq!(reads.complete(second, false), ReadUpdate::Remove);
+        }
     }
 }

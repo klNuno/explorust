@@ -40,7 +40,7 @@ pub struct LocalShortcut {
     pub explorer: bool,
 }
 
-/// The standard local TaskBar shortcut directory, used before asking providers for pin properties.
+/// The standard local TaskBar shortcut directory.
 pub struct LocalPinFolder(Vec<u8>);
 
 impl LocalPinFolder {
@@ -89,8 +89,7 @@ pub fn local_shortcut(pidl: &[u8]) -> Option<LocalShortcut> {
 
         let mut target = [0u16; 260];
         let exe_is_explorer = link.GetPath(&mut target, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32).is_ok()
-            && String::from_utf16_lossy(target.split(|&u| u == 0).next().unwrap_or_default())
-                .rsplit(['\\', '/']).next().is_some_and(|exe| exe.eq_ignore_ascii_case("explorer.exe"));
+            && is_explorer_exe(&String::from_utf16_lossy(target.split(|&u| u == 0).next().unwrap_or_default()));
         let id = link.cast::<IPropertyStore>().ok().and_then(|store| {
             let value = store.GetValue(&PKEY_AppUserModel_ID).ok()?;
             take(PropVariantToStringAlloc(&value))
@@ -98,6 +97,10 @@ pub fn local_shortcut(pidl: &[u8]) -> Option<LocalShortcut> {
         exe_is_explorer || id.is_some_and(|id| id.eq_ignore_ascii_case("Microsoft.Windows.Explorer"))
     };
     Some(LocalShortcut { path: shortcut.to_string(), name: Path::new(original).file_stem()?.to_str()?.to_string(), explorer })
+}
+
+fn is_explorer_exe(path: &str) -> bool {
+    path.rsplit(['\\', '/']).next().is_some_and(|exe| exe.eq_ignore_ascii_case("explorer.exe"))
 }
 
 fn fixed_drive(path: &Path) -> bool {
@@ -151,7 +154,16 @@ pub fn resolved_taskbar_pins_from_blob(blob: &[u8]) -> Vec<PinItem> {
 }
 
 /// Resolves one validated Taskband PIDL without extracting its icon.
-pub fn resolve_pin(mut pidl: Vec<u8>) -> Option<PinItem> {
+pub fn resolve_pin(pidl: Vec<u8>) -> Option<PinItem> {
+    resolve_pin_inner(pidl, false).map(|(pin, _)| pin)
+}
+
+/// Resolves a pin and whether to route its launch to the Files replacement.
+pub fn resolve_taskbar_pin(pidl: Vec<u8>) -> Option<(PinItem, bool)> {
+    resolve_pin_inner(pidl, true)
+}
+
+fn resolve_pin_inner(mut pidl: Vec<u8>, classify_explorer: bool) -> Option<(PinItem, bool)> {
     if !crate::taskband::valid_pidl(&pidl) {
         return None;
     }
@@ -179,9 +191,14 @@ pub fn resolve_pin(mut pidl: Vec<u8>) -> Option<PinItem> {
     // The shortcut is the pin. A target may be advertised, on a disconnected mapped drive,
     // or reachable only after the user signs in to a network provider.
     let key = item_key(&item)?;
+    // An explicit AppUserModelID can mask an Explorer shortcut's target in the grouping key.
+    let explorer = classify_explorer && (key == "microsoft.windows.explorer" || is_explorer_exe(&key)
+        || (path.is_some() && !Path::new(&key).is_absolute()
+            && take(unsafe { item.GetString(&PKEY_Link_TargetParsingPath) })
+                .is_some_and(|target| is_explorer_exe(&target))));
     let name = take(unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) })?;
     let item = windows_core::Interface::cast(&item).ok()?;
-    Some(PinItem { key, name, pidl, item })
+    Some((PinItem { key, name, pidl, item }, explorer))
 }
 
 fn parse_pidl(path: &str) -> Option<Vec<u8>> {
