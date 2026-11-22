@@ -279,7 +279,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         } else {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
-        let work = WorkArea::reserve(monitor, if settings.autohide { S::REVEAL_EDGE_PX } else { h_px });
+        let work = WorkArea::reserve(monitor, settings.reserved_height(h_px));
         let shellhook = RegisterWindowMessageW(w!("SHELLHOOK"));
         let taskband = Taskband::publish(hwnd, hwnd, shellhook);
         let hooked = RegisterShellHookWindow(hwnd).as_bool();
@@ -448,14 +448,8 @@ fn run_effect(e: Effect) {
         }
         Effect::WorkArea => {
             let _ = with_bar(|b| {
-                let mut bar = RECT::default();
-                // SAFETY: reads our own window's rect.
-                let _ = unsafe { GetWindowRect(b.hwnd, &mut bar) };
                 if b.work.is_some() {
-                    if b.settings.autohide {
-                        bar = RECT { top: b.monitor.bottom - S::REVEAL_EDGE_PX, bottom: b.monitor.bottom, ..bar };
-                    }
-                    let r = b.side.work_area(b.monitor, bar);
+                    let r = b.side.work_area(b.monitor, b.reserved_rect());
                     super::workarea::apply_rect(RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom });
                 }
             });
@@ -524,6 +518,13 @@ unsafe extern "system" fn on_winevent(_: HWINEVENTHOOK, event: u32, hwnd: HWND, 
 }
 
 impl Bar {
+    /// The taskbar's work-area reservation stays put during the slide.
+    fn reserved_rect(&self) -> crate::appbar::Rect {
+        let monitor = super::appbars::to_rect(self.monitor);
+        let top = monitor.bottom - self.settings.reserved_height(self.h_px);
+        crate::appbar::Rect { top, ..monitor }
+    }
+
     fn row(&self) -> Row {
         Row { width: self.scene.as_ref().map_or(1280.0, |s| s.width), buttons: self.groups.len() + 1, left: self.settings.align_left }
     }
@@ -1444,7 +1445,8 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             let cds = unsafe { &*(lp.0 as *const windows::Win32::System::DataExchange::COPYDATASTRUCT) };
             let (h, m, k) = b.ctx();
             let cx = Ctx { hwnd: h, monitor: m, scale: k, theme: &b.theme };
-            let (r, a) = b.side.on_copydata(cds, &cx);
+            let reserved = b.reserved_rect();
+            let (r, a) = b.side.on_copydata(cds, &cx, reserved);
             b.asks(a);
             LRESULT(r)
         }),

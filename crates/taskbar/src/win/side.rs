@@ -139,7 +139,7 @@ impl Side {
     }
 
     /// WM_COPYDATA on `Shell_TrayWnd`: (result, asks).
-    pub fn on_copydata(&mut self, cds: &COPYDATASTRUCT, cx: &Ctx) -> (isize, Asks) {
+    pub fn on_copydata(&mut self, cds: &COPYDATASTRUCT, cx: &Ctx, reserved: Rect) -> (isize, Asks) {
         let data = if cds.lpData.is_null() || cds.cbData == 0 {
             &[][..]
         } else {
@@ -158,7 +158,7 @@ impl Side {
             }
             0 => {
                 let monitor = to_rect(cx.monitor);
-                let out = self.appbars.on_copydata(data, monitor, to_rect(cx.bar_rect()));
+                let out = self.appbars.on_copydata(data, monitor, to_rect(cx.bar_rect()), reserved);
                 asks.work_area = out.work_area;
                 (out.result, asks)
             }
@@ -170,8 +170,8 @@ impl Side {
     }
 
     /// The work area the taskbar and the AppBars leave.
-    pub fn work_area(&self, monitor: RECT, bar: RECT) -> Rect {
-        self.appbars.bars.work_area(to_rect(monitor), to_rect(bar))
+    pub fn work_area(&self, monitor: RECT, reserved: Rect) -> Rect {
+        self.appbars.bars.work_area(to_rect(monitor), reserved)
     }
 
     /// Drops dead icons and bars.

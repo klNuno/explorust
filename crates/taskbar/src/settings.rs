@@ -83,6 +83,11 @@ impl Settings {
             combine_other: Combine::from_dword(r.mm_glom.or(r.glom)),
         }
     }
+
+    /// Space this taskbar removes from the monitor's work area.
+    pub fn reserved_height(self, bar_height: i32) -> i32 {
+        if self.autohide { 0 } else { bar_height }
+    }
 }
 
 /// StuckRects3 `Settings`: byte 8 holds the auto-hide bit (3 with auto-hide, 2 without).
@@ -90,8 +95,8 @@ pub fn autohide_bit(b: &[u8]) -> bool {
     b.get(8).is_some_and(|v| v & 1 != 0)
 }
 
-/// The invisible gap between the maximized work area and the bottom of the monitor.
-pub const REVEAL_EDGE_PX: i32 = 2;
+/// Pointer distance from the bottom that wakes a hidden taskbar.
+const REVEAL_EDGE_PX: i32 = 2;
 /// The show slide of the owner's Windhawk mod `taskbar-autohide-instant-show`.
 pub const SHOW_MS: f32 = 200.0;
 pub const HIDE_MS: f32 = 200.0;
@@ -164,6 +169,14 @@ mod tests {
     }
 
     #[test]
+    fn auto_hide_reserves_no_work_area() {
+        let regular = Settings::default();
+        let auto_hide = Settings { autohide: true, ..regular };
+        assert_eq!(regular.reserved_height(48), 48);
+        assert_eq!(auto_hide.reserved_height(48), 0);
+    }
+
+    #[test]
     fn reveal_uses_the_bottom_edge_of_its_own_monitor() {
         let left = Rect::new(-1920, -40, 0, 1040);
         let primary = Rect::new(0, 0, 1280, 800);
@@ -188,7 +201,8 @@ mod tests {
     #[test]
     fn maximize_borders_do_not_make_a_window_fullscreen() {
         let monitor = Rect::new(0, 0, 1280, 800);
-        assert!(!fullscreen_cover(Rect::new(-8, -8, 1288, 806), monitor, true));
+        assert!(!fullscreen_cover(Rect::new(-8, -8, 1288, 808), monitor, true));
+        assert!(!fullscreen_cover(monitor, monitor, true));
         assert!(fullscreen_cover(monitor, monitor, false));
         assert!(!fullscreen_cover(Rect::new(0, 0, 1280, 798), monitor, false));
     }

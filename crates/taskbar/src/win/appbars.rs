@@ -31,7 +31,7 @@ impl AppBarHost {
         AppBarHost { bars: AppBars::default(), fullscreen: false, logged_raw: false }
     }
 
-    pub fn on_copydata(&mut self, data: &[u8], monitor: Rect, taskbar: Rect) -> Outcome {
+    pub fn on_copydata(&mut self, data: &[u8], monitor: Rect, taskbar: Rect, reserved: Rect) -> Outcome {
         if !self.logged_raw {
             self.logged_raw = true;
             let hex: Vec<String> = data.iter().take(72).map(|b| format!("{b:02x}")).collect();
@@ -41,7 +41,7 @@ impl AppBarHost {
             log::line(&format!("appbar: unreadable payload of {} bytes", data.len()));
             return Outcome::default();
         };
-        let out = self.handle(&m, monitor, taskbar);
+        let out = self.handle(&m, monitor, taskbar, reserved);
         log::line(&format!(
             "appbar {} hwnd {:#x} cb {:#x} edge {} rc {},{},{},{} lp {} pid {}: {}",
             name(m.msg), m.hwnd, m.callback, m.edge, m.rc.left, m.rc.top, m.rc.right, m.rc.bottom, m.lparam, m.pid, out.result
@@ -49,7 +49,7 @@ impl AppBarHost {
         out
     }
 
-    fn handle(&mut self, m: &Message, monitor: Rect, taskbar: Rect) -> Outcome {
+    fn handle(&mut self, m: &Message, monitor: Rect, taskbar: Rect, reserved: Rect) -> Outcome {
         let mut out = Outcome::default();
         match m.msg {
             ab::ABM_NEW => out.result = self.bars.add(m.hwnd, m.callback) as isize,
@@ -61,11 +61,11 @@ impl AppBarHost {
                 }
             }
             ab::ABM_QUERYPOS => {
-                let r = self.bars.query(m.hwnd, m.edge, m.rc, monitor, taskbar);
+                let r = self.bars.query(m.hwnd, m.edge, m.rc, monitor, reserved);
                 out.result = write_rect(m, r, None) as isize;
             }
             ab::ABM_SETPOS => {
-                if let Some(r) = self.bars.set(m.hwnd, m.edge, m.rc, monitor, taskbar) {
+                if let Some(r) = self.bars.set(m.hwnd, m.edge, m.rc, monitor, reserved) {
                     out.result = write_rect(m, r, None) as isize;
                     out.work_area = true;
                     self.notify_all(m.hwnd, ab::ABN_POSCHANGED, 0);
