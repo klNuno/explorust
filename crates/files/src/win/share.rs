@@ -11,8 +11,22 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 use windows::Win32::UI::Shell::{
     IDataTransferManagerInterop, IShellItemArray, IShellView, SIGDN_NORMALDISPLAY, SVGIO_SELECTION,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 use windows_collections::IIterable;
 use windows_core::{Error, HSTRING, Interface, Result};
+
+pub fn available() -> bool {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(GetShellWindow(), Some(&mut pid)) };
+    let explorer = std::env::var("SystemRoot").ok().map(|root| format!(r"{root}\explorer.exe"));
+    let available = pid != 0 && shelldata::items::process_path(pid).zip(explorer)
+        .is_some_and(|(image, explorer)| image.eq_ignore_ascii_case(&explorer));
+    if !available {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| log::line("Share unavailable: no Explorer-owned shell window for native broker dispatch"));
+    }
+    available
+}
 
 pub struct Registration {
     manager: DataTransferManager,
@@ -54,12 +68,14 @@ pub fn open(hwnd: HWND, view: &IShellView) -> Result<Registration> {
             DataRequestedEventArgs,
         >::new(move |_, args| {
             if let Some(args) = args.as_ref() {
+                log::line("Share broker requested selection data");
                 supply(args.Request()?, &title, paths.clone())?;
             }
             Ok(())
         }))?;
         let registration = Registration { manager, token };
         interop.ShowShareUIForWindow(hwnd)?;
+        log::line("Share request submitted to the Windows broker");
         Ok(registration)
     }
 }

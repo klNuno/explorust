@@ -65,6 +65,16 @@ pub const CMD_ICONS: [(Cmd, char, f32); 6] = [
     (Cmd::Share, '\u{E72D}', 292.0),
     (Cmd::Delete, '\u{E74D}', 330.0),
 ];
+
+pub fn command_icons(share: bool) -> impl Iterator<Item = (Cmd, char, f32)> {
+    CMD_ICONS.into_iter().filter_map(move |(cmd, glyph, x)| {
+        if !share && cmd == Cmd::Share {
+            return None;
+        }
+        let x = if !share && cmd == Cmd::Delete { x - 38.0 } else { x };
+        Some((cmd, glyph, x))
+    })
+}
 /// Labelled buttons: command, glyph, glyph cx, label x, chevron cx, left, right.
 pub const CMD_LABELLED: [(Cmd, char, f32, f32, f32, f32, f32); 3] = [
     (Cmd::New, '\u{E8F4}', 27.0, 44.0, 0.0, 10.0, 107.0),
@@ -155,7 +165,7 @@ fn within(v: f32, center: f32, width: f32) -> bool {
 
 /// What the point (x, y) hits in a window `w` wide with `tabs` tabs; `crumbs` are the x spans of
 /// the breadcrumb's items as last drawn.
-pub fn hit(x: f32, y: f32, w: f32, tabs: usize, active: usize, crumbs: &[(f32, f32)]) -> Hit {
+pub fn hit(x: f32, y: f32, w: f32, tabs: usize, active: usize, crumbs: &[(f32, f32)], share: bool) -> Hit {
     if x < 0.0 || y < 0.0 || x >= w || y >= CHROME_H {
         return Hit::None;
     }
@@ -210,7 +220,7 @@ pub fn hit(x: f32, y: f32, w: f32, tabs: usize, active: usize, crumbs: &[(f32, f
     if !within(y, CMD_CY, CMD_H) {
         return Hit::None;
     }
-    for (c, _, cx) in CMD_ICONS {
+    for (c, _, cx) in command_icons(share) {
         if within(x, cx, CMD_BTN_W) {
             return Hit::Cmd(c);
         }
@@ -254,6 +264,10 @@ mod tests {
     use super::*;
 
     const W: f32 = 1240.0;
+
+    fn hit(x: f32, y: f32, w: f32, tabs: usize, active: usize, crumbs: &[(f32, f32)]) -> Hit {
+        super::hit(x, y, w, tabs, active, crumbs, true)
+    }
 
     #[test]
     fn caption_buttons() {
@@ -310,6 +324,13 @@ mod tests {
         assert_eq!(hit(W - 60.0, 112.0, W, 1, 0, &[]), Hit::Cmd(Cmd::Details));
         assert_eq!(hit(800.0, 112.0, W, 1, 0, &[]), Hit::None);
         assert_eq!(hit(800.0, 200.0, W, 1, 0, &[]), Hit::None);
+    }
+
+    #[test]
+    fn an_unavailable_share_command_has_no_visible_or_clickable_slot() {
+        assert_eq!(super::hit(292.0, 116.0, W, 1, 0, &[], false), Hit::Cmd(Cmd::Delete));
+        assert_eq!(super::hit(330.0, 116.0, W, 1, 0, &[], false), Hit::None);
+        assert!(command_icons(false).all(|(command, _, _)| command != Cmd::Share));
     }
 
     #[test]

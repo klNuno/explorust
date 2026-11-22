@@ -405,6 +405,7 @@ impl Volume {
         let mut since = Instant::now();
         let mut retries = HashMap::new();
         let mut links_buf = vec![0u8; 8 << 10];
+        let mut caught_up = false;
         loop {
             let rd = READ_USN_JOURNAL_DATA_V0 {
                 StartUsn: next,
@@ -413,18 +414,24 @@ impl Volume {
                 Timeout: 0,
                 // Only poll while a link retry has a deadline. With no pending retries, wait
                 // indefinitely for USN records so an idle volume never wakes the follower.
-                BytesToWaitFor: u64::from(retries.is_empty()),
+                BytesToWaitFor: u64::from(caught_up && retries.is_empty()),
                 UsnJournalID: journal_id,
             };
             let got = match ioctl(self.h, FSCTL_READ_USN_JOURNAL, &rd, &mut buf) {
                 Ok(n) => n,
-                Err(e) => return e,
+                Err(e) => {
+                    table.write().unwrap_or_else(|p| p.into_inner()).journal_current = false;
+                    return e;
+                }
             };
             if got >= 8 {
                 next = i64::from_le_bytes(buf[..8].try_into().unwrap_or_default());
             }
             if got > 8 {
                 changes += self.changes(&buf[8..got], table, &mut retries);
+            } else if !caught_up {
+                table.write().unwrap_or_else(|p| p.into_inner()).journal_current = true;
+                caught_up = true;
             }
             if !retries.is_empty() {
                 self.retry_links(table, &mut retries, &mut links_buf);

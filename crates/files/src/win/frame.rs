@@ -11,7 +11,7 @@ use crate::win::details::Pane;
 use crate::win::gfx::{Canvas, Shared};
 use crate::win::shell::{self, Pidl};
 use crate::win::tab::{self, Tab};
-use crate::win::{log, menus, search, share, shellwindows};
+use crate::win::{log, menus, operations, search, share, shellwindows};
 use render::style::{self, Native, Part, WindowStyle};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -58,13 +58,14 @@ pub struct Frame {
     search_focus: bool,
     search_timer: bool,
     search_worker: Option<search::Worker>,
+    operations: Option<operations::Worker>,
     sharing: Option<share::Registration>,
+    share_available: bool,
     details: Option<Pane>,
     s: &'static Strings,
     icons: HashMap<usize, ID2D1Bitmap1>,
     window_active: bool,
     tracking: bool,
-    view_hidden: bool,
     /// Client size and DPI of the last layout.
     laid_out: (i32, i32, u32),
     /// When the window was asked for, until its view is ready (logged then).
@@ -82,6 +83,7 @@ thread_local! {
     static SHARED: RefCell<Option<(Rc<Shared>, &'static Strings)>> = const { RefCell::new(None) };
     static NEW_WINDOW: Cell<Option<HWND>> = const { Cell::new(None) };
     static BROWSES: RefCell<Vec<(HWND, usize, Pidl)>> = const { RefCell::new(Vec::new()) };
+    static NAVIGATION: RefCell<Vec<(HWND, usize, tab::Navigation)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Registers the window class and keeps the shared drawing devices; `cmd` receives the
@@ -114,10 +116,6 @@ fn with<R>(hwnd: HWND, f: impl FnOnce(&mut Frame) -> R) -> Option<R> {
     let rc = find(hwnd)?;
     let mut fr = rc.try_borrow_mut().ok()?;
     Some(f(&mut fr))
-}
-
-pub fn count() -> usize {
-    FRAMES.with(|f| f.borrow().len())
 }
 
 fn scale(hwnd: HWND) -> f32 {
@@ -184,13 +182,14 @@ pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
             search_focus: false,
             search_timer: false,
             search_worker: None,
+            operations: None,
             sharing: None,
+            share_available: share::available(),
             details: None,
             s,
             icons: HashMap::new(),
             window_active: false,
             tracking: false,
-            view_hidden: false,
             laid_out: (0, 0, 0),
             opened: None,
             sw_cookie: None,
@@ -245,27 +244,6 @@ fn cloak(hwnd: HWND, hide: bool) {
     }
 }
 
-/// Hides the active view until its next navigation completes (a ready window sent elsewhere
-/// shows no stale folder).
-pub fn hide_view(hwnd: HWND) {
-    with(hwnd, |f| {
-        if let Some(t) = f.tab() {
-            t.show(false);
-        }
-        f.view_hidden = true;
-    });
-}
-
-/// Navigates the active tab of `hwnd` to `place`.
-pub fn browse(hwnd: HWND, place: &Pidl) {
-    with(hwnd, |f| {
-        f.clear_search();
-        if let Some(t) = f.tabs.get(f.active) {
-            let _ = t.browse(place);
-        }
-    });
-}
-
 /// Puts `hwnd` in the shell's window list, showing `place`.
 pub fn announce(hwnd: HWND, place: &Pidl) {
     // Outside the frame's borrow: the cross-process call can let callers in.
@@ -306,6 +284,12 @@ pub fn browse_tab_later(hwnd: HWND, id: usize, place: Pidl) {
     }
 }
 
+pub fn browser_navigated(hwnd: HWND, id: usize, event: tab::Navigation) {
+    if unsafe { PostMessageW(Some(hwnd), tab::MSG_NAVIGATION, WPARAM(0), LPARAM(0)) }.is_ok() {
+        NAVIGATION.with(|pending| pending.borrow_mut().push((hwnd, id, event)));
+    }
+}
+
 /// A middle click on a folder in an items view opens it in a new tab, as Explorer does. The view
 /// has no hit test, so the click is replayed as a left click (which selects what it hits) and the
 /// frame reads the selection after it.
@@ -342,18 +326,16 @@ pub fn set_opened(hwnd: HWND, t: Instant) {
     });
 }
 
-pub fn ready(hwnd: HWND) -> bool {
-    with(hwnd, |f| f.view_ready()).unwrap_or(false)
-}
-
-/// Closes every window (shutdown).
-pub fn close_all() {
+/// Releases this STA's windows and devices before OLE is uninitialized.
+pub fn clear_thread() {
     let all: Vec<HWND> = FRAMES.with(|f| f.borrow().iter().map(|(h, _)| *h).collect());
     for h in all {
         unsafe {
             let _ = SendMessageW(h, WM_CLOSE, None, None);
         }
     }
+    SHARED.with(|shared| shared.borrow_mut().take());
+    shellwindows::clear_thread();
 }
 
 /// Keys of the message loop: Explorer's shortcuts, then the view's own accelerators (F2,
@@ -363,10 +345,6 @@ pub fn accelerator(msg: &MSG) -> bool {
         return false;
     }
     let root = unsafe { GetAncestor(msg.hwnd, GA_ROOT) };
-    if root == msg.hwnd {
-        // Our own window has the focus: the address or search box edits.
-        return false;
-    }
     with(root, |f| f.accelerator(msg)).unwrap_or(false)
 }
 
@@ -431,7 +409,7 @@ impl Frame {
     }
 
     fn view_ready(&self) -> bool {
-        !self.view_hidden && self.tab().is_some_and(|tab| tab.history.current().is_some())
+        self.tab().is_some_and(|tab| tab.history.current().is_some())
     }
 
     fn add_tab(&mut self, place: &Pidl) -> windows_core::Result<()> {
@@ -557,6 +535,7 @@ impl Frame {
             hover: self.hover,
             pressed: self.pressed,
             selection: selected > 0,
+            share: self.share_available,
             paste: ready && create && menus::file_clipboard(),
             create,
             ready,
@@ -611,7 +590,7 @@ impl Frame {
         let k = self.scale();
         let rect = client(self.hwnd);
         let w = rect.right as f32 / k;
-        L::hit(x_px as f32 / k, y_px as f32 / k, w, self.tabs.len(), self.active, &self.spans)
+        L::hit(x_px as f32 / k, y_px as f32 / k, w, self.tabs.len(), self.active, &self.spans, self.share_available)
     }
 
     fn set_hover(&mut self, h: Hit) {
@@ -676,8 +655,9 @@ impl Frame {
             Hit::Forward => self.go(Move::Forward),
             Hit::Up => {
                 if !self.clear_search() {
-                    if let Some(t) = self.tab() {
-                        t.up()
+                    if let Some(t) = self.tabs.get_mut(self.active) {
+                        t.invalidate_address();
+                        t.up();
                     }
                 }
             }
@@ -719,6 +699,7 @@ impl Frame {
             return;
         }
         if let Some(t) = self.tabs.get_mut(self.active) {
+            t.invalidate_address();
             t.go(m);
         }
     }
@@ -749,14 +730,14 @@ impl Frame {
         };
         let r = match c {
             Cmd::Cut | Cmd::Copy | Cmd::Delete => {
-                let verb = match c {
-                    Cmd::Cut => "cut",
-                    Cmd::Copy => "copy",
-                    _ => "delete",
-                };
                 let Some(view) = &sv else { return };
-                let Some(menu) = shell::selection_menu(view) else { return };
-                shell::invoke(&menu, view, self.hwnd, verb)
+                let Ok(items) = shell::selection(view) else { return };
+                if !items.is_empty() {
+                    let action = if c == Cmd::Delete { operations::Action::Delete { items, results: t.index_results_id() } }
+                        else { operations::Action::Clipboard(items, c == Cmd::Cut) };
+                    self.submit_operation(t.id, action);
+                }
+                return;
             }
             Cmd::Rename => {
                 let Some(v) = fv.as_ref().filter(|v| shell::has_selection(v)) else { return };
@@ -764,7 +745,7 @@ impl Frame {
             }
             Cmd::Share => {
                 let Some(view) = &sv else { return };
-                if !fv.as_ref().is_some_and(shell::has_selection) {
+                if !self.share_available || !fv.as_ref().is_some_and(shell::has_selection) {
                     return;
                 }
                 self.sharing = None;
@@ -774,17 +755,16 @@ impl Frame {
                 if t.path.is_none() || !t.query.is_empty() || !menus::file_clipboard() {
                     return;
                 }
-                let Some(view) = &sv else { return };
-                let Some(menu) = shell::background_menu(view) else { return };
-                shell::invoke(&menu, view, self.hwnd, "paste")
+                if let Some(folder) = t.history.current() {
+                    self.submit_operation(t.id, operations::Action::Paste(folder.clone()));
+                }
+                return;
             }
             Cmd::New => {
-                let Some(folder) = t.item.as_ref().filter(|_| t.path.is_some() && t.query.is_empty()) else { return };
-                let result = shell::new_folder(self.hwnd, folder, self.s.new_folder);
-                if result.is_ok() {
-                    t.refresh();
+                if t.path.is_some() && t.query.is_empty() && let Some(folder) = t.history.current() {
+                    self.submit_operation(t.id, operations::Action::NewFolder(folder.clone(), self.s.new_folder));
                 }
-                result
+                return;
             }
             Cmd::Sort => {
                 if let Some(v) = &fv {
@@ -804,7 +784,21 @@ impl Frame {
             }
             Cmd::More => {
                 if let (Some(v), Some(s)) = (&fv, &sv) {
-                    menus::more(self.hwnd, v, s, self.s, below(L::command_more_x(w) - 17.0))
+                    match menus::more(self.hwnd, v, self.s, below(L::command_more_x(w) - 17.0)) {
+                        Ok(true) => {
+                            let items = if shell::has_selection(v) {
+                                shell::selection(s).unwrap_or_default()
+                            } else {
+                                t.history.current().cloned().into_iter().collect()
+                            };
+                            if !items.is_empty() {
+                                self.submit_operation(t.id, operations::Action::Properties(items));
+                            }
+                            Ok(())
+                        }
+                        Ok(false) => Ok(()),
+                        Err(error) => Err(error),
+                    }
                 } else {
                     Ok(())
                 }
@@ -857,7 +851,7 @@ impl Frame {
             }
             return true;
         }
-        if in_edit {
+        if in_edit || msg.hwnd == self.hwnd {
             return false;
         }
         match self.tab().and_then(|t| t.shell_view()) {
@@ -912,19 +906,46 @@ impl Frame {
     }
 
     fn go_to(&mut self, text: &str) {
-        let text = text.trim().trim_matches('"');
-        match Pidl::parse_result(text) {
-            Ok(p) => {
-                if let Some(folder) = p.item().ok().as_ref().and_then(shell::folder_target) {
-                    self.browse_active(&folder);
-                } else if let Err(e) = shell::open_item(self.hwnd, &p) {
-                    log::line(&format!("address: opening {text:?} failed: {e}"));
-                }
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let request = tab.invalidate_address();
+        let id = tab.id;
+        self.submit_operation(id, operations::Action::Address { text: text.trim().trim_matches('"').to_owned(), request });
+    }
+
+    fn submit_operation(&mut self, tab: usize, action: operations::Action) {
+        if self.operations.is_none() {
+            match operations::Worker::new(self.hwnd) {
+                Ok(worker) => self.operations = Some(worker),
+                Err(error) => log::line(&format!("Files operation worker failed: {error}")),
             }
-            Err(e) => {
-                log::line(&format!("address: navigation failed for {text:?} (SHParseDisplayName HRESULT {:#010x}): {e}", e.code().0 as u32));
-                unsafe {
-                    let _ = MessageBeep(MB_ICONWARNING);
+        }
+        if let Some(worker) = &self.operations {
+            worker.submit(tab, action);
+        }
+    }
+
+    fn operation_results(&mut self) {
+        let Some(worker) = &self.operations else { return };
+        for response in worker.take() {
+            match response {
+                operations::Response::Address { tab, request, destination } => {
+                    if self.tabs.iter().any(|t| t.id == tab && t.address_generation == request) {
+                        match destination {
+                            Ok(Some(folder)) => self.browse_tab(tab, &folder),
+                            Err(_) => unsafe { let _ = MessageBeep(MB_ICONWARNING); },
+                            Ok(None) => {}
+                        }
+                    }
+                }
+                operations::Response::Refresh { tab, folder } => {
+                    if let Some(t) = self.tabs.iter().find(|t| t.id == tab && t.query.is_empty() && t.history.current() == Some(&folder)) {
+                        t.refresh();
+                    }
+                }
+                operations::Response::Deleted { tab, results, items } => {
+                    if let Some(t) = self.tabs.iter().find(|t| t.id == tab) {
+                        t.remove_index_results(results, &items);
+                    }
                 }
             }
         }
@@ -941,6 +962,7 @@ impl Frame {
             self.clear_search();
         }
         if let Some(tab) = self.tabs.get_mut(index) {
+            tab.invalidate_address();
             if index != self.active {
                 tab.clear_search(false);
             }
@@ -1020,15 +1042,13 @@ impl Frame {
     }
 
     fn apply_search(&mut self, response: search::Response) {
-        let rect = self.view_rect();
-        let hwnd = self.hwnd;
         let active = self.tab().is_some_and(|t| t.id == response.tab);
         let Some(t) = self.tabs.iter_mut().find(|t| t.id == response.tab && t.generation == response.generation) else {
             return;
         };
         let result = response.results.and_then(|hits| {
             let indexed = matches!(hits, search::Results::Indexed(_));
-            let browser = t.search_browser(hwnd, rect, indexed)?;
+            let browser = t.search_browser(indexed)?;
             search::present(browser, hits)
         });
         match result {
@@ -1043,14 +1063,13 @@ impl Frame {
             }
         }
         if active && self.search_focus {
-            unsafe { let _ = SetFocus(Some(hwnd)); }
+            unsafe { let _ = SetFocus(Some(self.hwnd)); }
         }
         self.draw();
     }
 
     fn navigated(&mut self, id: usize, p: Pidl) {
         let active_id = self.tab().map(|t| t.id);
-        let view_rect = self.view_rect();
         let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) else { return };
         t.navigated(p);
         log::line(&format!("tab {id}: displaying {:?}", t.path.as_deref().unwrap_or(&t.title)));
@@ -1060,11 +1079,6 @@ impl Frame {
             }
         }
         let title = t.title.clone();
-        if active_id == Some(id) && self.view_hidden {
-            self.view_hidden = false;
-            t.set_rect(view_rect);
-            t.show(true);
-        }
         if let Some(t0) = self.opened.take() {
             log::line(&format!(
                 "view ready on {title:?}: {:.1} ms after the open",
@@ -1077,6 +1091,30 @@ impl Frame {
             self.select_pending();
         }
         self.draw();
+    }
+
+    fn navigation_event(&mut self, browser: usize, event: tab::Navigation) {
+        let Some(index) = self.tabs.iter().position(|t| t.folder_browser(browser)) else { return };
+        let id = self.tabs[index].id;
+        match event {
+            tab::Navigation::Complete(place) => {
+                let changed = self.tabs[index].history.current().is_some_and(|old| {
+                    !unsafe { windows::Win32::UI::Shell::ILIsEqual(old.as_ptr(), place.as_ptr()) }.as_bool()
+                });
+                if changed {
+                    self.tabs[index].invalidate_address();
+                    if index == self.active {
+                        self.clear_search();
+                    } else {
+                        self.tabs[index].clear_search(false);
+                    }
+                }
+                self.navigated(id, place);
+            }
+            tab::Navigation::Failed(target) => {
+                log::line(&format!("tab {id}: navigation failed for {:?} (ExplorerBrowser event)", target.map(|p| p.display())));
+            }
+        }
     }
 
     /// Selects the item a caller asked for when the active tab shows its folder.
@@ -1109,13 +1147,16 @@ impl Frame {
         Some(place)
     }
 
-    fn view_created(&mut self, id: usize, search: bool) {
-        let Some(browser) = self.tabs.iter().find(|t| t.id == id).and_then(|t| t.source(search)) else { return };
+    fn view_created(&mut self, id: usize) {
+        let Some((tab, browser)) = self.tabs.iter().find_map(|tab| Some((tab, tab.source(id)?))) else { return };
         if let Some(root) = browser.window() {
             shell::dark_children(root);
         }
         if let Some(view) = browser.shell_view() {
             menu::hook(&view);
+            if tab.folder_browser(id) {
+                tab::watch_folder_layout(&view, id);
+            }
         }
         self.draw();
     }
@@ -1271,7 +1312,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let mut at = POINT::default();
                     let _ = GetCursorPos(&mut at);
                     let k = scale(hwnd);
-                    crate::win::open_window(&place, Some((at.x - (120.0 * k) as i32, at.y - (20.0 * k) as i32)));
+                    crate::win::views::open_folder(place, Some((at.x - (120.0 * k) as i32, at.y - (20.0 * k) as i32)));
                     return LRESULT(0);
                 }
                 with(hwnd, |f| {
@@ -1380,36 +1421,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
             }
-            tab::MSG_NAVIGATED => {
-                let p = Pidl::copy(lp.0 as *const _);
-                windows::Win32::UI::Shell::ILFree(Some(lp.0 as *const _));
-                if let Some(p) = p {
-                    with(hwnd, |f| f.navigated(wp.0, p));
+            tab::MSG_NAVIGATION => {
+                let event = NAVIGATION.with(|pending| {
+                    let mut pending = pending.borrow_mut();
+                    let index = pending.iter().position(|(window, _, _)| *window == hwnd)?;
+                    Some(pending.remove(index))
+                });
+                if let Some((_, browser, event)) = event {
+                    with(hwnd, |f| f.navigation_event(browser, event));
                 }
                 LRESULT(0)
             }
-            tab::MSG_VIEW | tab::MSG_SEARCH_VIEW => {
-                with(hwnd, |f| f.view_created(wp.0, msg == tab::MSG_SEARCH_VIEW));
+            tab::MSG_VIEW => {
+                with(hwnd, |f| f.view_created(wp.0));
                 LRESULT(0)
             }
-            tab::MSG_FAILED => {
-                let target = Pidl::copy(lp.0 as *const _);
-                windows::Win32::UI::Shell::ILFree(Some(lp.0 as *const _));
-                // ExplorerBrowser's failure callback only supplies the destination PIDL.
-                log::line(&format!("tab {}: navigation failed for {:?} (ExplorerBrowser event)", wp.0, target.map(|p| p.display())));
+            tab::MSG_FOLDER_LAYOUT => {
                 with(hwnd, |f| {
-                    if f.view_hidden {
-                        f.view_hidden = false;
-                        f.select = None;
-                        f.opened = None;
-                        if let Some(t) = f.tab() {
-                            t.show(true);
-                        }
+                    if let Some(tab) = f.tab().filter(|tab| tab.folder_browser(wp.0)) {
+                        tab.layout_results();
                     }
                 });
                 LRESULT(0)
             }
-            tab::MSG_SELECTION | WM_CLIPBOARDUPDATE => {
+            tab::MSG_SELECTION => {
+                with(hwnd, |f| {
+                    if f.tab().is_some_and(|t| t.browser().id == wp.0) {
+                        f.draw();
+                    }
+                });
+                LRESULT(0)
+            }
+            WM_CLIPBOARDUPDATE => {
                 with(hwnd, |f| f.draw());
                 LRESULT(0)
             }
@@ -1421,6 +1464,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 with(hwnd, Frame::search_results);
                 LRESULT(0)
             }
+            operations::MSG_OPERATION => {
+                with(hwnd, Frame::operation_results);
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 with(hwnd, |f| f.tabs.clear());
                 let _ = DestroyWindow(hwnd);
@@ -1429,10 +1476,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_DESTROY => {
                 let _ = windows::Win32::System::DataExchange::RemoveClipboardFormatListener(hwnd);
                 BROWSES.with(|pending| pending.borrow_mut().retain(|(window, _, _)| *window != hwnd));
+                NAVIGATION.with(|pending| pending.borrow_mut().retain(|(window, _, _)| *window != hwnd));
                 if let Some(Some(c)) = with(hwnd, |f| f.sw_cookie.take()) {
                     shellwindows::revoke(c);
                 }
                 FRAMES.with(|f| f.borrow_mut().retain(|(h, _)| *h != hwnd));
+                PostQuitMessage(0);
                 LRESULT(0)
             }
             MSG_BROWSE => {
@@ -1442,7 +1491,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         let index = pending.iter().position(|(window, _, _)| *window == hwnd)?;
                         Some(pending.remove(index))
                     });
-                    if let Some((_, id, p)) = next {
+                    if let Some((_, browser, p)) = next {
+                        let id = if browser == 0 { Some(0) } else {
+                            f.tabs.iter().find(|t| t.source(browser).is_some()).map(|t| t.id)
+                        };
+                        let Some(id) = id else { return };
                         log::line(&format!("tab {id}: in-place browse {:?}", p.display()));
                         f.browse_tab(id, &p);
                     }

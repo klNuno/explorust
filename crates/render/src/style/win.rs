@@ -67,14 +67,24 @@ fn state() -> &'static Mutex<State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
     STATE.get_or_init(|| {
         Mutex::new(State {
-            styles: State::read(&Document::load().unwrap_or_default()),
+            styles: Part::ALL.map(Part::defaults),
             windows: Vec::new(),
         })
     })
 }
 
 pub fn current(part: Part) -> Style {
+    start_watch();
     state().lock().unwrap().styles[part as usize]
+}
+
+fn start_watch() {
+    static WATCH: Once = Once::new();
+    WATCH.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("appearance".into())
+            .spawn(watch);
+    });
 }
 
 fn message() -> u32 {
@@ -212,12 +222,7 @@ pub fn bind_with_repaint(hwnd: HWND, part: Part, window: WindowStyle, repaint: O
         let _ = Box::into_raw(binding);
         apply(hwnd, window, applied);
     }
-    static WATCH: Once = Once::new();
-    WATCH.call_once(|| {
-        let _ = std::thread::Builder::new()
-            .name("appearance".into())
-            .spawn(watch);
-    });
+    start_watch();
 }
 
 unsafe extern "system" fn subclass(

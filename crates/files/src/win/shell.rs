@@ -7,7 +7,6 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT};
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Ole::IObjectWithSite;
 use windows::Win32::System::SystemServices::{SFGAO_BROWSABLE, SFGAO_FOLDER, SFGAO_LINK};
 use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
@@ -15,7 +14,7 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, DestroyMenu, EnumChildWindows, GetClassNameW, SW_SHOWNORMAL, SendMessageW, WM_THEMECHANGED,
 };
-use windows_core::{BOOL, HSTRING, Interface, PCSTR, PCWSTR, PWSTR, Result, w};
+use windows_core::{BOOL, HSTRING, PCSTR, PCWSTR, PWSTR, Result, w};
 
 /// An ID list held as its bytes, terminator included: comparable, clonable, no COM memory.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -177,15 +176,11 @@ pub fn home() -> Option<Pidl> {
 const CMIC_MASK_UNICODE: u32 = 0x4000;
 
 /// Invokes a canonical verb ("cut", "copy", "delete", "paste", "NewFolder", ...) on a context menu.
-pub fn invoke(menu: &IContextMenu, view: &IShellView, hwnd: HWND, verb: &str) -> Result<()> {
+fn invoke(menu: &IContextMenu, hwnd: HWND, verb: &str) -> Result<()> {
     let a: Vec<u8> = verb.bytes().chain(std::iter::once(0)).collect();
     let wv = shelldata::wide(verb);
     unsafe {
         let hmenu = CreatePopupMenu()?;
-        let site = menu.cast::<IObjectWithSite>().ok();
-        if let Some(site) = &site {
-            let _ = site.SetSite(view);
-        }
         let fill = menu.QueryContextMenu(hmenu, 0, 1, 0x7fff, CMF_NORMAL | CMF_CANRENAME);
         let info = CMINVOKECOMMANDINFOEX {
             cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
@@ -199,10 +194,16 @@ pub fn invoke(menu: &IContextMenu, view: &IShellView, hwnd: HWND, verb: &str) ->
         };
         let r = fill.ok().and_then(|()| menu.InvokeCommand(&info as *const _ as *const CMINVOKECOMMANDINFO));
         let _ = DestroyMenu(hmenu);
-        if let Some(site) = &site {
-            let _ = site.SetSite(None);
-        }
         r
+    }
+}
+
+pub fn paste(owner: HWND, folder: &Pidl) -> Result<()> {
+    unsafe {
+        let parent = SHGetDesktopFolder()?;
+        let folder: IShellFolder = parent.BindToObject(folder.as_ptr(), None)?;
+        let menu = folder.CreateViewObject(owner)?;
+        invoke(&menu, owner, "paste")
     }
 }
 
@@ -224,6 +225,24 @@ pub fn new_folder(owner: HWND, folder: &IShellItem, name: &str) -> Result<()> {
         op.SetOwnerWindow(owner)?;
         op.SetOperationFlags(FOF_RENAMEONCOLLISION | FOF_NOCONFIRMMKDIR)?;
         op.NewItem(folder, FILE_ATTRIBUTE_DIRECTORY.0, &HSTRING::from(name), PCWSTR::null(), None::<&IFileOperationProgressSink>)?;
+        complete_operation(&op)
+    }
+}
+
+pub fn delete_items(owner: HWND, items: &[Pidl]) -> Result<()> {
+    let children: Vec<_> = items.iter().map(Pidl::as_ptr).collect();
+    unsafe {
+        let selection = SHCreateShellItemArrayFromIDLists(&children)?;
+        let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
+        op.SetOwnerWindow(owner)?;
+        op.SetOperationFlags(FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOFX_RECYCLEONDELETE)?;
+        op.DeleteItems(&selection)?;
+        complete_operation(&op)
+    }
+}
+
+fn complete_operation(op: &IFileOperation) -> Result<()> {
+    unsafe {
         op.PerformOperations()?;
         if op.GetAnyOperationsAborted()?.as_bool() {
             return Err(windows::Win32::Foundation::E_ABORT.into());
@@ -232,18 +251,17 @@ pub fn new_folder(owner: HWND, folder: &IShellItem, name: &str) -> Result<()> {
     }
 }
 
-/// The context menu of the selected items of `view`, `None` when nothing is selected.
-pub fn selection_menu(view: &IShellView) -> Option<IContextMenu> {
-    unsafe { view.GetItemObject(SVGIO_SELECTION).ok() }
+pub fn selection(view: &IShellView) -> Result<Vec<Pidl>> {
+    unsafe {
+        let selection: IShellItemArray = view.GetItemObject(SVGIO_SELECTION)?;
+        (0..selection.GetCount()?)
+            .map(|i| Pidl::of(&selection.GetItemAt(i)?).ok_or_else(windows_core::Error::empty))
+            .collect()
+    }
 }
 
 pub fn has_selection(view: &IFolderView2) -> bool {
     unsafe { view.ItemCount(SVGIO_SELECTION).unwrap_or(0) > 0 }
-}
-
-/// The folder background's context menu (paste, new folder).
-pub fn background_menu(view: &IShellView) -> Option<IContextMenu> {
-    unsafe { view.GetItemObject(SVGIO_BACKGROUND).ok() }
 }
 
 /// uxtheme ordinals: 133 AllowDarkModeForWindow, 135 SetPreferredAppMode, 136 FlushMenuThemes.

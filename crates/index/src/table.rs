@@ -51,6 +51,9 @@ pub struct Table {
     dead: usize,
     /// Records of the folders named in PRUNE_NAMES (their contents are not kept).
     prune_roots: Vec<u32>,
+    /// Scoped coverage starts only after the initial scan, journal catch-up and alias discovery.
+    pub journal_current: bool,
+    pub initial_links_complete: bool,
     /// Files pruned since the last `take_pruned_files`: a hard link of theirs may sit outside
     /// the pruned tree (System32 binaries are links into WinSxS), looked up by the service.
     pruned_files: Vec<u32>,
@@ -480,6 +483,62 @@ impl Table {
 
     /// The best `max` matches of the folded query `q`, sorted.
     pub fn query(&self, q: &str, max: usize) -> Vec<Found> {
+        self.query_where(q, max, None)
+    }
+
+    /// Query only the descendants of a known scope. A prune root or any ancestor of one has
+    /// incomplete coverage. Resolve folder names to record IDs before ranking any matches.
+    pub fn query_scope(&self, q: &str, max: usize, root: &str, path: &str) -> Option<Vec<Found>> {
+        if !self.journal_current || !self.initial_links_complete {
+            return None;
+        }
+        let path = path.trim_end_matches('\\');
+        let lower_path = path.to_lowercase();
+        let scope = if path.eq_ignore_ascii_case(root.trim_end_matches('\\')) {
+            ROOT
+        } else {
+            let leaf = path.rsplit_once('\\')?.1;
+            let folded = fold::fold(leaf);
+            let mut matching = self.starts.iter().enumerate().filter_map(|(i, _)| {
+                let rec = self.recs[i];
+                if rec == NONE || !self.is_dir(rec) {
+                    return None;
+                }
+                let (start, end) = self.name_range(i);
+                (&self.fold[start..end] == folded.as_bytes()
+                    && self.path(rec, root).is_some_and(|p| p.to_lowercase() == lower_path)).then_some(rec)
+            });
+            let scope = matching.next()?;
+            // NTFS directories can opt in to case-sensitive lookup. An ambiguous scope needs
+            // the native search provider rather than the first matching MFT record.
+            if matching.next().is_some() {
+                return None;
+            }
+            scope
+        };
+        if self.prune_roots.iter().any(|&rec| {
+            self.is_dir(rec) && (rec == scope || self.descends_from(rec, scope) || self.descends_from(scope, rec))
+        }) {
+            return None;
+        }
+        Some(self.query_where(q, max, Some(scope)))
+    }
+
+    fn descends_from(&self, mut rec: u32, ancestor: u32) -> bool {
+        for _ in 0..256 {
+            if rec == ROOT {
+                return false;
+            }
+            let Some(slot) = self.slots.get(rec as usize).filter(|s| s.name != NONE) else { return false };
+            rec = slot.parent;
+            if rec == ancestor {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn query_where(&self, q: &str, max: usize, scope: Option<u32>) -> Vec<Found> {
         let q = q.as_bytes();
         if q.is_empty() || q.contains(&SEP) || max == 0 {
             return Vec::new();
@@ -489,7 +548,8 @@ impl Table {
         let (q0, n) = (q[0], q.len());
         for (i, &st) in self.starts.iter().enumerate() {
             let st = st as usize;
-            if self.fold[st] == q0 && self.fold.get(st..st + n) == Some(q) && self.recs[i] != NONE {
+            if self.fold[st] == q0 && self.fold.get(st..st + n) == Some(q) && self.recs[i] != NONE
+                && scope.is_none_or(|ancestor| self.descends_from(self.recs[i], ancestor)) {
                 top.offer(meta_key(self.meta[i], 0), i);
             }
         }
@@ -503,13 +563,13 @@ impl Table {
                 i = self.seek(i, m);
                 let (s, e) = self.name_range(i);
                 at = e + 1;
-                if m == s || self.recs[i] == NONE {
+                if m == s || self.recs[i] == NONE || scope.is_some_and(|ancestor| !self.descends_from(self.recs[i], ancestor)) {
                     continue;
                 }
                 let rank = if word_start(self.fold[m - 1]) { 1 } else { 2 };
                 top.offer(meta_key(self.meta[i], rank), i);
                 seen += 1;
-                if seen >= INNER_CAP {
+                if scope.is_none() && seen >= INNER_CAP {
                     break;
                 }
             }
@@ -517,6 +577,52 @@ impl Table {
         let mut out: Vec<Found> = top.heap.into_iter().map(|(k, i)| Found { key: k, rec: self.recs[i] }).collect();
         out.sort_unstable();
         out
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_results_require_their_own_volume_and_filter_before_ranking() {
+        let mut table = Table::new();
+        table.upsert(11, ROOT, "Projects", true, false, 0);
+        table.upsert(12, ROOT, "Projects-old", true, false, 0);
+        table.upsert(13, 11, "old report.txt", false, false, 10);
+        table.upsert(14, 12, "report.txt", false, false, 20);
+        assert_eq!(table.query("report", 1)[0].rec, 14);
+        assert!(table.query_scope("report", 1, "D:\\", "D:\\Projects").is_none());
+        table.journal_current = true;
+        assert!(table.query_scope("report", 1, "D:\\", "D:\\Projects").is_none());
+        table.initial_links_complete = true;
+        assert_eq!(table.query_scope("report", 1, "D:\\", "d:\\projects\\").unwrap()[0].rec, 13);
+        assert!(table.query_scope("report", 1, "C:\\", "D:\\Projects").is_none());
+        assert!(table.query_scope("report", 1, "D:\\", "D:\\missing").is_none());
+    }
+
+    #[test]
+    fn prune_roots_and_their_ancestors_have_incomplete_coverage() {
+        let mut table = Table::new();
+        table.upsert(11, ROOT, "Windows", true, false, 0);
+        table.upsert(12, 11, "WinSxS", true, false, 0);
+        table.upsert(13, 11, "System32", true, false, 0);
+        table.journal_current = true;
+        table.initial_links_complete = true;
+        for scope in ["C:\\", "C:\\Windows", "C:\\Windows\\WinSxS", "C:\\Windows\\WinSxS\\sub"] {
+            assert!(table.query_scope("foo", 1, "C:\\", scope).is_none(), "{scope}");
+        }
+        assert!(table.query_scope("foo", 1, "C:\\", "C:\\Windows\\System32").unwrap().is_empty());
+    }
+
+    #[test]
+    fn case_sensitive_folders_with_the_same_folded_path_are_not_covered() {
+        let mut table = Table::new();
+        table.upsert(11, ROOT, "Projects", true, false, 0);
+        table.upsert(12, ROOT, "projects", true, false, 0);
+        table.journal_current = true;
+        table.initial_links_complete = true;
+        assert!(table.query_scope("report", 1, "D:\\", "D:\\Projects").is_none());
     }
 }
 

@@ -31,7 +31,8 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
             let v = volume::Volume::open(letter)?;
             let j = v.journal()?;
             let t0 = Instant::now();
-            let volume::Mft { names, sequences, pruned } = v.load(j.NextUsn)?;
+            let volume::Mft { mut names, sequences, pruned } = v.load(j.NextUsn)?;
+            names.initial_links_complete = pruned.is_empty();
             let id = names.id();
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             let (n, bytes) = (names.len(), names.bytes());
@@ -83,6 +84,7 @@ fn links_later(letter: char, handle: volume::Volume, frns: Vec<u64>, vol: Arc<Vo
             return;
         }
         table.shrink();
+        table.initial_links_complete = true;
         let (bytes, names) = (table.bytes(), table.len());
         drop(table);
         log::line(&format!(
@@ -93,16 +95,27 @@ fn links_later(letter: char, handle: volume::Volume, frns: Vec<u64>, vol: Arc<Vo
     });
 }
 
-fn answer(vols: &[Arc<Vol>], q: &str, max: u16) -> Reply {
+fn answer(vols: &[Arc<Vol>], q: &str, max: u16, scope: Option<&str>) -> (Reply, bool) {
     let t = Instant::now();
     let fq = fold::fold(q.trim());
     let mut all: Vec<(SortKey, Hit)> = Vec::new();
     let mut names = 0;
+    let mut covered = false;
     for v in vols {
+        if scope.is_some_and(|path| !path.get(..3).is_some_and(|drive| drive.eq_ignore_ascii_case(&v.root))) {
+            continue;
+        }
         let tb = v.table.read().unwrap_or_else(|p| p.into_inner());
         names += tb.len();
-        // A few extra: some hits have no path (a folder of theirs is metadata).
-        for f in tb.query(&fq, max as usize + 8) {
+        let found = if let Some(path) = scope {
+            let Some(found) = tb.query_scope(&fq, max as usize, &v.root, path) else { break };
+            covered = true;
+            found
+        } else {
+            // A few extra: some hits have no path (a folder of theirs is metadata).
+            tb.query(&fq, max as usize + 8)
+        };
+        for f in found {
             if let Some(path) = tb.path(f.rec, &v.root) {
                 all.push((f.key, Hit { path, folder: tb.is_dir(f.rec), noisy: f.noisy(), rank: f.rank(), modified: f.modified() }));
             }
@@ -110,7 +123,7 @@ fn answer(vols: &[Arc<Vol>], q: &str, max: u16) -> Reply {
     }
     all.sort_by_key(|(k, _)| *k);
     all.truncate(max as usize);
-    Reply { hits: all.into_iter().map(|(_, h)| h).collect(), micros: t.elapsed().as_micros() as u32, names: names as u32 }
+    (Reply { hits: all.into_iter().map(|(_, h)| h).collect(), micros: t.elapsed().as_micros() as u32, names: names as u32 }, covered)
 }
 
 /// The volumes being served; a fixed volume that arrives later joins through `rescan`.
@@ -173,8 +186,8 @@ pub fn run(ready: Option<&dyn Fn()>) {
     if let Some(f) = ready {
         f();
     }
-    pipe::serve(Arc::new(move |q: &str, max: u16| {
+    pipe::serve(Arc::new(move |q: &str, max: u16, scope: Option<&str>| {
         let vols: Vec<Arc<Vol>> = VOLS.read().map(|v| v.iter().map(|(_, v)| v.clone()).collect()).unwrap_or_default();
-        answer(&vols, q, max)
+        answer(&vols, q, max, scope)
     }));
 }

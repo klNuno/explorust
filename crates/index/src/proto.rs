@@ -15,7 +15,10 @@ pub enum Version {
 
 const V2_REQUEST: u16 = 1 << 15;
 const V2_REPLY: u32 = 1 << 31;
+const SCOPED_REQUEST: u16 = 1 << 14;
+const COVERED_REPLY: u32 = 1 << 30;
 const MAX_HITS: u16 = 200;
+const MAX_QUERY_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
@@ -36,9 +39,25 @@ pub struct Reply {
 }
 
 pub fn write_request(w: &mut impl Write, q: &str, max: u16, version: Version) -> io::Result<()> {
-    let q = &q.as_bytes()[..q.len().min(1024)];
-    let mut b = Vec::with_capacity(4 + q.len());
+    let q = &q.as_bytes()[..q.floor_char_boundary(MAX_QUERY_BYTES.min(q.len()))];
     let max = max.min(MAX_HITS) | if version == Version::V2 { V2_REQUEST } else { 0 };
+    write_frame(w, q, max)
+}
+
+pub fn write_scoped_request(w: &mut impl Write, q: &str, max: u16, scope: &str) -> io::Result<()> {
+    // Keeping one old-format frame lets a V1/V2 service consume this request and reply normally.
+    // Only new services interpret the scope marker and may mark a response as covered.
+    if scope.is_empty() || scope.len() + q.len() + 1 > MAX_QUERY_BYTES || scope.contains('\0') || q.contains('\0') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid search scope or query"));
+    }
+    let mut payload = scope.as_bytes().to_vec();
+    payload.push(0);
+    payload.extend_from_slice(q.as_bytes());
+    write_frame(w, &payload, max.min(MAX_HITS) | V2_REQUEST | SCOPED_REQUEST)
+}
+
+fn write_frame(w: &mut impl Write, q: &[u8], max: u16) -> io::Result<()> {
+    let mut b = Vec::with_capacity(4 + q.len());
     b.extend_from_slice(&max.to_le_bytes());
     b.extend_from_slice(&(q.len() as u16).to_le_bytes());
     b.extend_from_slice(q);
@@ -46,23 +65,45 @@ pub fn write_request(w: &mut impl Write, q: &str, max: u16, version: Version) ->
     w.flush()
 }
 
-pub fn read_request(r: &mut impl Read) -> io::Result<(String, u16, Version)> {
+pub struct Request {
+    pub query: String,
+    pub max: u16,
+    pub version: Version,
+    pub scope: Option<String>,
+}
+
+pub fn read_request(r: &mut impl Read) -> io::Result<Request> {
     let mut h = [0u8; 4];
     r.read_exact(&mut h)?;
     let max = u16::from_le_bytes([h[0], h[1]]);
     let n = u16::from_le_bytes([h[2], h[3]]) as usize;
-    if n > 1024 {
+    if n > MAX_QUERY_BYTES {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "query too long"));
     }
     let mut q = vec![0u8; n];
     r.read_exact(&mut q)?;
     let version = if max & V2_REQUEST != 0 { Version::V2 } else { Version::V1 };
-    Ok((String::from_utf8_lossy(&q).into_owned(), (max & !V2_REQUEST).min(MAX_HITS), version))
+    let mut query = String::from_utf8_lossy(&q).into_owned();
+    let scope = if version == Version::V2 && max & SCOPED_REQUEST != 0 {
+        let (scope, scoped_query) = query.split_once('\0').filter(|(s, _)| !s.is_empty())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing search scope"))?;
+        let scope = scope.to_owned();
+        query = scoped_query.to_owned();
+        Some(scope)
+    } else {
+        None
+    };
+    Ok(Request { query, max: (max & !(V2_REQUEST | SCOPED_REQUEST)).min(MAX_HITS), version, scope })
 }
 
 pub fn write_reply(w: &mut impl Write, r: &Reply, version: Version) -> io::Result<()> {
+    write_reply_with_coverage(w, r, version, false)
+}
+
+pub fn write_reply_with_coverage(w: &mut impl Write, r: &Reply, version: Version, covered: bool) -> io::Result<()> {
     let mut b = Vec::with_capacity(12 + r.hits.len() * 64);
-    let count = r.hits.len() as u32 | if version == Version::V2 { V2_REPLY } else { 0 };
+    let count = r.hits.len() as u32 | if version == Version::V2 { V2_REPLY } else { 0 }
+        | if covered && version == Version::V2 { COVERED_REPLY } else { 0 };
     b.extend_from_slice(&count.to_le_bytes());
     b.extend_from_slice(&r.micros.to_le_bytes());
     b.extend_from_slice(&r.names.to_le_bytes());
@@ -81,10 +122,14 @@ pub fn write_reply(w: &mut impl Write, r: &Reply, version: Version) -> io::Resul
 }
 
 pub fn read_reply(r: &mut impl Read) -> io::Result<Reply> {
+    read_reply_with_coverage(r).map(|(reply, _)| reply)
+}
+
+pub fn read_reply_with_coverage(r: &mut impl Read) -> io::Result<(Reply, bool)> {
     let mut h = [0u8; 12];
     r.read_exact(&mut h)?;
     let count = u32::from_le_bytes(h[0..4].try_into().unwrap_or_default());
-    let n = (count & !V2_REPLY) as usize;
+    let n = (count & !(V2_REPLY | COVERED_REPLY)) as usize;
     if n > usize::from(MAX_HITS) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "too many hits"));
     }
@@ -103,7 +148,7 @@ pub fn read_reply(r: &mut impl Read) -> io::Result<Reply> {
         }
         hits.push(Hit { path: String::from_utf8_lossy(&p).into_owned(), folder: e[0] & 1 != 0, noisy: e[0] & 2 != 0, rank: e[1], modified: u64::from_le_bytes(modified) });
     }
-    Ok(Reply { hits, micros, names })
+    Ok((Reply { hits, micros, names }, count & (V2_REPLY | COVERED_REPLY) == V2_REPLY | COVERED_REPLY))
 }
 
 #[cfg(test)]
@@ -114,7 +159,8 @@ mod tests {
     fn round_trip() {
         let mut b = Vec::new();
         write_request(&mut b, "rapport é", 24, Version::V2).unwrap();
-        assert_eq!(read_request(&mut b.as_slice()).unwrap(), ("rapport é".to_string(), 24, Version::V2));
+        let request = read_request(&mut b.as_slice()).unwrap();
+        assert_eq!((request.query.as_str(), request.max, request.version, request.scope), ("rapport é", 24, Version::V2, None));
         let r = Reply {
             hits: vec![
                 Hit { path: r"C:\Users\a\Rapport.docx".into(), folder: false, noisy: false, rank: 0, modified: 133_800_000_000_000_000 },
@@ -131,7 +177,7 @@ mod tests {
     #[test]
     fn legacy_request_and_reply_layouts() {
         let one_hit = b"\x01\0\0\0\x02\0\0\0\x03\0\0\0\0\0\x01\0a";
-        let (_, _, version) = read_request(&mut b"\x18\0\x01\0a".as_slice()).unwrap();
+        let version = read_request(&mut b"\x18\0\x01\0a".as_slice()).unwrap().version;
         let mut reply = read_reply(&mut one_hit.as_slice()).unwrap();
         assert_eq!(reply.hits[0].modified, 0);
         reply.hits[0].modified = 42;
@@ -142,5 +188,23 @@ mod tests {
         write_request(&mut wire, "a", 24, Version::V2).unwrap();
         assert_eq!(u16::from_le_bytes([wire[0], wire[1]]).min(200), 200);
         assert_eq!(&wire[2..], b"\x01\0a");
+    }
+
+    #[test]
+    fn scoped_frames_keep_legacy_length_and_require_explicit_coverage() {
+        let mut bytes = Vec::new();
+        write_scoped_request(&mut bytes, "report", 20, r"D:\Work").unwrap();
+        let legacy_len = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+        assert_eq!(&bytes[4..4 + legacy_len], b"D:\\Work\0report");
+        let request = read_request(&mut bytes.as_slice()).unwrap();
+        assert_eq!(request.scope.as_deref(), Some(r"D:\Work"));
+        assert_eq!(request.query, "report");
+        assert_eq!(request.max, 20);
+        let reply = Reply { names: 500, ..Reply::default() };
+        for (version, covered, expected) in [(Version::V1, false, false), (Version::V2, false, false), (Version::V2, true, true)] {
+            bytes.clear();
+            write_reply_with_coverage(&mut bytes, &reply, version, covered).unwrap();
+            assert_eq!(read_reply_with_coverage(&mut bytes.as_slice()).unwrap(), (reply.clone(), expected));
+        }
     }
 }

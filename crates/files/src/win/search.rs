@@ -13,7 +13,7 @@ use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED
 use windows::Win32::System::Search::{IQueryParser, IQueryParserManager, QueryParserManager};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
-use windows_core::{HSTRING, IUnknown, PCWSTR, Result, w};
+use windows_core::{HSTRING, PCWSTR, Result, w};
 
 pub const MSG_RESULTS: u32 = WM_APP + 0x129;
 const INDEX_LIMIT: u16 = 200;
@@ -96,6 +96,13 @@ fn indexed_volume(path: &str) -> bool {
     if !matches!(path.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic()) {
         return false;
     }
+    // Alias and junction paths do not refer to the namespace indexed under this drive letter.
+    let Ok(final_path) = std::fs::canonicalize(path) else { return false };
+    let final_path = final_path.to_string_lossy();
+    let Some(final_path) = final_path.strip_prefix(r"\\?\") else { return false };
+    if final_path.trim_end_matches('\\').to_lowercase() != path.trim_end_matches('\\').to_lowercase() {
+        return false;
+    }
     let path = HSTRING::from(path);
     let mut root = [0; 260];
     let mut format = [0; 16];
@@ -110,10 +117,8 @@ fn indexed_volume(path: &str) -> bool {
 
 fn query(job: &Request, index: &mut Client) -> Result<Results> {
     if let Some(path) = job.path.as_deref().filter(|path| indexed_volume(path)) {
-        if let Ok(reply) = index.query(&job.query, INDEX_LIMIT) {
-            // The service's list is global. If it reaches its cap the relevant matches may have
-            // been cut off, so let Windows Search run the query in its actual scope.
-            if reply.names > 0 && reply.hits.len() < INDEX_LIMIT.into() {
+        if let Ok(Some(reply)) = index.query_scope(&job.query, INDEX_LIMIT, path) {
+            if reply.hits.len() < INDEX_LIMIT.into() {
                 let hits = reply.hits.iter().filter_map(|hit| {
                     (scope::contains(path, &hit.path) && std::fs::symlink_metadata(&hit.path).is_ok())
                         .then(|| Pidl::parse(&hit.path)).flatten()
@@ -147,10 +152,10 @@ fn windows_folder(job: &Request) -> Result<Pidl> {
 pub fn present(browser: &Browser, results: Results) -> Result<()> {
     unsafe {
         match results {
-            Results::Windows(pidl) => browser.eb.BrowseToIDList(pidl.as_ptr(), SBSP_SAMEBROWSER | SBSP_ACTIVATE_NOFOCUS),
+            Results::Windows(pidl) => browser.browse_results(pidl),
             Results::Indexed(hits) => {
                 if browser.folder_view().is_none() {
-                    browser.eb.FillFromObject(None::<&IUnknown>, EBF_NODROPTARGET)?;
+                    browser.create_index_results()?;
                 }
                 let view = browser.folder_view().ok_or(E_FAIL)?;
                 let results: IResultsFolder = view.GetFolder()?;

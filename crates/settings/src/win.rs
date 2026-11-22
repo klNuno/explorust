@@ -277,6 +277,10 @@ impl Window {
             doc.save()?;
             Ok(doc)
         });
+        self.after_save(result);
+    }
+
+    fn after_save(&mut self, result: std::io::Result<Document>) {
         self.model.error = result.is_err();
         if let Ok(doc) = result {
             self.model.doc = doc;

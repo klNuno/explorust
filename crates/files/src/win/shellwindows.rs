@@ -31,6 +31,10 @@ thread_local! {
     static ASKED: RefCell<Vec<(GUID, GUID)>> = const { RefCell::new(Vec::new()) };
 }
 
+pub fn clear_thread() {
+    LIST.with(|list| list.borrow_mut().take());
+}
+
 /// The window list of the session (Explorer's, or shell32's local server without it).
 fn list() -> Option<IShellWindows> {
     LIST.with(|l| {

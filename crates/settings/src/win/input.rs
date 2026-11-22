@@ -61,11 +61,7 @@ impl Window {
             }
             Action::Reset => {
                 self.model.dropdown = None;
-                self.commit(|doc| {
-                    for p in Part::ALL {
-                        doc.reset(p);
-                    }
-                });
+                self.after_save(Document::restore_defaults());
                 return None;
             }
             Action::Fallback | Action::Uninstall => {

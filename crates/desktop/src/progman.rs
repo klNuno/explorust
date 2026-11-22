@@ -38,6 +38,7 @@ struct State {
     layered: bool,
     /// The WorkerW child, once a wallpaper app raised the desktop (0x052C).
     workerw: Option<HWND>,
+    wallpaper_input: Option<workerw::input::Hook>,
 }
 
 thread_local! {
@@ -129,6 +130,7 @@ unsafe fn create() -> windows_core::Result<HWND> {
                 desk: None,
                 layered,
                 workerw: None,
+                wallpaper_input: None,
             })
         });
         wallpaper::spawn(hwnd, 1);
@@ -289,6 +291,10 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             raise(hwnd, wp, lp);
             Some(LRESULT(0))
         }
+        workerw::input::MSG_RIGHT => {
+            workerw::input::right_click(lp);
+            Some(LRESULT(0))
+        }
         WM_WALLPAPER => {
             // SAFETY: lParam is the Box<Frame> posted by `wallpaper::spawn`; taken once here.
             let frame = unsafe { Box::from_raw(lp.0 as *mut Frame) };
@@ -393,7 +399,15 @@ fn raise(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
         Ok(w) => {
             with(|s| s.workerw = Some(w));
             if let Some(dv) = defview() {
-                workerw::layer_view(dv, true);
+                if workerw::layer_view(dv, true) {
+                    match workerw::input::Hook::new(hwnd, dv, w) {
+                        Ok(hook) => with(|s| s.wallpaper_input = Some(hook)),
+                        Err(error) => {
+                            log::line(&format!("wallpaper input observation unavailable: {error}"));
+                            None
+                        }
+                    };
+                }
             }
             log::line(&format!("0x052C ({:#x}, {:#x}): raised, WorkerW {:?}", wp.0, lp.0, w.0));
             // SAFETY: repaints this window and its children (view background now the key color).

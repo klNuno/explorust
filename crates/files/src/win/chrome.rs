@@ -49,6 +49,7 @@ pub struct View<'a> {
     pub hover: Hit,
     pub pressed: Hit,
     pub selection: bool,
+    pub share: bool,
     pub paste: bool,
     pub create: bool,
     pub ready: bool,
@@ -258,7 +259,7 @@ fn command_bar(c: &Canvas, v: &View) {
     for x in L::CMD_SEPS {
         c.fill(rect(x, cy - 16.0, 1.0, 32.0), CMD_SEP);
     }
-    for (cmd, g, cx) in L::CMD_ICONS {
+    for (cmd, g, cx) in L::command_icons(v.share) {
         let on = match cmd {
             Cmd::Paste => v.paste,
             _ => v.selection,

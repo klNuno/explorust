@@ -17,7 +17,7 @@ use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQue
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_core::{HSTRING, PWSTR};
 
-pub type Handler = Arc<dyn Fn(&str, u16) -> Reply + Send + Sync>;
+pub type Handler = Arc<dyn Fn(&str, u16, Option<&str>) -> (Reply, bool) + Send + Sync>;
 
 fn token_sid(token: HANDLE) -> Option<String> {
     // SAFETY: two-call token query into a local buffer; the string is freed with LocalFree.
@@ -137,8 +137,9 @@ pub fn serve(handler: Handler) {
         let _ = std::thread::Builder::new().name("index-client".into()).spawn(move || {
             // SAFETY: the File takes the instance handle and closes it when the client leaves.
             let mut f = unsafe { File::from_raw_handle(raw as _) };
-            while let Ok((q, max, version)) = proto::read_request(&mut f) {
-                if proto::write_reply(&mut f, &hd(&q, max), version).is_err() {
+            while let Ok(request) = proto::read_request(&mut f) {
+                let (reply, covered) = hd(&request.query, request.max, request.scope.as_deref());
+                if proto::write_reply_with_coverage(&mut f, &reply, request.version, covered).is_err() {
                     break;
                 }
             }

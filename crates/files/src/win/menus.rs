@@ -2,7 +2,6 @@
 //! the process asked for, and the clipboard text the edit boxes paste.
 
 use crate::text::Strings;
-use crate::win::shell;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, POINT};
 use windows::Win32::Storage::EnhancedStorage::{PKEY_DateModified, PKEY_ItemNameDisplay, PKEY_ItemTypeText, PKEY_Size};
 use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW};
@@ -78,7 +77,7 @@ pub fn view(hwnd: HWND, v: &IFolderView2, s: &Strings, at: POINT) -> windows_cor
 }
 
 /// See more: select all, select none, properties.
-pub fn more(hwnd: HWND, v: &IFolderView2, sv: &IShellView, s: &Strings, at: POINT) -> windows_core::Result<()> {
+pub fn more(hwnd: HWND, v: &IFolderView2, s: &Strings, at: POINT) -> windows_core::Result<bool> {
     let items = [(1, s.select_all, false), (2, s.select_none, false), (0, "", false), (3, s.properties, false)];
     match popup(hwnd, &items, at) {
         pick @ (1 | 2) => unsafe {
@@ -88,15 +87,10 @@ pub fn more(hwnd: HWND, v: &IFolderView2, sv: &IShellView, s: &Strings, at: POIN
                 v.SelectItem(i, flag.0 as u32)?;
             }
         },
-        3 => {
-            let m = shell::selection_menu(sv).or_else(|| shell::background_menu(sv));
-            if let Some(m) = m {
-                return shell::invoke(&m, sv, hwnd, "properties");
-            }
-        }
+        3 => return Ok(true),
         _ => {}
     }
-    Ok(())
+    Ok(false)
 }
 
 pub fn file_clipboard() -> bool {

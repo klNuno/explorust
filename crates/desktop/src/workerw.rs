@@ -16,8 +16,9 @@
 //!
 //! Here the DefView is opaque (alpha 255, the list view paints the wallpaper as its background)
 //! until the desktop is raised; then it is color-keyed (the list view background is `KEY`) and the
-//! WorkerW paints the wallpaper. Key-colored pixels let the mouse through, so the WorkerW passes
-//! the clicks it gets back to the list view.
+//! WorkerW paints the wallpaper. Key-colored pixels let the mouse through, so WorkerW forwards
+//! its mouse messages to the list view. A wallpaper child retains its own input and the desktop
+//! also gets a right-click on blank background over that child.
 
 use crate::{log, progman, screen};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -46,6 +47,9 @@ pub const KEY: COLORREF = COLORREF(0x0001_0101);
 const CLASS: PCWSTR = w!("WorkerW");
 
 static PAINTS: AtomicU32 = AtomicU32::new(0);
+
+#[path = "wallpaper_input.rs"]
+pub mod input;
 
 /// Layered child windows need the Windows 8+ manifest; without it the process sees 6.2 and the
 /// classic layout (an opaque Progman with GDI content) is kept.
@@ -185,15 +189,18 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN | WM_XBUTTONUP
         | WM_XBUTTONDBLCLK => {
             // A click on a transparent pixel of the view: give it back to the list view.
-            let lv = list_view()?;
-            let mut pt = [POINT { x: (lp.0 & 0xFFFF) as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as i16 as i32 }];
-            // SAFETY: maps one point between two windows of this thread, then sends the message.
-            unsafe {
-                MapWindowPoints(Some(hwnd), Some(lv), &mut pt);
-                let l = ((pt[0].y as u16 as isize) << 16) | pt[0].x as u16 as isize;
-                Some(SendMessageW(lv, msg, Some(wp), Some(LPARAM(l))))
-            }
+            forward_mouse(hwnd, msg, wp, input::unpack(lp))
         }
         _ => None,
+    }
+}
+
+fn forward_mouse(from: HWND, msg: u32, wp: WPARAM, pt: POINT) -> Option<LRESULT> {
+    let lv = list_view()?;
+    let mut pt = [pt];
+    // SAFETY: maps one point to the list view and sends a mouse message to this thread's window.
+    unsafe {
+        MapWindowPoints(Some(from), Some(lv), &mut pt);
+        Some(SendMessageW(lv, msg, Some(wp), Some(input::pack(pt[0]))))
     }
 }

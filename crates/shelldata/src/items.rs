@@ -83,17 +83,8 @@ fn resolve_pin(mut pidl: Vec<u8>) -> Option<PinItem> {
             item = unsafe { SHCreateItemFromIDList(pidl.as_ptr().cast()) }.ok()?;
         }
     }
-    if let Some(target) = take(unsafe { item.GetString(&PKEY_Link_TargetParsingPath) }) {
-        let target = Path::new(&target);
-        // A virtual or advertised target can be valid without a regular file. Access-denied
-        // paths (including WindowsApps) likewise do not establish that a target is missing.
-        if target.is_absolute() && matches!(target.metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
-            let id = take(unsafe { item.GetString(&PKEY_AppUserModel_ID) });
-            if id.as_deref().and_then(apps_folder_item).is_none() {
-                return None;
-            }
-        }
-    }
+    // The shortcut is the pin. A target may be advertised, on a disconnected mapped drive,
+    // or reachable only after the user signs in to a network provider.
     let key = item_key(&item)?;
     let name = take(unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) })?;
     let item = windows_core::Interface::cast(&item).ok()?;

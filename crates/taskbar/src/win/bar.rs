@@ -22,6 +22,7 @@ use render::style::{self, Material, Native, Part, WindowStyle};
 use shelldata::items::{self, PinItem};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
@@ -48,6 +49,7 @@ const WM_APP_EVENT: u32 = WM_APP + 2;
 const WM_APP_STATUS: u32 = WM_APP + 3;
 /// The flyout lost the activation: close it outside its own message.
 const WM_APP_CLOSE_FLYOUT: u32 = WM_APP + 4;
+const WM_APP_PINS: u32 = WM_APP + 5;
 const WM_COPYGLOBALDATA: u32 = 0x0049;
 const TIMER_ANIM: usize = 1;
 const TIMER_CLOCK: usize = 2;
@@ -97,7 +99,8 @@ struct Bar {
     theme: Theme,
     scene: Option<Scene>,
     model: Model,
-    pins: Vec<PinItem>,
+    pins: Vec<Pin>,
+    loaded_pins: Arc<Mutex<Option<Vec<Pin>>>>,
     /// Exe path and original-case app id of each task window.
     exes: HashMap<isize, String>,
     ids: HashMap<String, String>,
@@ -127,6 +130,49 @@ struct Bar {
     slide_at: Instant,
     /// Start of the indeterminate progress animation.
     progress_t0: Instant,
+}
+
+struct Pin {
+    key: String,
+    name: String,
+    pidl: Vec<u8>,
+    icon: Option<shelldata::Image>,
+}
+
+impl Pin {
+    fn from_item(item: PinItem, px: i32) -> Self {
+        let icon = shelldata::icons::icon_for_item(&item.item, px).or_else(|| {
+            if item.key.contains('\\') {
+                shelldata::icons::icon_for_path(&item.key, px)
+            } else {
+                items::apps_folder_item(&item.key).and_then(|app| shelldata::icons::icon_for_item(&app, px))
+            }
+        });
+        Self {
+            icon,
+            key: item.key,
+            name: item.name,
+            pidl: item.pidl,
+        }
+    }
+}
+
+fn load_pins(hwnd: HWND, px: i32, result: Arc<Mutex<Option<Vec<Pin>>>>) {
+    let hwnd = hwnd.0 as isize;
+    if let Err(error) = std::thread::Builder::new().name("taskbar-pins".into()).spawn(move || {
+        if let Err(error) = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() } {
+            log::line(&format!("pins COM initialization failed: {error}"));
+            return;
+        }
+        let start = Instant::now();
+        let pins: Vec<_> = items::resolved_taskbar_pins().into_iter().map(|p| Pin::from_item(p, px)).collect();
+        unsafe { CoUninitialize() };
+        log::line(&format!("resolved {} pins on the worker in {} ms", pins.len(), start.elapsed().as_millis()));
+        *result.lock().unwrap() = Some(pins);
+        let _ = unsafe { PostMessageW(Some(HWND(hwnd as _)), WM_APP_PINS, WPARAM(0), LPARAM(0)) };
+    }) {
+        log::line(&format!("pins worker could not start: {error}"));
+    }
 }
 
 pub fn run() {
@@ -292,9 +338,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             }
         }
         let t0 = Instant::now();
-        let pins = items::resolved_taskbar_pins();
         let mut model = Model::default();
-        model.pins = pins.iter().map(|p| p.key.clone()).collect();
         let mut exes = HashMap::new();
         let mut ids = HashMap::new();
         let mut all = tasks::top_level();
@@ -310,17 +354,14 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         model.set_active((!fg.is_invalid()).then_some(fg.0 as isize));
         let dpi = GetDpiForWindow(hwnd);
         log::line(&format!(
-            "started: monitor {}x{} dpi {dpi} bar {h_px} px, shell hook {hooked}, taskman {taskman}, {} win hooks, {} pins, {} windows in {} ms",
+            "started: monitor {}x{} dpi {dpi} bar {h_px} px, shell hook {hooked}, taskman {taskman}, {} win hooks, {} windows in {} ms",
             width,
             monitor.bottom - monitor.top,
             hooks.len(),
-            pins.len(),
             model.wins.len(),
             t0.elapsed().as_millis()
         ));
-        for p in &pins {
-            log::line(&format!("pin {} = {}", p.name, p.key));
-        }
+        let loaded_pins = Arc::new(Mutex::new(None));
         let bar = Bar {
             hwnd,
             cmd,
@@ -330,7 +371,8 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             theme,
             scene: Some(scene),
             model,
-            pins,
+            pins: Vec::new(),
+            loaded_pins: loaded_pins.clone(),
             exes,
             ids,
             groups: Vec::new(),
@@ -365,6 +407,8 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
                 b.taskband.button_created(h);
             }
         });
+        log::line("initial taskbar paint returned; starting pin resolution");
+        load_pins(hwnd, (G::ICON * dpi as f32 / 96.0).round() as i32, loaded_pins);
         SetTimer(Some(hwnd), TIMER_CLOCK, shelldata::clock::ms_to_next_minute() as u32, None);
         // Running apps add their icons again.
         trayhost::broadcast_created();
@@ -946,8 +990,11 @@ impl Bar {
 
     /// The icon of a group: its pin, its AppsFolder entry, then its exe.
     fn group_image(&self, g: &Group, px: i32) -> Option<shelldata::Image> {
-        let mut img = g.pin.and_then(|p| shelldata::icons::icon_for_item(&self.pins[p].item, px));
-        if img.is_none() && !g.key.contains('\\') {
+        if let Some(p) = g.pin {
+            return self.pins[p].icon.clone();
+        }
+        let mut img = None;
+        if !g.key.contains('\\') {
             let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
             img = items::apps_folder_item(&id).and_then(|i| shelldata::icons::icon_for_item(&i, px));
         }
@@ -1129,7 +1176,7 @@ impl Bar {
                     let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
                     let exe = g.wins.first().and_then(|h| self.exes.get(h)).cloned().unwrap_or_default();
                     if let Some(item) = jumplist::pin_item(&g.key, &id, &exe) {
-                        self.pins.push(item);
+                        self.pins.push(Pin::from_item(item, (G::ICON * self.scale()).round() as i32));
                         self.model.pins.push(g.key.clone());
                         log::line(&format!("pinned {} (this session; Taskband not written)", g.key));
                     }
@@ -1342,6 +1389,27 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             b.dirty_posted = false;
             b.rebuild();
             b.paint();
+            LRESULT(0)
+        }),
+        WM_APP_PINS => with_bar(|b| {
+            let loaded = b.loaded_pins.lock().unwrap().take();
+            if let Some(mut pins) = loaded {
+                for pin in &pins {
+                    log::line(&format!("pin {} = {}", pin.name, pin.key));
+                    if let Some(scene) = b.scene.as_mut() && let Some(icon) = &pin.icon {
+                        scene.set_icon(&pin.key, Some(icon.clone()));
+                    }
+                }
+                for pin in b.pins.drain(..) {
+                    if !pins.iter().any(|p| p.key == pin.key) {
+                        pins.push(pin);
+                    }
+                }
+                b.model.pins = pins.iter().map(|p| p.key.clone()).collect();
+                b.pins = pins;
+                b.rebuild();
+                b.paint();
+            }
             LRESULT(0)
         }),
         WM_APP_EVENT => with_bar(|b| {

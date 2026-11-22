@@ -42,17 +42,29 @@ impl Client {
 
     /// The best `max` hits for `q` (case does not matter).
     pub fn query(&mut self, q: &str, max: u16) -> io::Result<Reply> {
+        self.request(max, |pipe| proto::write_request(pipe, q, max, Version::V2)).map(|(reply, _)| reply)
+    }
+
+    /// Returns a complete scoped answer or `None` while the volume is unavailable, pruned,
+    /// or served by an older version of the service.
+    pub fn query_scope(&mut self, q: &str, max: u16, folder: &str) -> io::Result<Option<Reply>> {
+        self.request(max, |pipe| proto::write_scoped_request(pipe, q, max, folder))
+            .map(|(reply, covered)| covered.then_some(reply))
+    }
+
+    fn request(&mut self, max: u16, write: impl Fn(&mut File) -> io::Result<()>) -> io::Result<(Reply, bool)> {
         let mut last = None;
         for _ in 0..2 {
             if self.pipe.is_none() {
                 self.pipe = Some(connect()?);
             }
             let Some(p) = self.pipe.as_mut() else { break };
-            match proto::write_request(p, q, max, Version::V2).and_then(|()| proto::read_reply(p)) {
-                Ok(mut r) => {
+            match write(p).and_then(|()| proto::read_reply_with_coverage(p)) {
+                Ok((mut r, covered)) => {
                     r.hits.truncate(usize::from(max));
-                    return Ok(r);
+                    return Ok((r, covered));
                 }
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Err(e),
                 Err(e) => {
                     self.pipe = None;
                     last = Some(e);
