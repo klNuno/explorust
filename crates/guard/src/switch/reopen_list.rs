@@ -2,12 +2,13 @@ use std::collections::HashSet;
 
 /// ShellWindows can enumerate several tabs for one HWND. Keep each window's active folder,
 /// including two different windows that happen to be on the same folder.
-pub fn folders(entries: impl IntoIterator<Item = (isize, String)>) -> Vec<String> {
+pub fn folders(entries: impl IntoIterator<Item = (isize, String)>) -> Vec<(isize, String)> {
     let mut seen = HashSet::new();
     entries
         .into_iter()
         .filter_map(|(hwnd, folder)| {
-            (!folder.is_empty() && !folder.contains('\0') && seen.insert(hwnd)).then_some(folder)
+            (!folder.is_empty() && !folder.contains('\0') && seen.insert(hwnd))
+                .then_some((hwnd, folder))
         })
         .collect()
 }
@@ -30,7 +31,7 @@ mod tests {
         ];
         assert_eq!(
             folders(entries.map(|(h, folder)| (h, folder.to_owned()))),
-            [local, local, virtual_folder]
+            [(1, local.to_owned()), (2, local.to_owned()), (3, virtual_folder.to_owned())]
         );
     }
 }

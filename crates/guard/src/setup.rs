@@ -36,7 +36,7 @@ pub fn run() -> u32 {
         return OTHER_ACCOUNT;
     }
     let exe = install::dir().join("explorust.exe");
-    let mode = install_mode(&exe);
+    let (mode, needs_sign_in) = install_mode(&exe);
     let go = match mode {
         Mode::UpdateLive { preserves_files: true, .. } => tr(
             "Mettre à jour\nRedémarre explorust en quelques secondes, sans fermer la session.",
@@ -45,6 +45,14 @@ pub fn run() -> u32 {
         Mode::UpdateLive { preserves_files: false, .. } => tr(
             "Mettre à jour\nRedémarre explorust sans fermer la session. Les fenêtres de Fichiers se ferment et les copies, déplacements et suppressions en cours s'arrêtent.",
             "Update\nRestarts explorust without signing out. File Explorer windows close and ongoing copies, moves and deletions stop.",
+        ),
+        Mode::UpdateOnSignIn if needs_sign_in => tr(
+            "Mettre à jour\nL’Explorateur Windows ne peut pas lancer la bascule sans élévation. Prend effet à la prochaine ouverture de session.",
+            "Update\nExplorer cannot launch the switch without elevation. Takes effect at the next sign-in.",
+        ),
+        Mode::Install if needs_sign_in => tr(
+            "Installer\nL’Explorateur Windows ne peut pas lancer la bascule sans élévation. Prend effet à la prochaine ouverture de session.",
+            "Install\nExplorer cannot launch the switch without elevation. Takes effect at the next sign-in.",
         ),
         Mode::UpdateOnSignIn => tr("Mettre à jour\nPrend effet à la prochaine ouverture de session.", "Update\nTakes effect at the next sign-in."),
         Mode::Install => tr("Installer\nPrend effet à la prochaine ouverture de session.", "Install\nTakes effect at the next sign-in."),
@@ -97,7 +105,10 @@ pub fn run() -> u32 {
         return finish_live_update(&exe, pid);
     }
     if let Mode::SwitchLive { .. } = mode {
-        return crate::switch::run();
+        match crate::switch::launch_from_setup() {
+            Ok(()) => return 0,
+            Err(e) => log::line(&format!("setup: live switch unavailable after installation: {e}")),
+        }
     }
     let pick = ui::choose(
         Icon::Info,
@@ -126,23 +137,31 @@ pub fn run() -> u32 {
     0
 }
 
-fn install_mode(exe: &Path) -> Mode {
+fn install_mode(exe: &Path) -> (Mode, bool) {
     let installed = exe.is_file();
     let shell = installed.then(|| taskbar::explorust(exe)).flatten();
     // The session-scoped fallback event is held by the supervising guard, including an adopted one.
     let reload = shell.is_some() && Event::open_for_signal(RELOAD_EVENT).is_ok();
     let guarded = reload && Event::open_for_signal(FALLBACK_EVENT).is_ok();
     let preserves_files = shell.is_some_and(|pid| Event::open_for_signal(&reload_preserves_files_event(pid)).is_ok());
-    let explorer = shell.is_none() && taskbar::explorer_window().is_some();
+    let explorer_present = shell.is_none() && taskbar::explorer_window().is_some();
+    let explorer = explorer_present
+        && match crate::switch::can_launch_switch() {
+            Ok(()) => true,
+            Err(e) => {
+                log::line(&format!("setup: cannot switch now: {e}"));
+                false
+            }
+        };
     let mode = setup_mode::choose(installed, shell, reload, guarded, preserves_files, explorer);
     if matches!(mode, Mode::Install | Mode::UpdateOnSignIn) {
-        log::line(if shell.is_some() {
-            "setup: cannot restart now: the current explorust has no live reload guard"
-        } else {
-            "setup: cannot switch now: no Explorer taskbar in this session"
-        });
+        if shell.is_some() {
+            log::line("setup: cannot restart now: the current explorust has no live reload guard");
+        } else if !explorer_present {
+            log::line("setup: cannot switch now: no Explorer taskbar in this session");
+        }
     }
-    mode
+    (mode, explorer_present && !explorer)
 }
 
 fn finish_live_update(exe: &Path, pid: u32) -> u32 {

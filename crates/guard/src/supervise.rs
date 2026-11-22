@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 pub use launch_timing::FALLBACK_EVENT;
 pub const RELEASE_EXPLORER: &str = r"Local\explorust-guard-release-explorer";
+pub const WATCHES_EXPLORER_HANDOFF: &str = r"Local\explorust-guard-watches-explorer-handoff";
 
 enum End {
     /// Something went wrong: explorer takes over and the user is told.
@@ -41,7 +42,7 @@ pub fn run(adopt: Option<(u32, Option<String>)>, live: bool) -> u32 {
             return explorer_forever(None);
         }
     };
-    hotkey::spawn(fallback.0);
+    let _hotkey = hotkey::spawn(fallback.0);
     let exe = shell_exe();
     let build = reg::windows_build();
     let mut attempt = 0u32;
@@ -389,6 +390,7 @@ pub fn explorer_path() -> PathBuf {
 /// trying, waiting longer between tries (up to a minute). `notice` shows once a taskbar answers.
 fn explorer_forever(notice: Option<Notice>) -> u32 {
     let release = Event::named(RELEASE_EXPLORER).ok();
+    let _handoff = Event::named(WATCHES_EXPLORER_HANDOFF).ok();
     folders::handler(false);
     let mut notice = notice;
     let path = explorer_path();
@@ -448,6 +450,9 @@ fn explorer_forever(notice: Option<Notice>) -> u32 {
                     }
                 } else {
                     wait_any(&[shell.handle], None);
+                }
+                if Event::is_signalled(crate::switch::watcher::EXITING_EXPLORER) {
+                    return released_explorer();
                 }
                 log::line(&format!("explorer pid {pid} ended after {} s, code {:#x}", up.elapsed().as_secs(), shell.exit_code()));
             }

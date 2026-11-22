@@ -2,11 +2,12 @@
 
 mod explorer;
 mod reopen_list;
+pub(crate) mod watcher;
 
 use crate::launch_timing::{self, FALLBACK_EVENT, build_verdict_event};
 use crate::proc::{Child, Event};
 use crate::ui::{self, Icon, tr};
-use crate::{GUARD_MUTEX, account, install, log, manage, policy, reg, reopen, supervise, taskbar};
+use crate::{GUARD_MUTEX, account, install, log, policy, reg, reopen, supervise, taskbar};
 use std::path::Path;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -15,7 +16,35 @@ use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND};
 use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 use windows::core::HSTRING;
 
+const VERDICT_LIMIT: Duration = Duration::from_secs(
+    launch_timing::NATIVE_BUDGET.as_secs()
+        + launch_timing::IMMERSIVE_BUDGET.as_secs()
+        + launch_timing::VERDICT_BUDGET.as_secs()
+        + 30,
+);
+
+pub use explorer::can_launch_switch;
+
+pub fn launch_from_setup() -> Result<(), String> {
+    explorer::launch_switch(&install::dir().join("explorust-guard.exe"))?;
+    log::line("switch: Explorer launched the unelevated session switch");
+    Ok(())
+}
+
 pub fn run() -> u32 {
+    if install::elevated() {
+        return match launch_from_setup() {
+            Ok(()) => 0,
+            Err(e) => show(Err(e)),
+        };
+    }
+    run_worker()
+}
+
+pub fn run_worker() -> u32 {
+    if install::elevated() {
+        return show(Err("Explorer launched an elevated switch worker".into()));
+    }
     let dir = install::dir();
     if taskbar::explorust(&dir.join("explorust.exe")).is_some() {
         return show(Ok(Outcome::AlreadyRunning));
@@ -24,15 +53,6 @@ pub fn run() -> u32 {
         return show(Err("the switch must run as the signed-in user".into()));
     }
     let guard = dir.join("explorust-guard.exe");
-    if install::elevated() {
-        return match explorer::launch_switch(&guard) {
-            Ok(()) => {
-                log::line("switch: Explorer launched the unelevated session switch");
-                0
-            }
-            Err(e) => show(Err(e)),
-        };
-    }
     let exe = dir.join("explorust.exe");
     let mut supervisor = None;
     let result = ui::working_cancellable(
@@ -136,60 +156,62 @@ fn switch(
     let guard_pid = std::process::id();
     let stamp = reopen::guard_stamp(guard_pid)
         .ok_or("could not identify this guard for the Files handoff")?;
-    loop {
-        let Some(folders) = wait_for_folders(tray, pid, cancel)? else {
-            log::line("switch: cancelled before closing Explorer; installed for next sign-in");
-            return Ok(Outcome::Postponed);
+    let (mut watcher, previous) = loop {
+        wait_for_file_operations(tray, pid, cancel)?;
+        if cancel.requested() {
+            return Ok(postponed());
+        }
+        let Some(watcher) = watcher::Watcher::prepare(guard, stamp, tray, pid, cancel)? else {
+            return Ok(postponed());
         };
-        reopen::save(&log::dir(), stamp, &folders)
-            .map_err(|e| format!("save the Files handoff: {e}"))?;
-        if let Err(e) = release_old_guard(pid, guard) {
-            let _ = reopen::take(&log::dir(), stamp);
-            return Err(e);
-        }
-        // File operations can start while the handoff is being prepared. Check again before
-        // disabling Cancel and closing Explorer. Retry the folder snapshot after the operation.
+        // Just collect the legacy guard's handle. The previous guard still watches Explorer
+        // throughout the cancellable preparation, including if a new file operation starts.
+        let previous = previous_guard(pid, guard)?;
         if !explorer::file_operations() && cancel.commit() {
-            log::line(&format!(
-                "switch: saved {} Explorer folder windows for guard pid {}",
-                folders.len(),
-                guard_pid
-            ));
-            break;
+            break (watcher, previous);
         }
-        let _ = reopen::take(&log::dir(), stamp);
-    }
-    let started = explorer::exit(tray, pid).and_then(|()| {
+    };
+    let started = watcher.vacate_desktop().and_then(|desktop| {
+        match desktop {
+            watcher::Desktop::Postponed => return Ok(postponed()),
+            watcher::Desktop::Restored => return Ok(Outcome::Windows),
+            watcher::Desktop::Vacated => {}
+        }
+        release_previous_guard(previous)?;
         thread::Builder::new()
             .name("supervise".into())
             .spawn(|| crate::run_shell(None, true))
             .map_err(|e| format!("start supervision: {e}"))
+            .and_then(|thread| {
+                log::line(&format!("switch: guard pid {guard_pid} took over the session"));
+                wait_for_verdict(exe, supervisor.insert(thread))?;
+                watcher.accept()?;
+                Ok(Outcome::Running)
+            })
     });
-    let thread = match started {
-        Ok(thread) => supervisor.insert(thread),
+    match started {
+        Ok(outcome) => Ok(outcome),
         Err(e) => {
-            let _ = reopen::take(&log::dir(), stamp);
-            return recover_windows(&e);
+            log::line(&format!("switch: {e}"));
+            watcher.restore()?;
+            Ok(Outcome::Windows)
         }
-    };
-    log::line(&format!(
-        "switch: guard pid {guard_pid} took over the session"
-    ));
-    wait_for_verdict(exe, thread)
+    }
 }
 
-fn wait_for_folders(
-    tray: HWND,
-    pid: u32,
-    cancel: &ui::Cancel,
-) -> Result<Option<Vec<String>>, String> {
+fn postponed() -> Outcome {
+    log::line("switch: postponed before closing Explorer; installed for next sign-in");
+    Outcome::Postponed
+}
+
+fn wait_for_file_operations(tray: HWND, pid: u32, cancel: &ui::Cancel) -> Result<(), String> {
     let mut waiting = false;
     while !cancel.requested() {
         if taskbar::explorer_window() != Some((tray, pid)) {
             return Err("Explorer's taskbar changed while waiting".into());
         }
         if !explorer::file_operations() {
-            return explorer::open_folders().map(Some);
+            return Ok(());
         }
         if !waiting {
             waiting = true;
@@ -197,7 +219,7 @@ fn wait_for_folders(
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    Ok(None)
+    Ok(())
 }
 
 fn guard_present() -> Result<bool, String> {
@@ -218,43 +240,57 @@ fn guard_present() -> Result<bool, String> {
     }
 }
 
-fn release_old_guard(explorer: u32, guard: &Path) -> Result<(), String> {
+enum PreviousGuard {
+    WatchingHandoff,
+    Release(Event),
+    Legacy(Child),
+}
+
+fn previous_guard(explorer: u32, guard: &Path) -> Result<Option<PreviousGuard>, String> {
     if !guard_present()? {
-        return Ok(());
+        return Ok(None);
+    }
+    if Event::open_for_signal(supervise::WATCHES_EXPLORER_HANDOFF).is_ok() {
+        return Ok(Some(PreviousGuard::WatchingHandoff));
     }
     if let Ok(request) = Event::open_for_signal(supervise::RELEASE_EXPLORER) {
-        request.signal()?;
-    } else {
-        // Old builds have no release event. Only retire the installed guard that started this
-        // Explorer process, after verifying its image and that the PID has not been reused.
-        let parent = explorer::processes()?
-            .into_iter()
-            .find(|process| process.pid == explorer)
-            .ok_or("Explorer exited while checking its previous guard")?
-            .parent;
-        let child = Child::open(parent)?;
-        let image =
-            taskbar::image_path(parent).ok_or("could not identify Explorer's parent process")?;
-        let image = image.to_ascii_lowercase();
-        let expected = guard.to_string_lossy().to_ascii_lowercase();
-        let is_guard = image == expected
-            || image
-                .strip_prefix(&format!("{expected}.old"))
-                .is_some_and(|suffix| {
-                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-                });
-        let predates_explorer = reopen::guard_stamp(parent)
-            .zip(reopen::guard_stamp(explorer))
-            .is_some_and(|(guard, explorer)| guard < explorer);
-        if !is_guard || !predates_explorer || child.ended() {
-            return Err("the previous guard has no handoff event and was not identified as Explorer's parent".into());
+        return Ok(Some(PreviousGuard::Release(request)));
+    }
+    // Old builds have no handoff event. Keep a handle to the verified Explorer parent while it
+    // still exists. This handle identifies the process even if its PID is reused.
+    let parent = explorer::processes("explorer.exe")?
+        .into_iter()
+        .find(|process| process.pid == explorer)
+        .ok_or("Explorer exited while checking its previous guard")?
+        .parent;
+    let child = Child::open(parent)?;
+    let image = taskbar::image_path(parent)
+        .ok_or("could not identify Explorer's parent process")?
+        .to_ascii_lowercase();
+    let expected = guard.to_string_lossy().to_ascii_lowercase();
+    let is_guard = image == expected
+        || image
+            .strip_prefix(&format!("{expected}.old"))
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()));
+    let predates_explorer = reopen::guard_stamp(parent)
+        .zip(reopen::guard_stamp(explorer))
+        .is_some_and(|(guard, explorer)| guard < explorer);
+    if !is_guard || !predates_explorer || child.ended() {
+        return Err("the previous guard has no handoff event and was not identified as Explorer's parent".into());
+    }
+    Ok(Some(PreviousGuard::Legacy(child)))
+}
+
+fn release_previous_guard(previous: Option<PreviousGuard>) -> Result<(), String> {
+    match previous {
+        Some(PreviousGuard::Release(request)) => request.signal()?,
+        Some(PreviousGuard::Legacy(child)) if !child.ended() => {
+            // SAFETY: this is the verified legacy guard that would otherwise relaunch Explorer.
+            unsafe { windows::Win32::System::Threading::TerminateProcess(child.handle, 0) }
+                .map_err(|e| format!("retire legacy guard pid {}: {e}", child.pid))?;
+            log::line(&format!("switch: retired the legacy Explorer supervisor pid {}", child.pid));
         }
-        // SAFETY: the verified old guard will otherwise relaunch Explorer when it exits.
-        unsafe { windows::Win32::System::Threading::TerminateProcess(child.handle, 0) }
-            .map_err(|e| format!("retire legacy guard pid {parent}: {e}"))?;
-        log::line(&format!(
-            "switch: retired the legacy Explorer supervisor pid {parent}"
-        ));
+        _ => {}
     }
     let started = Instant::now();
     while guard_present()? {
@@ -266,19 +302,15 @@ fn release_old_guard(explorer: u32, guard: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn wait_for_verdict(exe: &Path, supervisor: &JoinHandle<u32>) -> Result<Outcome, String> {
+fn wait_for_verdict(exe: &Path, supervisor: &JoinHandle<u32>) -> Result<(), String> {
     let started = Instant::now();
-    let limit = launch_timing::NATIVE_BUDGET
-        + launch_timing::IMMERSIVE_BUDGET
-        + launch_timing::VERDICT_BUDGET
-        + Duration::from_secs(30);
     loop {
         if let Some((_, pid)) = taskbar::explorer_window() {
             let _ = Event::set_existing(FALLBACK_EVENT);
-            return recover_windows(&format!("Explorer pid {pid} took back the taskbar"));
+            return Err(format!("Explorer pid {pid} took back the taskbar"));
         }
         if supervisor.is_finished() {
-            return recover_windows("supervision ended before the build verdict");
+            return Err("supervision ended before the build verdict".into());
         }
         if !Event::is_signalled(FALLBACK_EVENT)
             && let Some(pid) = taskbar::explorust(exe)
@@ -290,16 +322,11 @@ fn wait_for_verdict(exe: &Path, supervisor: &JoinHandle<u32>) -> Result<Outcome,
             log::line(&format!(
                 "switch: explorust pid {pid} passed the build verdict and owns an answering taskbar"
             ));
-            return Ok(Outcome::Running);
+            return Ok(());
         }
-        if started.elapsed() >= limit {
-            return recover_windows("the new shell did not pass the build verdict in time");
+        if started.elapsed() >= VERDICT_LIMIT {
+            return Err("the new shell did not pass the build verdict in time".into());
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-}
-
-fn recover_windows(problem: &str) -> Result<Outcome, String> {
-    log::line(&format!("switch: {problem}"));
-    manage::bring_back_explorer().map(|_| Outcome::Windows)
 }

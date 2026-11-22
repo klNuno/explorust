@@ -45,6 +45,7 @@ mod ui;
 mod uninstall;
 
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
 use windows::core::HSTRING;
@@ -56,7 +57,7 @@ fn say(msg: &str) {
 
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
-    if arg != "--switch" {
+    if !matches!(arg.as_str(), "--switch" | "--switch-worker" | "--watch-switch") {
         // SAFETY: lets a console caller see the output; harmless without one.
         let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
@@ -73,6 +74,8 @@ fn main() {
         "--restore" => manage::restore(),
         "--setup" => setup::run(),
         "--switch" => switch::run(),
+        "--switch-worker" => switch::run_worker(),
+        "--watch-switch" => switch::watcher::run(std::env::args().skip(2)),
         "--uninstall" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             let has = |f: &str| rest.iter().any(|a| a == f);
@@ -121,9 +124,18 @@ fn run_shell(adopt: Option<(u32, Option<String>)>, live: bool) -> u32 {
         log::line("guard: Explorer still owns the taskbar; switch aborted");
         return 1;
     }
-    // SAFETY: one guard per session; the mutex lives until the process ends.
-    let _mutex = unsafe { CreateMutexW(None, false, &HSTRING::from(GUARD_MUTEX)) };
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+    // SAFETY: one guard per session; the last-error value is read immediately after creation.
+    let handle = match unsafe { CreateMutexW(None, false, &HSTRING::from(GUARD_MUTEX)) } {
+        Ok(handle) => handle,
+        Err(e) => {
+            log::line(&format!("guard mutex: {e}"));
+            return 1;
+        }
+    };
+    let already = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    // SAFETY: the supervisory loop owns and closes the handle, even if a dialog is still open.
+    let _mutex = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    if already {
         log::line("another guard runs in this session: exiting");
         return 0;
     }

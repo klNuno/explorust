@@ -2,13 +2,15 @@
 //! sets the fallback event at any moment, whatever explorust is doing.
 
 use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
+use std::thread::JoinHandle;
 use windows::Win32::Foundation::{HANDLE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::SetEvent;
+use windows::Win32::System::Threading::{GetCurrentThreadId, SetEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F12, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG, SetWindowsHookExW,
-    TranslateMessage, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG, PM_NOREMOVE,
+    PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
 };
 
 static EVENT: AtomicIsize = AtomicIsize::new(0);
@@ -55,27 +57,53 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-/// Starts the hook thread; `fallback` is set when the combination is pressed.
-pub fn spawn(fallback: HANDLE) {
+pub struct Hook {
+    tid: u32,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for Hook {
+    fn drop(&mut self) {
+        EVENT.store(0, Ordering::Relaxed);
+        // SAFETY: the handler creates its queue before reporting its thread ID.
+        if unsafe { PostThreadMessageW(self.tid, WM_QUIT, WPARAM(0), LPARAM(0)) }.is_ok()
+            && let Some(thread) = self.thread.take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Starts the hook thread; `fallback` remains live until the returned hook is dropped.
+pub fn spawn(fallback: HANDLE) -> Option<Hook> {
     EVENT.store(fallback.0 as isize, Ordering::Relaxed);
-    let _ = std::thread::Builder::new().name("hotkey".into()).spawn(|| {
+    let (ready, result) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new().name("hotkey".into()).spawn(move || {
         // SAFETY: a global low-level hook needs this module's handle and a message loop on this thread.
         let module = unsafe { GetModuleHandleW(None) }.ok();
         let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module.map(Into::into), 0) };
-        if let Err(e) = hook {
-            crate::log::line(&format!("hotkey hook failed: {e}"));
-            return;
-        }
-        crate::log::line("hotkey Ctrl+Alt+Shift+F12 armed");
-        let mut msg = MSG::default();
+        let hook = match hook {
+            Ok(hook) => hook,
+            Err(e) => {
+                crate::log::line(&format!("hotkey hook failed: {e}"));
+                return;
+            }
+        };
         // SAFETY: standard message loop for the hook thread.
+        let mut msg = MSG::default();
+        let _ = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE) };
+        let _ = ready.send(unsafe { GetCurrentThreadId() });
+        crate::log::line("hotkey Ctrl+Alt+Shift+F12 armed");
         while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
-    });
+        // SAFETY: this thread installed the hook and owns it.
+        let _ = unsafe { UnhookWindowsHookEx(hook) };
+    }).ok()?;
+    Some(Hook { tid: result.recv().ok()?, thread: Some(thread) })
 }
 
 /// True while Shift is held: at logon this skips explorust and starts plain explorer.

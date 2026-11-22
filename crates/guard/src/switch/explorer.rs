@@ -1,7 +1,7 @@
 //! Observe and close only Explorer processes on this desktop and in this Windows session.
 
 use super::reopen_list;
-use crate::{log, taskbar};
+use crate::{account, log, supervise, taskbar};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE, HWND, LPARAM, WPARAM};
@@ -21,7 +21,7 @@ use windows::Win32::UI::Shell::{
     SWFO_NEEDDISPATCH, ShellWindows,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+    FindWindowExW, GetShellWindow, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
 };
 use windows::core::{BSTR, Interface, PCWSTR, w};
 
@@ -41,7 +41,7 @@ impl Drop for Snapshot {
     }
 }
 
-pub fn processes() -> Result<Vec<Process>, String> {
+pub fn processes(image: &str) -> Result<Vec<Process>, String> {
     let mut session = 0;
     // SAFETY: the snapshot is owned, and outputs are live for each call.
     unsafe {
@@ -64,7 +64,7 @@ pub fn processes() -> Result<Vec<Process>, String> {
                 .position(|&c| c == 0)
                 .unwrap_or(entry.szExeFile.len());
             if String::from_utf16_lossy(&entry.szExeFile[..len])
-                .eq_ignore_ascii_case("explorer.exe")
+                .eq_ignore_ascii_case(image)
             {
                 let mut process_session = 0;
                 if ProcessIdToSessionId(entry.th32ProcessID, &mut process_session).is_ok()
@@ -128,11 +128,28 @@ impl Drop for Apartment {
     }
 }
 
-/// Ask the desktop Explorer to launch the installed switch in its own user context.
-pub fn launch_switch(guard: &Path) -> Result<(), String> {
+pub fn can_launch_switch() -> Result<(), String> {
     if taskbar::explorer_window().is_none() {
         return Err("no Explorer taskbar in this session".into());
     }
+    let mut pid = 0;
+    // SAFETY: this queries the current desktop window and copies its process ID.
+    unsafe {
+        let desktop = GetShellWindow();
+        if desktop.is_invalid() {
+            return Err("no Explorer desktop in this session".into());
+        }
+        GetWindowThreadProcessId(desktop, Some(&mut pid));
+    }
+    if !taskbar::is_explorer(pid) {
+        return Err("the desktop is not owned by Windows Explorer".into());
+    }
+    account::check_unelevated_process(pid)
+}
+
+/// Ask the desktop Explorer to launch the installed switch in its own user context.
+pub fn launch_switch(guard: &Path) -> Result<(), String> {
+    can_launch_switch()?;
     let path = BSTR::from(guard.to_string_lossy().as_ref());
     let Some(dir) = guard.parent() else {
         return Err("the installed guard has no working directory".into());
@@ -169,7 +186,7 @@ pub fn launch_switch(guard: &Path) -> Result<(), String> {
             .map_err(|e| format!("get Explorer's application automation: {e}"))?;
         app.ShellExecute(
             &path,
-            &VARIANT::from(BSTR::from("--switch")),
+            &VARIANT::from(BSTR::from("--switch-worker")),
             &VARIANT::from(BSTR::from(dir.to_string_lossy().as_ref())),
             &VARIANT::from(BSTR::from("open")),
             &VARIANT::from(1),
@@ -178,7 +195,7 @@ pub fn launch_switch(guard: &Path) -> Result<(), String> {
     }
 }
 
-pub fn open_folders() -> Result<Vec<String>, String> {
+pub fn open_folders() -> Result<Vec<(isize, String)>, String> {
     let open = folder_windows();
     if open.is_empty() {
         return Ok(Vec::new());
@@ -225,6 +242,21 @@ pub fn open_folders() -> Result<Vec<String>, String> {
         }
         Ok(reopen_list::folders(entries))
     }
+}
+
+pub fn restore_folders(folders: &[(isize, String)]) {
+    let existing = folder_windows();
+    let mut reopened = 0;
+    for (handle, folder) in folders {
+        if existing.iter().any(|(window, _)| window.0 as isize == *handle) {
+            continue;
+        }
+        match std::process::Command::new(supervise::explorer_path()).arg(folder).spawn() {
+            Ok(_) => reopened += 1,
+            Err(e) => log::line(&format!("switch: could not reopen Explorer folder {folder}: {e}")),
+        }
+    }
+    log::line(&format!("switch: reopened {reopened} closed folder windows in Explorer"));
 }
 
 unsafe fn active_folder(browser: &IWebBrowser2) -> windows::core::Result<String> {
@@ -280,7 +312,7 @@ pub fn exit(tray: HWND, pid: u32) -> Result<(), String> {
         {
             return Err(format!("Windows restarted Explorer as pid {owner}"));
         }
-        let running = processes()?;
+        let running = processes("explorer.exe")?;
         let pids: Vec<_> = running.iter().map(|process| process.pid).collect();
         let desktop_present = pids.iter().any(|owner| desktop_owners.contains(owner));
         let new_desktop = windows(w!("Progman"))
