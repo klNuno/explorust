@@ -22,8 +22,9 @@ use windows::{
         Foundation::{HANDLE, HWND, LPARAM, RECT},
         Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute},
         UI::WindowsAndMessaging::{
-            EnumChildWindows, GA_ROOT, GetAncestor, GetClassNameW, GetClientRect, GetPropW,
-            IsWindowVisible, RemovePropW, SetPropW, WS_CHILD, WS_EX_NOREDIRECTIONBITMAP,
+            EnumChildWindows, GA_ROOT, GWL_STYLE, GetAncestor, GetClassNameW, GetClientRect,
+            GetPropW, GetWindowLongW, IsWindowVisible, RemovePropW, SetPropW, WS_CHILD,
+            WS_EX_NOREDIRECTIONBITMAP, WS_VISIBLE,
         },
     },
     core::{BOOL, w},
@@ -89,10 +90,10 @@ fn core_child(frame: HWND, require_layout: bool) -> bool {
             return BOOL(1);
         }
         let mut rect = RECT::default();
-        // SAFETY: the window is a descendant of the frame. It has been laid out once the client
-        // area is visible with positive dimensions, including under a nested layout host.
+        // SAFETY: the descendant is ready when it has a layout and wants to show. Check its own
+        // style because the frame can still be hidden while waiting for that attachment.
         if !result.require_layout
-            || unsafe { IsWindowVisible(window) }.as_bool()
+            || unsafe { GetWindowLongW(window, GWL_STYLE) } as u32 & WS_VISIBLE.0 != 0
                 && unsafe { GetClientRect(window, &mut rect) }.is_ok()
                 && rect.right > rect.left && rect.bottom > rect.top
         {
@@ -292,7 +293,7 @@ mod tests {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE,
-        WNDCLASSW, WS_POPUP, WS_VISIBLE,
+        WNDCLASSW, WS_POPUP,
     };
     use windows::core::PCWSTR;
 
@@ -313,7 +314,7 @@ mod tests {
             let wc = WNDCLASSW { lpfnWndProc: Some(fixture_proc), hInstance: module, lpszClassName: name, ..Default::default() };
             assert_ne!(unsafe { RegisterClassW(&wc) }, 0);
         }
-        let frame = make(frame_class, WS_POPUP | WS_VISIBLE, None);
+        let frame = make(frame_class, WS_POPUP, None);
         let retry_target = |hwnd, style, parent| empty_retry_frame(hwnd, WS_EX_NOREDIRECTIONBITMAP.0, style, parent, 1, 3);
         let helper = make(helper_class, WS_CHILD | WS_VISIBLE, Some(frame));
         assert!(!retry_target(helper, WS_CHILD.0, frame.0));
@@ -321,7 +322,11 @@ mod tests {
         assert!(!core_child(frame, true));
         for _ in 0..2 {
             let core = make(core_class, WS_CHILD | WS_VISIBLE, Some(helper));
-            assert!(core_child(frame, true));
+            assert!(core_child(frame, false), "they must enumerate the nested CoreWindow");
+            let mut rect = RECT::default();
+            unsafe { GetClientRect(core, &mut rect).unwrap() };
+            let style = unsafe { GetWindowLongW(core, GWL_STYLE) } as u32;
+            assert!(core_child(frame, true), "nested client area {rect:?}, style {style:#x}");
             assert!(!retry_target(frame, WS_POPUP.0, std::ptr::null_mut()));
             unsafe { DestroyWindow(core).unwrap() };
             assert!(!core_child(frame, true));
