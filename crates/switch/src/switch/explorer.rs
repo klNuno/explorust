@@ -243,7 +243,10 @@ pub fn exit(
         let new_desktop = windows(w!("Progman"))
             .into_iter()
             .any(|(_, owner)| taskbar::is_explorer(owner));
-        if !desktop_present && !new_desktop {
+        let desktop_exited = !desktop_present && !new_desktop;
+        // A separate-process folder can outlive the desktop. Files may reopen it only once
+        // the original window closes, so keep waiting even if the old desktop is already gone.
+        if desktop_exited && folder_windows().is_empty() {
             log::line(&format!(
                 "switch: Explorer desktop exited after {} ms (background Explorer pids: {pids:?})",
                 started.elapsed().as_millis()
@@ -251,6 +254,9 @@ pub fn exit(
             return Ok(true);
         }
         if started.elapsed() >= EXIT_BUDGET {
+            if desktop_exited {
+                return Err("Explorer folder windows did not close within 30 s".into());
+            }
             return Err(format!(
                 "Explorer's desktop did not exit within 30 s (remaining pids {pids:?})"
             ));
