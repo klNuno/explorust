@@ -5,7 +5,7 @@
 //! and the files stay until an uninstall with permission. `--yes` skips the question, `--quiet`
 //! shows nothing (Apps' QuietUninstallString).
 
-use crate::manage::{self, BUSY, FAILED, KEPT, OTHER_ACCOUNT};
+use crate::manage::{self, BUSY, FAILED, KEPT, OTHER_ACCOUNT, RestoreMode, SessionDesktop};
 use crate::ui::{self, Icon, tr};
 use crate::{account, install, log};
 use std::os::windows::process::CommandExt;
@@ -23,6 +23,17 @@ pub fn start_detached() {
         Ok(c) => log::line(&format!("uninstall started, pid {}", c.id())),
         Err(e) => log::line(&format!("uninstall did not start: {e}")),
     }
+}
+
+/// The initiating window can close while cancellation and desktop recovery finish.
+pub fn finish_detached(quiet: bool) -> Result<(), String> {
+    let me = std::env::current_exe().map_err(|e| format!("locate the uninstaller: {e}"))?;
+    let mut child = std::process::Command::new(me);
+    child.args(["--uninstall", "--yes", "--finish-session-restore"]).creation_flags(CREATE_NO_WINDOW);
+    if quiet {
+        child.arg("--quiet");
+    }
+    child.spawn().map(|_| ()).map_err(|e| format!("start the deferred uninstaller: {e}"))
 }
 
 /// Runs this exe again elevated with `args`. Ok(exit code), Err(true) when the user said no.
@@ -102,13 +113,17 @@ pub fn run(yes: bool, quiet: bool) -> u32 {
         log::line("uninstall: cancelled by the user");
         return 1;
     }
+    let finishing = std::env::args().any(|arg| arg == "--finish-session-restore");
     let steps = || {
-        let (user, back) = manage::restore_session();
+        let mode = if finishing { RestoreMode::FinishUninstall } else { RestoreMode::Uninstall { quiet } };
+        let (user, desktop) = manage::restore_session(mode);
+        let back = match desktop {
+            Ok(SessionDesktop::Ready(description)) => Ok(description),
+            Ok(SessionDesktop::UninstallPending) => return None,
+            Err(error) => Err(error),
+        };
         if user.is_err() {
-            return (user, back, Machine::Code(FAILED));
-        }
-        if back.is_ok() {
-            manage::remove_package();
+            return Some((user, back, Machine::Code(FAILED)));
         }
         // The files stay until explorer is confirmed back: the guard of this session still runs
         // them, and a retry needs the Apps entry.
@@ -129,9 +144,9 @@ pub fn run(yes: bool, quiet: bool) -> u32 {
                 }
             }
         };
-        (user, back, machine)
+        Some((user, back, machine))
     };
-    let (user, back, machine) = if quiet {
+    let Some((user, back, machine)) = (if quiet || finishing {
         steps()
     } else {
         ui::working(
@@ -139,6 +154,8 @@ pub fn run(yes: bool, quiet: bool) -> u32 {
             tr("explorust se désinstalle, cela peut prendre une minute.", "explorust is being uninstalled, this can take a minute."),
             steps,
         )
+    }) else {
+        return 0;
     };
     let log_path = log::dir().join("guard.log").display().to_string();
     if let Err(e) = &user {

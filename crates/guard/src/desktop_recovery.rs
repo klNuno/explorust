@@ -53,6 +53,7 @@ fn recover(
     let mut recovery = ExplorerRecovery::default();
     let mut requested = false;
     let mut launch: Option<Child> = None;
+    let mut stopping_launcher = false;
     let mut observed: Option<Child> = None;
     let mut last_error = None;
     let mut orphan: Option<(u32, Instant)> = None;
@@ -223,6 +224,27 @@ fn recover(
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
+            Recovery::StopLauncher => {
+                if let Some(child) = &launch
+                    && !stopping_launcher
+                    && taskbar::desktop_owner().is_none()
+                    && !taskbar::explorer_file_operations()
+                    && !child.ended()
+                {
+                    // This is the process we launched with no arguments on a vacant desktop.
+                    // Never start again until its process handle signals that it has exited.
+                    match unsafe { TerminateProcess(child.handle, 1) } {
+                        Ok(()) => {
+                            stopping_launcher = true;
+                            log::line(&format!("restore: stopped Explorer launcher pid {} before it registered a desktop", child.pid));
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("could not stop Explorer launcher pid {}: {e}", child.pid));
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
             Recovery::Start if taskbar::desktop_owner().is_none() && !taskbar::explorer_file_operations() => {
                 if install::elevated() {
                     return Err("no shell runs: start explorer.exe from Task Manager".into());
@@ -237,6 +259,7 @@ fn recover(
                 if taskbar::desktop_owner().is_some() || taskbar::explorer_file_operations() {
                     continue;
                 }
+                stopping_launcher = false;
                 launch = match Child::spawn(&supervise::explorer_path(), "") {
                     Ok(child) => {
                         last_error = None;

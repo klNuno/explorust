@@ -4,9 +4,11 @@
 //! signed-in user's own process). The order keeps a way back at every step: on install, the Apps
 //! entry exists before the Shell value; on removal, the Shell value is gone before any file.
 
-use crate::{account, apps, desktop_recovery, folders, install, log, package, proc, reg};
+use crate::policy::{self, DESKTOP_RECOVERY_LIMIT, RestoreLocks};
+use crate::switch_events::{CANCEL_FOR_RESTORE, EXITING_EXPLORER};
+use crate::{account, apps, desktop_recovery, folders, install, log, package, proc, reg, taskbar, uninstall};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Exit codes shared by `--install`, `--setup` and `--uninstall`.
 pub const FAILED: u32 = 1;
@@ -158,11 +160,36 @@ fn restore_user() -> Result<String, String> {
     Ok(r)
 }
 
+pub enum RestoreMode {
+    Repair,
+    Uninstall { quiet: bool },
+    FinishUninstall,
+}
+
+pub enum SessionDesktop {
+    Ready(String),
+    UninstallPending,
+}
+
 /// Serializes the user cleanup and return to Explorer with a live handoff.
-pub fn restore_session() -> (Result<String, String>, Result<String, String>) {
+pub fn restore_session(mode: RestoreMode) -> (Result<String, String>, Result<SessionDesktop, String>) {
+    let started = Instant::now();
     let lock = || {
-        let user = install::user_setup_lock()?;
-        let cancel = proc::Event::named(crate::switch_events::CANCEL_FOR_RESTORE)?;
+        let user = loop {
+            match install::user_setup_lock() {
+                Ok(lock) => break lock,
+                Err(_) if matches!(mode, RestoreMode::FinishUninstall)
+                    && started.elapsed() < Duration::from_secs(5) =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let cancel = proc::Event::named(CANCEL_FOR_RESTORE)?;
+        if matches!(mode, RestoreMode::FinishUninstall) && reg::shell().is_some() {
+            return Err("the user installed a shell while uninstall was pending".into());
+        }
         cancel.signal()?;
         say("restore: requested Windows desktop");
         Ok((user, cancel))
@@ -172,13 +199,40 @@ pub fn restore_session() -> (Result<String, String>, Result<String, String>) {
         Err(e) => return (Err(e), Err("not tried".into())),
     };
     let user = restore_user();
-    let back = if user.is_ok() {
-        match crate::policy::try_restore_locks(install::switch_lock_for, install::recovery_lock_for) {
-            Ok(_locks) => bring_back_explorer(),
-            Err(e) => Err(format!("desktop recovery is already in progress: {e}")),
+    if user.is_err() {
+        return (user, Err("not tried".into()));
+    }
+    let mut deadline = Instant::now() + DESKTOP_RECOVERY_LIMIT;
+    let back = loop {
+        if matches!(mode, RestoreMode::FinishUninstall) && taskbar::explorer_file_operations() {
+            deadline = Instant::now() + DESKTOP_RECOVERY_LIMIT;
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
         }
-    } else {
-        Err("not tried".into())
+        let locks = policy::try_restore_locks(install::switch_lock_for, install::recovery_lock_for);
+        let pending = match locks {
+            RestoreLocks::Acquired(switch, recovery) if !proc::Event::is_signalled(EXITING_EXPLORER) => {
+                let result = bring_back_explorer();
+                drop(recovery);
+                drop(switch);
+                if result.is_ok() && !matches!(mode, RestoreMode::Repair) {
+                    remove_package();
+                }
+                break result.map(SessionDesktop::Ready);
+            }
+            RestoreLocks::Acquired(..) => "Explorer's exit is pending".into(),
+            RestoreLocks::Pending(error) => error,
+        };
+        match mode {
+            RestoreMode::Uninstall { quiet } => {
+                say(&format!("restore: finishing uninstall after the switch cancels ({pending})"));
+                break uninstall::finish_detached(quiet).map(|()| SessionDesktop::UninstallPending);
+            }
+            RestoreMode::FinishUninstall if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => break Err(format!("desktop recovery is already in progress: {pending}")),
+        }
     };
     (user, back)
 }
@@ -256,7 +310,12 @@ pub fn restore_machine(session_sid: Option<&str>) -> Result<bool, String> {
 pub fn restore() -> u32 {
     let mine = !install::elevated() || account::is_session_user();
     let (user, back) = if mine {
-        restore_session()
+        let (user, desktop) = restore_session(RestoreMode::Repair);
+        let back = desktop.and_then(|status| match status {
+            SessionDesktop::Ready(description) => Ok(description),
+            SessionDesktop::UninstallPending => Err("desktop recovery is pending".into()),
+        });
+        (user, back)
     } else {
         let back = install::recovery_lock_for(0).and_then(|_lock| bring_back_explorer());
         (Ok(String::new()), back)

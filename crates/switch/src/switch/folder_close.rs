@@ -143,7 +143,9 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
             Close::Destroyed => break,
             Close::Pending => {}
         }
-        if started.elapsed() >= guard::policy::DESKTOP_OBSERVE_LIMIT {
+        if started.elapsed() >= guard::policy::DESKTOP_OBSERVE_LIMIT
+            && watcher_process.ended() && owner_process.ended() && !explorer::file_operations()
+        {
             return Err(format!("Explorer folder HWND {hwnd:#x} did not close"));
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -154,12 +156,15 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
         if signals.completed.signalled() {
             return Ok(());
         }
-        if signals.windows_ready.signalled()
-            || (watcher_process.ended() && owner_process.ended() && taskbar::explorer().is_some())
+        if !explorer::file_operations()
+            && (signals.windows_ready.signalled()
+                || (watcher_process.ended() && owner_process.ended() && taskbar::explorer().is_some()))
         {
             return reopen_after_rollback(&folder.path);
         }
-        if started.elapsed() >= guard::policy::DESKTOP_OBSERVE_LIMIT {
+        if started.elapsed() >= guard::policy::DESKTOP_OBSERVE_LIMIT
+            && watcher_process.ended() && owner_process.ended() && !explorer::file_operations()
+        {
             return Err(format!("no desktop became ready to reopen {}", folder.path));
         }
         std::thread::sleep(Duration::from_millis(100));

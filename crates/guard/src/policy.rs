@@ -197,11 +197,31 @@ pub const DESKTOP_RECOVERY_LIMIT: Duration = Duration::from_secs(155);
 pub const DESKTOP_OBSERVE_LIMIT: Duration = Duration::from_secs(600);
 pub const RETIRING_EXPLORER_ATTEMPTS: u8 = 3;
 
+/// After the UI wait, observe a pending exit or copy without holding the recovery lock.
+pub fn observe_recovery(exit: ExitState, original_alive: bool, file_operations: bool) -> DesktopAction {
+    if exit.pending() && original_alive {
+        DesktopAction::WaitForOriginal
+    } else if file_operations {
+        DesktopAction::WaitForCopy
+    } else {
+        DesktopAction::Restore
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestoreLocks<T, E> {
+    Acquired(T, T),
+    Pending(E),
+}
+
 pub fn try_restore_locks<T, E>(
     switch: impl FnOnce(u32) -> Result<T, E>,
     recovery: impl FnOnce(u32) -> Result<T, E>,
-) -> Result<(T, T), E> {
-    Ok((switch(0)?, recovery(0)?))
+) -> RestoreLocks<T, E> {
+    match (|| Ok((switch(0)?, recovery(0)?)))() {
+        Ok((switch, recovery)) => RestoreLocks::Acquired(switch, recovery),
+        Err(error) => RestoreLocks::Pending(error),
+    }
 }
 
 /// The timing decision for an Explorer launch when the desktop still needs recovery.
@@ -210,6 +230,7 @@ pub enum Recovery {
     Wait,
     Start,
     Restart(u32),
+    StopLauncher,
     Exhausted,
 }
 
@@ -261,6 +282,9 @@ impl ExplorerRecovery {
         if tray == RecoveryTray::Other || blocked {
             return if expired { Recovery::Exhausted } else { Recovery::Wait };
         }
+        if self.attempts > 0 && tray == RecoveryTray::Missing && !launcher_ended {
+            return Recovery::StopLauncher;
+        }
         if self.attempts == EXPLORER_ATTEMPTS {
             return Recovery::Exhausted;
         }
@@ -280,6 +304,38 @@ impl ExplorerRecovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pending_exit_keeps_the_observer_after_the_ui_deadline() {
+        assert_eq!(observe_recovery(ExitState::Posted, true, false), DesktopAction::WaitForOriginal);
+        assert_eq!(observe_recovery(ExitState::Posted, false, false), DesktopAction::Restore);
+        assert_eq!(observe_recovery(ExitState::Uncertain, true, false), DesktopAction::WaitForOriginal);
+        assert_eq!(observe_recovery(ExitState::Unsent, true, false), DesktopAction::Restore);
+    }
+
+    #[test]
+    fn a_postponed_copy_checks_the_original_desktop_when_the_copy_ends() {
+        assert_eq!(observe_recovery(ExitState::Unsent, true, true), DesktopAction::WaitForCopy);
+        assert_eq!(observe_recovery(ExitState::Unsent, true, false), DesktopAction::Restore);
+    }
+
+    #[test]
+    fn restore_defers_when_the_switch_is_cancelling() {
+        let locks = try_restore_locks(
+            |ms| { assert_eq!(ms, 0); Err::<(), _>("switch cancelling") },
+            |_| panic!("must give control back without waiting for recovery"),
+        );
+        assert_eq!(locks, RestoreLocks::Pending("switch cancelling"));
+    }
+
+    #[test]
+    fn an_expired_launcher_with_no_desktop_is_stopped_before_retry() {
+        let mut recovery = ExplorerRecovery::default();
+        recovery.started(secs(0));
+        assert_eq!(recovery.step(secs(44), RecoveryTray::Missing, false, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(45), RecoveryTray::Missing, false, false), Recovery::StopLauncher);
+        assert_eq!(recovery.step(secs(46), RecoveryTray::Missing, false, true), Recovery::Start);
+    }
 
     #[test]
     fn a_confirmed_post_outlives_the_sender_and_a_cancelled_attempt_does_not() {
@@ -391,7 +447,7 @@ mod tests {
             |ms| Ok::<_, ()>(("session switch", ms)),
             |ms| Ok(("session recovery", ms)),
         );
-        assert_eq!(locks, Ok((("session switch", 0), ("session recovery", 0))));
+        assert_eq!(locks, RestoreLocks::Acquired(("session switch", 0), ("session recovery", 0)));
     }
 
     #[test]
@@ -423,7 +479,7 @@ mod tests {
             let retry = (0..=60).find(|&now| {
                 let step = recovery.step(secs(now), RecoveryTray::Missing, false, now >= first_exit);
                 assert_ne!(step, Recovery::Exhausted);
-                step == Recovery::Start
+                matches!(step, Recovery::Start | Recovery::StopLauncher)
             }).unwrap();
             assert_eq!(retry, (first_exit + 10).min(45));
             recovery.started(secs(retry));
@@ -443,7 +499,7 @@ mod tests {
         let mut recovery = ExplorerRecovery::default();
         for attempt in 0..3 {
             let start = secs(attempt * 45);
-            assert_eq!(recovery.step(start, RecoveryTray::Missing, false, false), Recovery::Start);
+            assert_eq!(recovery.step(start, RecoveryTray::Missing, false, true), Recovery::Start);
             recovery.started(start);
         }
         assert_eq!(recovery.step(secs(134), RecoveryTray::Missing, false, false), Recovery::Wait);

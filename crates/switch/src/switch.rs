@@ -207,12 +207,9 @@ fn switch(
                 if !watcher.committed() {
                     return Err("the switch stopped while preparing Explorer".into());
                 }
-                log::line(&format!("switch: {e}; restoring Windows directly"));
+                log::line(&format!("switch: {e}; starting a replacement recovery watcher"));
                 drop(lock);
-                let late_folders = watcher.recover(exe, &explorer_process)?;
-                if let Some(folders) = late_folders {
-                    watcher::restore_late_folders(&explorer_process, &folders)?;
-                }
+                watcher.recover(worker, &explorer_process)?;
             }
             Ok(Outcome::Windows)
         }
