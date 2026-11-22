@@ -1,6 +1,6 @@
 //! Keep wallpaper input intact while giving the desktop its blank-area right click.
 
-use super::list_view;
+use super::folder_view;
 use std::cell::Cell;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::Arc;
@@ -131,6 +131,19 @@ fn on_wallpaper(target: Target, pt: POINT) -> bool {
     }
 }
 
+pub fn right_click_activation(progman: HWND, view: HWND, worker: HWND, lp: LPARAM) -> Option<LRESULT> {
+    let mouse_message = (lp.0 >> 16) as u16 as u32;
+    if !matches!(mouse_message, WM_RBUTTONDOWN | WM_NCRBUTTONDOWN) {
+        return None;
+    }
+    let mut pt = POINT::default();
+    // SAFETY: GetCursorPos writes to the local point.
+    unsafe { GetCursorPos(&mut pt) }.ok()?;
+    // The wallpaper still gets the click. A click activation of Progman can arrive
+    // after the cross-thread click observer has already opened the desktop menu.
+    on_wallpaper(Target { progman, view, worker }, pt).then_some(LRESULT(MA_NOACTIVATE as isize))
+}
+
 pub fn right_click(progman: HWND, view: HWND, worker: HWND, lp: LPARAM) {
     if !on_wallpaper(
         Target {
@@ -142,7 +155,10 @@ pub fn right_click(progman: HWND, view: HWND, worker: HWND, lp: LPARAM) {
     ) {
         return;
     }
-    let Some(list) = list_view() else { return };
+    background_menu(view, folder_view(view), lp);
+}
+
+pub(super) fn background_menu(view: HWND, list: Option<HWND>, lp: LPARAM) {
     let state = LVITEMW {
         stateMask: LVIS_SELECTED,
         ..Default::default()
@@ -150,13 +166,16 @@ pub fn right_click(progman: HWND, view: HWND, worker: HWND, lp: LPARAM) {
     // A synthetic button-down can start the list view's mouse tracking after the physical
     // button-up has already gone to the wallpaper. Open its normal context menu directly.
     unsafe {
-        SendMessageW(
-            list,
-            LVM_SETITEMSTATE,
-            Some(WPARAM(usize::MAX)),
-            Some(LPARAM(&state as *const _ as isize)),
-        );
-        let _ = PostMessageW(Some(list), WM_CONTEXTMENU, WPARAM(list.0 as usize), lp);
+        if let Some(list) = list {
+            SendMessageW(
+                list,
+                LVM_SETITEMSTATE,
+                Some(WPARAM(usize::MAX)),
+                Some(LPARAM(&state as *const _ as isize)),
+            );
+        }
+        let target = list.unwrap_or(view);
+        let _ = PostMessageW(Some(target), WM_CONTEXTMENU, WPARAM(target.0 as usize), lp);
     }
 }
 

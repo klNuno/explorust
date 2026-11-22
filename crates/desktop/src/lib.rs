@@ -11,6 +11,9 @@ pub mod layout;
 pub mod toggle;
 pub mod transcoded;
 
+#[cfg(any(target_os = "windows", test))]
+mod view_layer;
+
 #[cfg(target_os = "windows")]
 mod browser;
 #[cfg(target_os = "windows")]
