@@ -107,7 +107,9 @@ fn run_live() -> u32 {
         }
     };
     let switch = install::dir().join(SWITCH_EXE);
+    let guard = install::dir().join("explorust-guard.exe");
     if Event::is_signalled(CANCEL_FOR_RESTORE)
+        || !reg::shell().is_some_and(|shell| shell.eq_ignore_ascii_case(&format!("\"{}\"", guard.display())))
         || install::elevated()
         || !account::is_session_user()
         || reopen::guard_stamp(worker) != Some(stamp)

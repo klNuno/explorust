@@ -115,14 +115,19 @@ pub struct DesktopFacts {
     pub tray_gone_grace_elapsed: bool,
     pub file_operations: bool,
     pub explorer_ready: Option<u32>,
+    pub explorer_owner: Option<u32>,
+    pub explorust_ready: Option<u32>,
+    pub recovery_expired: bool,
+    pub retirement_attempts: u8,
     pub supervisor_available: bool,
-    pub shell_window_owner: Option<u32>,
-    pub shell_tray_owner: Option<u32>,
+    pub explorust_owner: Option<u32>,
     pub adoption_elapsed: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DesktopAction {
+    WaitForCopy,
+    NeedsSignOut,
     WaitForOriginal,
     RepostExit(usize),
     StopRetiringExplorer,
@@ -136,33 +141,49 @@ pub enum DesktopAction {
 /// Decide from this observation only. Each caller probes again after waiting or taking action.
 pub fn recover_desktop(facts: DesktopFacts) -> DesktopAction {
     let retiring = facts.exit.pending() && facts.original_alive;
+    if !facts.file_operations && (!retiring || facts.original_tray == OriginalTray::Missing)
+        && let Some(pid) = facts.explorer_ready.or(facts.explorust_ready)
+    {
+        return DesktopAction::Ready { pid, retiring };
+    }
+    if facts.recovery_expired || (retiring && facts.explorer_owner.is_none()
+        && facts.tray_gone_grace_elapsed && facts.retirement_attempts >= RETIRING_EXPLORER_ATTEMPTS)
+    {
+        return DesktopAction::NeedsSignOut;
+    }
+    if facts.file_operations {
+        return DesktopAction::WaitForCopy;
+    }
     if retiring && facts.original_tray != OriginalTray::Missing {
         // Sent probes can be answered ahead of queued exit requests. Resolve uncertainty by
         // posting to the current tray of that PID, which can have recreated its window.
         if let OriginalTray::Answering(window) = facts.original_tray
             && facts.exit == ExitState::Uncertain
-            && !facts.file_operations
         {
             return DesktopAction::RepostExit(window);
         }
         return DesktopAction::WaitForOriginal;
     }
-    if let Some(pid) = facts.explorer_ready {
-        return DesktopAction::Ready { pid, retiring };
-    }
     if retiring {
+        if facts.explorer_owner.is_some() {
+            // A different verified Explorer owns the desktop. Recovery can retry that owner.
+            return DesktopAction::Restore;
+        }
         // Explorer can still route a new launch to a folder while the old shell process owns
         // the desktop. Wait for it to release ownership, even after its tray disappears.
-        return if facts.tray_gone_grace_elapsed && !facts.file_operations {
+        return if facts.tray_gone_grace_elapsed {
             DesktopAction::StopRetiringExplorer
         } else {
             DesktopAction::WaitForOriginal
         };
     }
+    if facts.explorer_owner.is_some() {
+        return DesktopAction::Restore;
+    }
     if facts.supervisor_available {
         return DesktopAction::RequestFallback;
     }
-    if let Some(pid) = facts.shell_window_owner.or(facts.shell_tray_owner) {
+    if let Some(pid) = facts.explorust_owner {
         return if facts.adoption_elapsed {
             DesktopAction::StopOrphan(pid)
         } else {
@@ -172,13 +193,15 @@ pub fn recover_desktop(facts: DesktopFacts) -> DesktopAction {
     DesktopAction::Restore
 }
 
-/// Hold both session locks while turning the current user back to Windows.
-pub fn lock_for_restore<T, E>(
+pub const DESKTOP_RECOVERY_LIMIT: Duration = Duration::from_secs(155);
+pub const DESKTOP_OBSERVE_LIMIT: Duration = Duration::from_secs(600);
+pub const RETIRING_EXPLORER_ATTEMPTS: u8 = 3;
+
+pub fn try_restore_locks<T, E>(
     switch: impl FnOnce(u32) -> Result<T, E>,
     recovery: impl FnOnce(u32) -> Result<T, E>,
 ) -> Result<(T, T), E> {
-    const INFINITE: u32 = u32::MAX;
-    Ok((switch(INFINITE)?, recovery(INFINITE)?))
+    Ok((switch(0)?, recovery(0)?))
 }
 
 /// The timing decision for an Explorer launch when the desktop still needs recovery.
@@ -193,7 +216,7 @@ pub enum Recovery {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryTray {
     Missing,
-    Replacement(u32),
+    Explorer(u32),
     Other,
 }
 
@@ -205,6 +228,7 @@ pub struct ExplorerRecovery {
     attempts: u8,
     started: Duration,
     ended: Option<Duration>,
+    owner: Option<(u32, Duration)>,
 }
 
 impl ExplorerRecovery {
@@ -220,8 +244,11 @@ impl ExplorerRecovery {
         tray: RecoveryTray,
         blocked: bool,
         launcher_ended: bool,
-        file_operations: bool,
     ) -> Recovery {
+        self.owner = match tray {
+            RecoveryTray::Explorer(pid) => Some(self.owner.filter(|&(owner, _)| owner == pid).unwrap_or((pid, now))),
+            _ => None,
+        };
         let expired = now - self.started >= EXPLORER_WINDOW;
         if self.attempts > 0 {
             // Explorer can hand the launch to another process before the tray appears.
@@ -234,14 +261,16 @@ impl ExplorerRecovery {
         if tray == RecoveryTray::Other || blocked {
             return if expired { Recovery::Exhausted } else { Recovery::Wait };
         }
-        if matches!(tray, RecoveryTray::Replacement(_)) && file_operations {
-            return Recovery::Wait;
-        }
         if self.attempts == EXPLORER_ATTEMPTS {
             return Recovery::Exhausted;
         }
-        if let RecoveryTray::Replacement(pid) = tray {
-            Recovery::Restart(pid)
+        if let RecoveryTray::Explorer(pid) = tray {
+            if self.owner.is_some_and(|(_, since)| now - since >= EXPLORER_WINDOW) {
+                self.owner = Some((pid, now));
+                Recovery::Restart(pid)
+            } else {
+                Recovery::Wait
+            }
         } else {
             Recovery::Start
         }
@@ -273,6 +302,7 @@ mod tests {
                             };
                             let action = recover_desktop(facts);
                             let expected = match (exit, original_alive, original_tray, file_operations, tray_gone_grace_elapsed) {
+                                (_, _, _, true, _) => DesktopAction::WaitForCopy,
                                 (ExitState::Uncertain, true, OriginalTray::Answering(window), false, _) => DesktopAction::RepostExit(window),
                                 (ExitState::Uncertain | ExitState::Posted, true, OriginalTray::Answering(_) | OriginalTray::Present, _, _) => DesktopAction::WaitForOriginal,
                                 (ExitState::Uncertain | ExitState::Posted, true, OriginalTray::Missing, false, true) => DesktopAction::StopRetiringExplorer,
@@ -318,20 +348,17 @@ mod tests {
 
     #[test]
     fn supervisor_can_disappear_with_a_shell_window_or_a_tray() {
-        for owners in [(Some(42), None), (None, Some(42)), (Some(42), Some(42))] {
-            for supervisor_available in [false, true] {
-                for adoption_elapsed in [false, true] {
-                    let facts = DesktopFacts {
-                        supervisor_available, adoption_elapsed,
-                        shell_window_owner: owners.0, shell_tray_owner: owners.1,
-                        ..DesktopFacts::default()
-                    };
-                    assert_eq!(recover_desktop(facts), match (supervisor_available, adoption_elapsed) {
-                        (true, _) => DesktopAction::RequestFallback,
-                        (false, false) => DesktopAction::WaitForAdoption,
-                        (false, true) => DesktopAction::StopOrphan(42),
-                    });
-                }
+        for supervisor_available in [false, true] {
+            for adoption_elapsed in [false, true] {
+                let facts = DesktopFacts {
+                    supervisor_available, adoption_elapsed, explorust_owner: Some(42),
+                    ..DesktopFacts::default()
+                };
+                assert_eq!(recover_desktop(facts), match (supervisor_available, adoption_elapsed) {
+                    (true, _) => DesktopAction::RequestFallback,
+                    (false, false) => DesktopAction::WaitForAdoption,
+                    (false, true) => DesktopAction::StopOrphan(42),
+                });
             }
         }
     }
@@ -345,7 +372,7 @@ mod tests {
         facts.tray_gone_grace_elapsed = true;
         assert_eq!(recover_desktop(facts), DesktopAction::StopRetiringExplorer);
         facts.file_operations = true;
-        assert_eq!(recover_desktop(facts), DesktopAction::WaitForOriginal);
+        assert_eq!(recover_desktop(facts), DesktopAction::WaitForCopy);
     }
 
     #[test]
@@ -359,12 +386,12 @@ mod tests {
     }
 
     #[test]
-    fn per_user_restore_waits_only_for_its_session_even_during_a_machine_install() {
-        let locks = lock_for_restore(
+    fn per_user_restore_only_tries_its_session_locks() {
+        let locks = try_restore_locks(
             |ms| Ok::<_, ()>(("session switch", ms)),
             |ms| Ok(("session recovery", ms)),
         );
-        assert_eq!(locks, Ok((("session switch", u32::MAX), ("session recovery", u32::MAX))));
+        assert_eq!(locks, Ok((("session switch", 0), ("session recovery", 0))));
     }
 
     #[test]
@@ -377,15 +404,15 @@ mod tests {
     #[test]
     fn recovery_starts_once_the_retiring_process_is_gone() {
         let mut recovery = ExplorerRecovery::default();
-        assert_eq!(recovery.step(secs(0), RecoveryTray::Missing, true, false, false), Recovery::Wait);
-        assert_eq!(recovery.step(secs(1), RecoveryTray::Missing, false, false, false), Recovery::Start);
+        assert_eq!(recovery.step(secs(0), RecoveryTray::Missing, true, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(1), RecoveryTray::Missing, false, false), Recovery::Start);
     }
 
     #[test]
     fn recovery_starts_directly_when_the_signalled_guard_disappears() {
         let mut recovery = ExplorerRecovery::default();
-        assert_eq!(recovery.step(secs(0), RecoveryTray::Missing, true, false, false), Recovery::Wait);
-        assert_eq!(recovery.step(secs(1), RecoveryTray::Missing, false, false, false), Recovery::Start);
+        assert_eq!(recovery.step(secs(0), RecoveryTray::Missing, true, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(1), RecoveryTray::Missing, false, false), Recovery::Start);
     }
 
     #[test]
@@ -394,21 +421,21 @@ mod tests {
             let mut recovery = ExplorerRecovery::default();
             recovery.started(secs(0));
             let retry = (0..=60).find(|&now| {
-                let step = recovery.step(secs(now), RecoveryTray::Missing, false, now >= first_exit, false);
+                let step = recovery.step(secs(now), RecoveryTray::Missing, false, now >= first_exit);
                 assert_ne!(step, Recovery::Exhausted);
                 step == Recovery::Start
             }).unwrap();
             assert_eq!(retry, (first_exit + 10).min(45));
             recovery.started(secs(retry));
-            assert_eq!(recovery.step(secs(retry + 44), RecoveryTray::Missing, false, false, false), Recovery::Wait);
+            assert_eq!(recovery.step(secs(retry + 44), RecoveryTray::Missing, false, false), Recovery::Wait);
         }
     }
 
     #[test]
     fn recovery_waits_for_adoption_when_the_shell_still_owns_the_taskbar() {
         let mut recovery = ExplorerRecovery::default();
-        assert_eq!(recovery.step(secs(0), RecoveryTray::Other, true, false, false), Recovery::Wait);
-        assert_eq!(recovery.step(secs(1), RecoveryTray::Other, false, false, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(0), RecoveryTray::Other, true, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(1), RecoveryTray::Other, false, false), Recovery::Wait);
     }
 
     #[test]
@@ -416,46 +443,93 @@ mod tests {
         let mut recovery = ExplorerRecovery::default();
         for attempt in 0..3 {
             let start = secs(attempt * 45);
-            assert_eq!(recovery.step(start, RecoveryTray::Missing, false, false, false), Recovery::Start);
+            assert_eq!(recovery.step(start, RecoveryTray::Missing, false, false), Recovery::Start);
             recovery.started(start);
         }
-        assert_eq!(recovery.step(secs(134), RecoveryTray::Missing, false, false, false), Recovery::Wait);
-        assert_eq!(recovery.step(secs(135), RecoveryTray::Missing, false, true, false), Recovery::Exhausted);
+        assert_eq!(recovery.step(secs(134), RecoveryTray::Missing, false, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(135), RecoveryTray::Missing, false, true), Recovery::Exhausted);
     }
 
     #[test]
     fn recovery_gives_a_forwarded_process_time_to_create_its_tray() {
         let mut recovery = ExplorerRecovery::default();
         recovery.started(secs(0));
-        assert_eq!(recovery.step(secs(1), RecoveryTray::Missing, false, true, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(1), RecoveryTray::Missing, false, true), Recovery::Wait);
     }
 
     #[test]
     fn a_hung_tray_owned_by_the_first_launch_can_be_retried() {
         let mut recovery = ExplorerRecovery::default();
         recovery.started(secs(0));
-        assert_eq!(recovery.step(secs(44), RecoveryTray::Replacement(42), false, false, false), Recovery::Wait);
-        assert_eq!(recovery.step(secs(45), RecoveryTray::Replacement(42), false, false, false), Recovery::Restart(42));
-        recovery.started(secs(47));
-        assert_eq!(recovery.step(secs(91), RecoveryTray::Replacement(42), false, false, false), Recovery::Wait);
+        let tray = RecoveryTray::Explorer(42);
+        assert_eq!(recovery.step(secs(0), tray, false, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(44), tray, false, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(45), tray, false, false), Recovery::Restart(42));
+        assert_eq!(recovery.step(secs(46), tray, false, false), Recovery::Wait);
     }
 
     #[test]
     fn recovery_retries_the_forwarded_explorer_and_preserves_active_copies() {
         let mut recovery = ExplorerRecovery::default();
         recovery.started(secs(0));
-        let actual_owner = RecoveryTray::Replacement(54);
-        assert_eq!(recovery.step(secs(1), RecoveryTray::Missing, false, true, false), Recovery::Wait);
-        assert_eq!(recovery.step(secs(40), actual_owner, false, true, false), Recovery::Wait);
-        assert_eq!(recovery.step(secs(45), actual_owner, false, true, true), Recovery::Wait);
-        assert_eq!(recovery.step(secs(46), actual_owner, false, true, false), Recovery::Restart(54));
+        assert_eq!(recovery.step(secs(1), RecoveryTray::Missing, false, true), Recovery::Wait);
+        let actual_owner = RecoveryTray::Explorer(54);
+        assert_eq!(recovery.step(secs(2), actual_owner, false, true), Recovery::Wait);
+        assert_eq!(recovery.step(secs(46), actual_owner, false, true), Recovery::Wait);
+        assert_eq!(recovery.step(secs(47), actual_owner, false, true), Recovery::Restart(54));
+        let facts = DesktopFacts { explorer_owner: Some(54), file_operations: true, ..DesktopFacts::default() };
+        assert_eq!(recover_desktop(facts), DesktopAction::WaitForCopy);
+    }
+
+    #[test]
+    fn recovery_warns_after_retirement_attempts_are_exhausted() {
+        let mut facts = DesktopFacts {
+            exit: ExitState::Posted, original_alive: true, tray_gone_grace_elapsed: true,
+            ..DesktopFacts::default()
+        };
+        assert_eq!(recover_desktop(facts), DesktopAction::StopRetiringExplorer);
+        facts.retirement_attempts = RETIRING_EXPLORER_ATTEMPTS;
+        assert_eq!(recover_desktop(facts), DesktopAction::NeedsSignOut);
+        facts.original_alive = false;
+        assert_eq!(recover_desktop(facts), DesktopAction::Restore);
+    }
+
+    #[test]
+    fn recovery_can_retry_an_explorer_that_windows_launched() {
+        let mut recovery = ExplorerRecovery::default();
+        let windows_owner = RecoveryTray::Explorer(54);
+        assert_eq!(recovery.step(secs(0), windows_owner, false, true), Recovery::Wait);
+        assert_eq!(recovery.step(secs(44), windows_owner, false, true), Recovery::Wait);
+        assert_eq!(recovery.step(secs(45), windows_owner, false, true), Recovery::Restart(54));
+        let facts = DesktopFacts {
+            exit: ExitState::Posted, original_alive: true, explorer_owner: Some(54),
+            ..DesktopFacts::default()
+        };
+        assert_eq!(recover_desktop(facts), DesktopAction::Restore);
+    }
+
+    #[test]
+    fn late_folder_recovery_uses_the_desktop_at_the_time_of_reopen() {
+        let mut facts = DesktopFacts {
+            exit: ExitState::Posted, original_alive: true, explorer_ready: Some(54),
+            ..DesktopFacts::default()
+        };
+        assert_eq!(recover_desktop(facts), DesktopAction::Ready { pid: 54, retiring: true });
+        facts.original_alive = false;
+        facts.explorer_ready = None;
+        assert_eq!(recover_desktop(facts), DesktopAction::Restore);
+        facts.explorust_ready = Some(72);
+        facts.file_operations = true;
+        assert_eq!(recover_desktop(facts), DesktopAction::WaitForCopy);
+        facts.file_operations = false;
+        assert_eq!(recover_desktop(facts), DesktopAction::Ready { pid: 72, retiring: false });
     }
 
     #[test]
     fn recovery_does_not_restart_an_unrelated_tray() {
         let mut recovery = ExplorerRecovery::default();
         recovery.started(secs(0));
-        assert_eq!(recovery.step(secs(45), RecoveryTray::Other, false, false, false), Recovery::Exhausted);
+        assert_eq!(recovery.step(secs(45), RecoveryTray::Other, false, false), Recovery::Exhausted);
     }
 
     fn secs(n: u64) -> Duration {

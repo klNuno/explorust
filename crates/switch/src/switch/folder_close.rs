@@ -11,7 +11,6 @@ use guard::switch_events::{SWITCH_EXE, switch_event};
 use guard::{account, install, log, reopen, taskbar};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetPropW, MSG, PM_NOREMOVE, PeekMessageW, RemovePropW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
     SendMessageCallbackW, SendMessageTimeoutW, SetPropW, WM_CLOSE, WM_NULL,
@@ -132,6 +131,7 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     }
     // Track the original HWND through rollback. An acknowledgment from its message pump
     // cannot confirm destruction or that Explorer has abandoned the request.
+    let started = Instant::now();
     loop {
         if signals.completed.signalled() {
             return Ok(());
@@ -143,9 +143,13 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
             Close::Destroyed => break,
             Close::Pending => {}
         }
+        if started.elapsed() >= guard::policy::DESKTOP_OBSERVE_LIMIT {
+            return Err(format!("Explorer folder HWND {hwnd:#x} did not close"));
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     settled.signal()?;
+    let started = Instant::now();
     loop {
         if signals.completed.signalled() {
             return Ok(());
@@ -155,6 +159,9 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
         {
             return reopen_after_rollback(&folder.path);
         }
+        if started.elapsed() >= guard::policy::DESKTOP_OBSERVE_LIMIT {
+            return Err(format!("no desktop became ready to reopen {}", folder.path));
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -162,7 +169,8 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
 unsafe extern "system" fn acknowledged(_: HWND, _: u32, _: usize, _: LRESULT) {}
 
 fn reopen_after_rollback(path: &str) -> Result<(), String> {
-    let _recovery = install::recovery_lock_for(INFINITE)?;
+    let _recovery = install::recovery_lock_for(guard::policy::DESKTOP_OBSERVE_LIMIT.as_millis() as u32)?;
+    guard::desktop_recovery::ensure_desktop(&install::dir().join("explorust.exe"))?;
     reopen_in_current_shell(path)
 }
 

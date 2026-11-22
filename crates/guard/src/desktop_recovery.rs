@@ -22,18 +22,44 @@ pub struct RestoredDesktop {
 
 pub fn restore_desktop(
     installed_shell: &Path,
+    exit: Option<ExplorerExit<'_>>,
+) -> Result<RestoredDesktop, String> {
+    recover(installed_shell, exit, false)
+}
+
+pub fn ensure_desktop(installed_shell: &Path) -> Result<RestoredDesktop, String> {
+    recover(installed_shell, None, true)
+}
+
+pub fn show_sign_out_notice() {
+    let _ = std::thread::Builder::new().name("desktop-recovery-notice".into()).spawn(|| {
+        use crate::ui::{self, Icon, tr};
+        ui::tell(
+            Icon::Warning,
+            tr("La barre des tâches de Windows ne répond pas", "The Windows taskbar is not responding"),
+            tr("Fermez la session et rouvrez-la pour retrouver le bureau.",
+                "Sign out and sign in again to restore the desktop."),
+            None,
+        );
+    });
+}
+
+fn recover(
+    installed_shell: &Path,
     mut exit: Option<ExplorerExit<'_>>,
+    accept_explorust: bool,
 ) -> Result<RestoredDesktop, String> {
     let started = Instant::now();
-    let keep_trying = exit.is_some();
     let mut recovery = ExplorerRecovery::default();
     let mut requested = false;
     let mut launch: Option<Child> = None;
-    let mut replacement: Option<Child> = None;
+    let mut observed: Option<Child> = None;
     let mut last_error = None;
     let mut orphan: Option<(u32, Instant)> = None;
     let mut watching_original = false;
     let mut original_missing_since = None;
+    let mut termination_attempts = 0;
+    let mut last_termination: Option<Instant> = None;
     loop {
         let state = exit.as_ref().map_or(ExitState::Unsent, |exit| exit.state);
         let original = exit.as_ref().filter(|exit| !exit.process.ended());
@@ -50,15 +76,34 @@ pub fn restore_desktop(
             && original_tray == OriginalTray::Missing && !file_operations
         {
             original_missing_since.get_or_insert_with(Instant::now).elapsed() >= RETIRING_EXPLORER_GRACE
+                && last_termination.is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
         } else {
             original_missing_since = None;
             false
         };
         let available = (retiring.is_none())
             .then(|| Event::open_for_signal(supervise::FALLBACK_EVENT).ok()).flatten();
-        let shell_window_owner = taskbar::explorust_shell_window(installed_shell);
-        let shell_tray_owner = taskbar::explorust(installed_shell);
-        match shell_window_owner.or(shell_tray_owner) {
+        let desktop_owner = taskbar::desktop_owner();
+        let explorer_owner = desktop_owner.filter(|&pid| Some(pid) != retiring && taskbar::is_explorer(pid));
+        let explorust_owner = desktop_owner.filter(|&pid| {
+            taskbar::image_path(pid).is_some_and(|path| path.eq_ignore_ascii_case(&installed_shell.to_string_lossy()))
+        });
+        let tray = explorer_owner.map_or_else(
+            || if desktop_owner.is_none() { RecoveryTray::Missing } else { RecoveryTray::Other },
+            RecoveryTray::Explorer,
+        );
+        if observed.as_ref().is_some_and(Child::ended) || observed.as_ref().map(|child| child.pid) != explorer_owner {
+            observed = explorer_owner.and_then(|pid| Child::monitor(pid).ok());
+        }
+        let responsive = |owner: Option<u32>| {
+            owner.filter(|&pid| taskbar::tray_for(pid).is_some_and(|window| {
+                taskbar::answers(window, Duration::from_millis(500))
+                    && taskbar::desktop_owner() == Some(pid)
+                    && taskbar::tray_for(pid) == Some(window)
+                    && !taskbar::explorer_file_operations()
+            }))
+        };
+        match explorust_owner {
             Some(pid) if available.is_none() => {
                 if orphan.is_none_or(|(owner, _)| owner != pid) {
                     orphan = Some((pid, Instant::now()));
@@ -72,13 +117,23 @@ pub fn restore_desktop(
             original_tray,
             tray_gone_grace_elapsed,
             file_operations,
-            explorer_ready: taskbar::explorer_except(retiring),
+            explorer_ready: responsive(explorer_owner),
+            explorer_owner,
+            explorust_ready: if accept_explorust { responsive(explorust_owner) } else { None },
+            recovery_expired: started.elapsed() >= policy::DESKTOP_RECOVERY_LIMIT,
+            retirement_attempts: termination_attempts,
             supervisor_available: available.is_some(),
-            shell_window_owner,
-            shell_tray_owner,
+            explorust_owner,
             adoption_elapsed: orphan.is_some_and(|(_, since)| since.elapsed() >= Duration::from_secs(3)),
         });
         match decision {
+            DesktopAction::NeedsSignOut => {
+                return Err(last_error.unwrap_or_else(|| "the desktop did not return; sign out and sign in again".into()));
+            }
+            DesktopAction::WaitForCopy => {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
             DesktopAction::WaitForOriginal => {
                 if let Some(exit) = original {
                     if !watching_original {
@@ -101,10 +156,13 @@ pub fn restore_desktop(
                 continue;
             }
             DesktopAction::StopRetiringExplorer => {
-                if let Some(exit) = original
-                    && let Err(error) = stop_retiring_explorer(exit)
-                {
-                    log::line(&format!("restore: {error}"));
+                if let Some(exit) = original {
+                    termination_attempts += 1;
+                    last_termination = Some(Instant::now());
+                    if let Err(error) = stop_retiring_explorer(exit) {
+                        log::line(&format!("restore: {error}"));
+                        last_error = Some(error);
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
@@ -113,7 +171,9 @@ pub fn restore_desktop(
                 if retiring.is_some_and(taskbar::owns_tray) {
                     continue;
                 }
-                let description = if launch.is_some() {
+                let description = if explorust_owner == Some(pid) {
+                    format!("explorust's taskbar answers (pid {pid})")
+                } else if launch.is_some() {
                     format!("replacement Explorer taskbar answers (pid {pid})")
                 } else if requested {
                     format!("the guard brought explorer back (pid {pid})")
@@ -124,13 +184,15 @@ pub fn restore_desktop(
             }
             DesktopAction::RequestFallback => {
                 requested |= available.is_some_and(|event| event.signal().is_ok());
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
             }
             DesktopAction::StopOrphan(pid) => {
                 // An adopting guard may have arrived since the snapshot. Verify the same
                 // installed desktop owner after opening its process and before stopping it.
                 if available.is_none() {
                     match Child::open(pid) {
-                        Ok(child) if recovery_shell_owner(installed_shell) == Some(pid)
+                        Ok(child) if taskbar::desktop_owner() == Some(pid) && !taskbar::explorer_file_operations()
                             && Event::open_for_signal(supervise::FALLBACK_EVENT).is_err() => {
                             log::line(&format!("restore: stopping orphaned explorust desktop pid {pid}"));
                             child.kill();
@@ -139,65 +201,40 @@ pub fn restore_desktop(
                         _ => {}
                     }
                 }
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
             }
-            DesktopAction::WaitForAdoption | DesktopAction::Restore => {}
+            DesktopAction::WaitForAdoption => {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            DesktopAction::Restore => {}
         }
 
-        // Explorer can hand the launch to an existing process. Only consider an actual
-        // Windows Explorer tray that appeared after we started a recovery launch.
-        let owner = if launch.is_some() {
-            taskbar::explorer_window_except(retiring).map(|(_, pid)| pid)
-        } else {
-            None
-        };
-        if replacement.as_ref().is_some_and(Child::ended)
-            || replacement.as_ref().map(|child| child.pid) != owner
-        {
-            replacement = owner.and_then(|pid| Child::monitor(pid).ok());
-        }
-        let tray = taskbar::recovery_tray(replacement.as_ref().map(|child| child.pid));
-        let blocked = decision != DesktopAction::Restore;
-        match recovery.step(started.elapsed(), tray, blocked, launch.as_ref().is_none_or(Child::ended), file_operations) {
-            Recovery::Exhausted if keep_trying => {
-                if !blocked && tray != RecoveryTray::Other {
-                    // Keep the launcher handle so the next attempt can stop its hung process.
-                    recovery = ExplorerRecovery::default();
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-            Recovery::Exhausted if matches!(decision, DesktopAction::WaitForAdoption | DesktopAction::StopOrphan(_)) => {
-                // A guard can vanish at the end of a launch window. Complete the adoption
-                // grace and re-evaluate the resulting desktop before exhausting the budget.
-                recovery = ExplorerRecovery::default();
-                std::thread::sleep(Duration::from_secs(1));
-            }
+        match recovery.step(started.elapsed(), tray, false, launch.as_ref().is_none_or(Child::ended)) {
             Recovery::Exhausted => {
                 return Err(last_error.unwrap_or_else(|| "Explorer recovery ended without an answering taskbar".into()));
             }
             Recovery::Restart(pid) => {
-                if let Some(child) = replacement.as_ref().filter(|child| child.pid == pid)
+                if let Some(child) = observed.as_ref().filter(|child| child.pid == pid)
                     && let Err(error) = stop_hung_replacement(child)
                 {
                     log::line(&format!("restore: {error}"));
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
-            Recovery::Start if !taskbar::any() && recovery_shell_owner(installed_shell).is_none() => {
+            Recovery::Start if taskbar::desktop_owner().is_none() && !taskbar::explorer_file_operations() => {
                 if install::elevated() {
                     return Err("no shell runs: start explorer.exe from Task Manager".into());
                 }
                 if let Some(child) = &launch {
                     if !child.ended() {
-                        if taskbar::any() || taskbar::explorer_file_operations() {
-                            std::thread::sleep(Duration::from_millis(200));
-                            continue;
-                        }
-                        log::line(&format!("restore: stopping unresponsive recovery Explorer pid {}", child.pid));
-                        child.kill();
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
                     }
                     log::line(&format!("restore: retrying after Explorer pid {} did not produce an answering taskbar", child.pid));
                 }
-                if taskbar::any() || recovery_shell_owner(installed_shell).is_some() {
+                if taskbar::desktop_owner().is_some() || taskbar::explorer_file_operations() {
                     continue;
                 }
                 launch = match Child::spawn(&supervise::explorer_path(), "") {
@@ -220,14 +257,10 @@ pub fn restore_desktop(
     }
 }
 
-fn recovery_shell_owner(exe: &Path) -> Option<u32> {
-    taskbar::explorust_shell_window(exe).or_else(|| taskbar::explorust(exe))
-}
-
 fn stop_retiring_explorer(exit: &ExplorerExit<'_>) -> Result<(), String> {
     let pid = exit.process.pid;
     let child = Child::open(pid)?;
-    if taskbar::explorer_except(Some(pid)).is_some()
+    if taskbar::desktop_owner().is_some_and(|owner| owner != pid)
         || taskbar::explorer_file_operations()
         || taskbar::owns_tray(pid)
         || exit.process.ended()
@@ -245,20 +278,19 @@ fn stop_retiring_explorer(exit: &ExplorerExit<'_>) -> Result<(), String> {
 
 fn stop_hung_replacement(process: &Child) -> Result<(), String> {
     let pid = process.pid;
-    let Some(window) = taskbar::explorer_window_for(pid) else {
-        return Ok(());
-    };
+    let window = taskbar::explorer_window_for(pid);
     let child = Child::open(pid)?;
-    if taskbar::answers(window, policy::ANSWER_WITHIN)
+    if window.is_some_and(|hwnd| taskbar::answers(hwnd, policy::ANSWER_WITHIN))
         || taskbar::explorer_file_operations()
-        || taskbar::explorer_window_for(pid) != Some(window)
-        || taskbar::recovery_tray(Some(pid)) != RecoveryTray::Replacement(pid)
+        || !taskbar::is_explorer(pid)
+        || taskbar::desktop_owner() != Some(pid)
+        || taskbar::explorer_window_for(pid) != window
         || process.ended()
     {
         return Ok(());
     }
-    // SAFETY: the saved process and taskbar identities still match. The taskbar did not answer
-    // its bounded probe and no Explorer file operation is active on the desktop.
+    // SAFETY: the saved process is still the verified desktop owner. Its tray is absent or
+    // unresponsive and no Explorer file operation is active.
     unsafe { TerminateProcess(child.handle, 1) }
         .map_err(|e| format!("could not stop unresponsive replacement Explorer pid {pid}: {e}"))?;
     log::line(&format!("restore: stopped unresponsive replacement Explorer pid {pid}"));

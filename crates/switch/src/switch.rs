@@ -122,16 +122,19 @@ fn show(result: Result<Outcome, String>) -> u32 {
         ),
         Err(e) => {
             log::line(&format!("switch: {e}"));
+            let content = if e == watcher::sign_out_message() {
+                tr("La barre des tâches n’est pas revenue. Fermez la session et rouvrez-la.",
+                    "The taskbar did not return. Sign out and sign in again.")
+            } else {
+                tr("Consultez le journal pour en savoir plus.", "See the log for details.")
+            };
             ui::tell(
                 Icon::Warning,
                 tr(
                     "Impossible de passer à explorust",
                     "Could not switch to explorust",
                 ),
-                tr(
-                    "Consultez le journal pour en savoir plus.",
-                    "See the log for details.",
-                ),
+                content,
                 Some(&details),
             );
             return 1;
@@ -198,12 +201,15 @@ fn switch(
         Err(e) => {
             log::line(&format!("switch: {e}"));
             if let Err(e) = watcher.restore() {
+                if watcher.observing() {
+                    return Err(e);
+                }
                 if !watcher.committed() {
                     return Err("the switch stopped while preparing Explorer".into());
                 }
                 log::line(&format!("switch: {e}; restoring Windows directly"));
-                let late_folders = watcher.recover(exe, &explorer_process)?;
                 drop(lock);
+                let late_folders = watcher.recover(exe, &explorer_process)?;
                 if let Some(folders) = late_folders {
                     watcher::restore_late_folders(&explorer_process, &folders)?;
                 }

@@ -4,8 +4,8 @@ use super::{
     explorer, folder_close, prepare_lock,
     reopen_list::{self, Folder},
 };
-use guard::desktop_recovery::{ExplorerExit, restore_desktop};
-use guard::policy::{ANSWER_WITHIN, ExitState};
+use guard::desktop_recovery::{ExplorerExit, ensure_desktop, restore_desktop, show_sign_out_notice};
+use guard::policy::{ANSWER_WITHIN, DESKTOP_OBSERVE_LIMIT, DESKTOP_RECOVERY_LIMIT, ExitState};
 use guard::proc::{Child, Event, wait_any};
 use guard::switch_events::{CANCEL_FOR_RESTORE, EXITING_EXPLORER, SWITCH_EXE, switch_event};
 use guard::{account, install, log, reopen, taskbar, ui};
@@ -13,12 +13,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::System::Threading::INFINITE;
 
 const PREPARE_BUDGET: Duration = Duration::from_secs(15);
 const RESTORED: u32 = 2;
 const POSTPONED: u32 = 3;
 const FAILED: u32 = 1;
+const RECOVERY_WAIT_MS: u32 = (DESKTOP_RECOVERY_LIMIT.as_millis() as u32 + 15_000) * 2;
 
 pub(super) struct Signals {
     prepared: Event,
@@ -34,6 +34,7 @@ pub(super) struct Signals {
     pub(super) completed: Event,
     pub(super) rollback: Event,
     pub(super) windows_ready: Event,
+    stalled: Event,
 }
 
 impl Signals {
@@ -53,6 +54,7 @@ impl Signals {
             completed: get("completed")?,
             rollback: get("rollback")?,
             windows_ready: get("windows-ready")?,
+            stalled: get("recovery-stalled")?,
         })
     }
 
@@ -157,10 +159,11 @@ impl Watcher {
                     log::line(&format!("switch: {error}"));
                 }
             }
-            match wait_any(&[self.signals.exited.0, self.child.handle, self.signals.windows_ready.0], None) {
+            match wait_any(&[self.signals.exited.0, self.child.handle, self.signals.windows_ready.0, self.signals.stalled.0], Some(RECOVERY_WAIT_MS)) {
                 Some(0) if !self.child.ended() => return Ok(Desktop::Vacated),
                 Some(2) if result == Ok(true) => return Ok(Desktop::Restored),
-                Some(2) => { wait_any(&[self.child.handle], None); }
+                Some(2) => { wait_any(&[self.child.handle], Some(1_000)); }
+                Some(3) => return Err(sign_out_message()),
                 _ => {}
             }
         }
@@ -185,10 +188,12 @@ impl Watcher {
 
     pub fn restore(&self) -> Result<(), String> {
         self.signals.rollback.signal()?;
-        let timeout = (!self.committed).then_some(1_000);
-        let status = wait_any(&[self.signals.windows_ready.0, self.child.handle], timeout);
+        let timeout = if self.committed { RECOVERY_WAIT_MS } else { 1_000 };
+        let status = wait_any(&[self.signals.windows_ready.0, self.child.handle, self.signals.stalled.0], Some(timeout));
         if status == Some(0) || self.child.exit_code() == RESTORED {
             Ok(())
+        } else if status == Some(2) {
+            Err(sign_out_message())
         } else {
             Err("the independent switch watcher could not restore Windows".into())
         }
@@ -198,11 +203,24 @@ impl Watcher {
         self.committed
     }
 
+    pub fn observing(&self) -> bool {
+        self.signals.stalled.signalled() && !self.child.ended()
+    }
+
     pub fn recover(&mut self, exe: &Path, original: &Child) -> Result<Option<Vec<Folder>>, String> {
-        let _lock = install::recovery_lock_for(INFINITE)?;
+        let lock = install::recovery_lock_for(0)?;
         let folders = read_snapshot(self.stamp).unwrap_or_else(|_| std::mem::take(&mut self.folders));
-        let track = recover(self.stamp, &self.signals, exe, original, &folders)?;
-        Ok(track.then_some(folders))
+        let result = recover(self.stamp, &self.signals, exe, original, &folders);
+        drop(lock);
+        match result {
+            Ok(track) => Ok(track.then_some(folders)),
+            Err(error) => {
+                log::line(&format!("switch: {error}"));
+                show_sign_out_notice();
+                watch_stalled_recovery(original, &folders)?;
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -257,6 +275,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         return Err("Explorer changed before the switch was prepared".into());
     }
     let signals = Signals::open(stamp)?;
+    let _cancel_for_restore = Event::named(CANCEL_FOR_RESTORE)?;
     let retiring = Child::monitor(explorer_pid)?;
     log::line(&format!("switch: watcher reading Explorer folders for switch pid {owner}"));
     let snapshot = snapshot_path(stamp);
@@ -266,7 +285,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         folders.len()
     ));
     signals.prepared.signal()?;
-    if wait_any(&[owner_process.handle, signals.rollback.0, signals.prepare_exit.0], None) != Some(2) {
+    if wait_any(&[owner_process.handle, signals.rollback.0, signals.prepare_exit.0], Some(PREPARE_BUDGET.as_millis() as u32)) != Some(2) {
         clear_snapshot(stamp);
         let _ = std::fs::remove_file(snapshot);
         return Ok(0);
@@ -310,7 +329,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         })?;
     };
     signals.close_ready.signal()?;
-    if wait_any(&[owner_process.handle, signals.rollback.0, signals.exit.0], None) != Some(2) {
+    if wait_any(&[owner_process.handle, signals.rollback.0, signals.exit.0], Some(PREPARE_BUDGET.as_millis() as u32)) != Some(2) {
         clear_snapshot(stamp);
         let _ = std::fs::remove_file(&snapshot);
         return Ok(0);
@@ -326,7 +345,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         reopen::save(&log::dir(), stamp, &paths).map_err(|e| format!("save Files handoff: {e}"))?;
         signals.post_desktop.signal()?;
         let events = [signals.exiting.0, signals.exit_cancelled.0, owner_process.handle, signals.rollback.0];
-        match wait_any(&events, None) {
+        match wait_any(&events, Some(PREPARE_BUDGET.as_millis() as u32)) {
             Some(0) => {
                 log::line(&format!("switch: requested Exit Explorer for pid {explorer_pid}"));
                 let started = Instant::now();
@@ -364,9 +383,22 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
     }
     signals.rollback.signal()?;
     let owner_lost = owner_process.ended();
-    let track = recover(stamp, &signals, &installed.join("explorust.exe"), &retiring, &folders)?;
+    let outcome = recover(stamp, &signals, &installed.join("explorust.exe"), &retiring, &folders);
     drop(exiting);
     drop(recovery);
+    let track = match outcome {
+        Ok(track) => track,
+        Err(error) => {
+            log::line(&format!("switch: {error}"));
+            signals.stalled.signal()?;
+            if owner_lost {
+                show_sign_out_notice();
+            }
+            watch_stalled_recovery(&retiring, &folders)?;
+            signals.windows_ready.signal()?;
+            return Ok(RESTORED);
+        }
+    };
     if track {
         restore_late_folders(&retiring, &folders)?;
     }
@@ -381,6 +413,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
 
 fn wait_for_original_exit(original: &Child, owner: &Child, signals: &Signals) -> Result<(), String> {
     let events = [original.handle, owner.handle, signals.rollback.0];
+    let started = Instant::now();
     let mut missing_since = None;
     loop {
         if Event::is_signalled(CANCEL_FOR_RESTORE) {
@@ -390,6 +423,9 @@ fn wait_for_original_exit(original: &Child, owner: &Child, signals: &Signals) ->
             Some(0) => return Ok(()),
             Some(_) => return Err("the switch ended while Explorer's exit was pending".into()),
             None => {}
+        }
+        if started.elapsed() >= DESKTOP_RECOVERY_LIMIT {
+            return Err("Explorer did not exit within the handoff budget".into());
         }
         if taskbar::owns_tray(original.pid) {
             missing_since = None;
@@ -480,9 +516,6 @@ fn recover(
     folders: &[Folder],
 ) -> Result<bool, String> {
     clear_snapshot(stamp);
-    if signals.windows_ready.signalled() {
-        return Ok(false);
-    }
     let state = signals.desktop_exit();
     let exiting = Event::named(EXITING_EXPLORER)?;
     if state.pending() {
@@ -524,12 +557,27 @@ fn recover(
 
 pub(super) fn restore_late_folders(original: &Child, folders: &[Folder]) -> Result<(), String> {
     log::line(&format!("switch: Windows is back while Explorer pid {} is still exiting", original.pid));
-    wait_any(&[original.handle], None);
-    let _recovery = install::recovery_lock_for(INFINITE)?;
+    watch_stalled_recovery(original, folders)
+}
+
+fn watch_stalled_recovery(original: &Child, folders: &[Folder]) -> Result<(), String> {
+    let watch = Instant::now();
+    let limit = DESKTOP_OBSERVE_LIMIT.as_millis() as u32;
+    if !original.ended() && wait_any(&[original.handle], Some(limit)).is_none() {
+        return Err(sign_out_message());
+    }
+    let remaining = DESKTOP_OBSERVE_LIMIT.saturating_sub(watch.elapsed());
+    let _recovery = install::recovery_lock_for(remaining.as_millis() as u32)?;
+    let desktop = ensure_desktop(&install::dir().join("explorust.exe"))?;
+    log::line(&format!("switch: rechecked the desktop after Explorer pid {} exited: {}", original.pid, desktop.description));
     for folder in folders.iter().filter(|folder| folder.owner == original.pid) {
         if let Err(error) = folder_close::reopen_in_current_shell(&folder.path) {
             log::line(&format!("switch: {error}"));
         }
     }
     Ok(())
+}
+
+pub(super) fn sign_out_message() -> String {
+    "The Windows desktop did not return. Sign out and sign in again.".into()
 }

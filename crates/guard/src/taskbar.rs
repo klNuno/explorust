@@ -2,7 +2,7 @@
 //! watchdog asks explorust's; the fallback and the uninstall wait for explorer's before they say
 //! Windows is back.
 
-use crate::policy::{ANSWER_WITHIN, Probe, RecoveryTray};
+use crate::policy::{ANSWER_WITHIN, Probe};
 use crate::proc::Child;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -101,14 +101,12 @@ pub fn explorust(exe: &Path) -> Option<u32> {
     })
 }
 
-/// An installed explorust that has registered its desktop can own it before it shows a tray.
-pub fn explorust_shell_window(exe: &Path) -> Option<u32> {
+/// A registered desktop can have an owner before its taskbar appears.
+fn desktop_window_owner() -> Option<u32> {
     let mut pid = 0;
     // SAFETY: only query the PID of the desktop window Windows currently publishes.
     unsafe { GetWindowThreadProcessId(GetShellWindow(), Some(&mut pid)) };
-    image_path(pid)
-        .filter(|path| path.eq_ignore_ascii_case(&exe.to_string_lossy()))
-        .map(|_| pid)
+    (pid != 0).then_some(pid)
 }
 
 pub fn tray_for(pid: u32) -> Option<HWND> {
@@ -124,17 +122,8 @@ pub fn any() -> bool {
     !trays().is_empty()
 }
 
-pub fn recovery_tray(replacement: Option<u32>) -> RecoveryTray {
-    let trays = trays();
-    if trays.is_empty() {
-        RecoveryTray::Missing
-    } else if let Some(pid) = replacement
-        && trays.iter().all(|&(_, owner)| owner == pid)
-    {
-        RecoveryTray::Replacement(pid)
-    } else {
-        RecoveryTray::Other
-    }
+pub fn desktop_owner() -> Option<u32> {
+    desktop_window_owner().or_else(|| trays().first().map(|&(_, pid)| pid))
 }
 
 pub fn explorer_file_operations() -> bool {

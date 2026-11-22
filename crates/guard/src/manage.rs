@@ -25,6 +25,13 @@ fn say(msg: &str) {
 /// `--install`: elevated, the machine part then this user's; not elevated (a dev run), only the
 /// Shell value pointing to this exe.
 pub fn install() -> u32 {
+    let _user = match install::user_setup_lock() {
+        Ok(lock) => lock,
+        Err(e) => {
+            say(&format!("install: {e}"));
+            return BUSY;
+        }
+    };
     let _switch = match install::switch_lock_for(0) {
         Ok(lock) => lock,
         Err(e) => {
@@ -154,14 +161,11 @@ fn restore_user() -> Result<String, String> {
 /// Serializes the user cleanup and return to Explorer with a live handoff.
 pub fn restore_session() -> (Result<String, String>, Result<String, String>) {
     let lock = || {
+        let user = install::user_setup_lock()?;
         let cancel = proc::Event::named(crate::switch_events::CANCEL_FOR_RESTORE)?;
         cancel.signal()?;
-        say("restore: requested Windows desktop and waiting for pending handoffs");
-        let locks = crate::policy::lock_for_restore(
-            install::switch_lock_for,
-            install::recovery_lock_for,
-        )?;
-        Ok((cancel, locks))
+        say("restore: requested Windows desktop");
+        Ok((user, cancel))
     };
     let _locks = match lock() {
         Ok(lock) => lock,
@@ -169,7 +173,10 @@ pub fn restore_session() -> (Result<String, String>, Result<String, String>) {
     };
     let user = restore_user();
     let back = if user.is_ok() {
-        bring_back_explorer()
+        match crate::policy::try_restore_locks(install::switch_lock_for, install::recovery_lock_for) {
+            Ok(_locks) => bring_back_explorer(),
+            Err(e) => Err(format!("desktop recovery is already in progress: {e}")),
+        }
     } else {
         Err("not tried".into())
     };
@@ -248,7 +255,12 @@ pub fn restore_machine(session_sid: Option<&str>) -> Result<bool, String> {
 /// the machine when elevated. 0 only when every step worked.
 pub fn restore() -> u32 {
     let mine = !install::elevated() || account::is_session_user();
-    let (user, back) = if mine { restore_session() } else { (Ok(String::new()), bring_back_explorer()) };
+    let (user, back) = if mine {
+        restore_session()
+    } else {
+        let back = install::recovery_lock_for(0).and_then(|_lock| bring_back_explorer());
+        (Ok(String::new()), back)
+    };
     // Only once the shell is off for good and explorer answers: the package is explorust's.
     if mine && user.is_ok() && back.is_ok() {
         remove_package();

@@ -196,7 +196,7 @@ fn clean_leftovers(to: &Path) {
     }
 }
 
-/// One installer or uninstaller at a time on this machine; released on drop.
+/// A named mutex owned by this thread, released on drop.
 pub struct Lock(HANDLE);
 
 impl Drop for Lock {
@@ -211,6 +211,10 @@ impl Drop for Lock {
 
 pub fn lock() -> Result<Lock, String> {
     named_lock(r"Global\explorust-setup", 0, "another explorust install or uninstall is running")
+}
+
+pub fn user_setup_lock() -> Result<Lock, String> {
+    named_lock(r"Local\explorust-user-setup", 0, "another explorust install or uninstall is running in this session")
 }
 
 pub fn switch_lock_for(timeout_ms: u32) -> Result<Lock, String> {
