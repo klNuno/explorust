@@ -5,10 +5,10 @@
 //! refuses: that account's settings would change instead of the signed-in user's.
 
 use crate::ui::{self, Icon, tr};
-use crate::launch_timing::{FALLBACK_EVENT, RELOAD_EVENT, reload_preserves_files_event};
+use crate::launch_timing::{FALLBACK_EVENT, RELOAD_EVENT, build_verdict_event, reload_preserves_files_event};
 use crate::manage::OTHER_ACCOUNT;
 use crate::proc::Event;
-use crate::setup_mode::{self, Mode};
+use crate::setup_mode::{self, Mode, Restart, RestartProgress};
 use crate::{account, install, log, taskbar};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -124,12 +124,6 @@ fn install_mode(exe: &Path) -> Mode {
     setup_mode::choose(installed, shell, reload, guarded, preserves_files)
 }
 
-enum Restart {
-    Updated,
-    Windows,
-    Unconfirmed,
-}
-
 fn finish_live_update(exe: &Path, pid: u32) -> u32 {
     let result = ui::working(
         tr("Redémarrage d'explorust", "Restarting explorust"),
@@ -141,17 +135,26 @@ fn finish_live_update(exe: &Path, pid: u32) -> u32 {
     );
     let details = log::dir().join("guard.log").display().to_string();
     match result {
-        Restart::Updated => ui::tell(
+        Restart::Updated(_) => ui::tell(
             Icon::Info,
             tr("explorust est à jour", "explorust is up to date"),
             tr("La nouvelle version est déjà en cours d'exécution.", "The new version is already running."),
             None,
         ),
-        Restart::Windows => ui::tell(
+        Restart::Windows(_) => ui::tell(
             Icon::Warning,
             tr("Windows a repris la main", "Windows took over"),
             tr("La nouvelle version a été installée. Le journal indique pourquoi explorust s'est arrêté.", "The new version was installed. See the log for why explorust stopped."),
             Some(&details),
+        ),
+        Restart::Deferred => ui::tell(
+            Icon::Info,
+            tr("Redémarrage d'explorust en attente", "explorust restart pending"),
+            tr(
+                "La nouvelle version a été installée. explorust redémarrera une fois les opérations de fichiers en cours terminées.",
+                "The new version was installed. explorust will restart when the current file operations finish.",
+            ),
+            None,
         ),
         Restart::Unconfirmed => ui::tell(
             Icon::Warning,
@@ -178,29 +181,50 @@ fn reload(exe: &Path, original: u32) -> Restart {
     } else {
         log::line("setup: explorust's taskbar disappeared during installation");
     }
-    if taskbar::explorer().is_some() { Restart::Windows } else { Restart::Unconfirmed }
+    taskbar::explorer().map_or(Restart::Unconfirmed, Restart::Windows)
 }
 
 fn wait_for_restart(exe: &Path, previous: u32) -> Restart {
-    let mut last_old_tray = Instant::now();
+    let started = Instant::now();
+    let mut last_tray = started;
     loop {
-        if taskbar::owns_tray(previous) {
-            // While Files drains, the old shell still serves its taskbar.
-            last_old_tray = Instant::now();
-        } else if let Some(pid) = taskbar::explorust(exe)
-            && pid != previous && taskbar::probe(pid) == crate::policy::Probe::Answered
-        {
-            log::line(&format!("setup: new explorust pid {pid} owns an answering taskbar (was {previous})"));
-            return Restart::Updated;
+        let progress = restart_progress(exe, previous);
+        let now = Instant::now();
+        if progress != RestartProgress::Missing {
+            last_tray = now;
         }
-        if let Some(pid) = taskbar::explorer() {
-            log::line(&format!("setup: Windows took over (explorer pid {pid})"));
-            return Restart::Windows;
-        }
-        if last_old_tray.elapsed() >= Duration::from_secs(60) {
-            log::line("setup: no answering replacement taskbar within 60 s");
-            return Restart::Unconfirmed;
+        let elapsed = now.duration_since(started);
+        if let Some(outcome) = setup_mode::restart_outcome(progress, elapsed, now.duration_since(last_tray)) {
+            match outcome {
+                Restart::Updated(pid) => log::line(&format!("setup: new explorust pid {pid} passed the build verdict and owns an answering taskbar (was {previous})")),
+                Restart::Windows(pid) => log::line(&format!("setup: Windows took over (explorer pid {pid})")),
+                Restart::Deferred => log::line(&format!("setup: reload still pending after {} s with the original shell pid {previous}", elapsed.as_secs())),
+                Restart::Unconfirmed => log::line(&format!("setup: restart could not be confirmed within {} s", elapsed.as_secs())),
+            }
+            return outcome;
         }
         std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn restart_progress(exe: &Path, previous: u32) -> RestartProgress {
+    if let Some(pid) = taskbar::explorer() {
+        return RestartProgress::Windows(pid);
+    }
+    if Event::is_signalled(FALLBACK_EVENT) {
+        return RestartProgress::Missing;
+    }
+    if taskbar::owns_tray(previous) {
+        return RestartProgress::OldShell;
+    }
+    let Some(pid) = taskbar::explorust(exe).filter(|&pid| pid != previous) else {
+        return RestartProgress::Missing;
+    };
+    if Event::is_signalled(&build_verdict_event(pid)) && taskbar::probe(pid) == crate::policy::Probe::Answered
+        && !Event::is_signalled(FALLBACK_EVENT)
+    {
+        RestartProgress::Verified(pid)
+    } else {
+        RestartProgress::Starting
     }
 }

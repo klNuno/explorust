@@ -210,11 +210,19 @@ fn shell(args: &Args) -> i32 {
     if let Some(code) = exits.requested(0) {
         return code;
     }
-    if let Some(phases) = &phases {
-        signal(&phases.verified, "build verdict");
-    } else if !legacy_ready_sent {
+    if phases.is_none() && !legacy_ready_sent {
         signal_legacy_ready(args.ready_event.as_deref());
     }
+    let verdict_signalled = phases.as_ref().is_none_or(|phases| signal(&phases.verified, "build verdict"));
+    // Publish the same verdict for setup even when the running guard uses the legacy protocol.
+    let _setup_verdict = if args.guard.is_some() && verdict_signalled {
+        events::Owned::create(&launch_timing::build_verdict_event(std::process::id()))
+            .inspect(|event| { signal(event, "setup build verdict"); })
+            .inspect_err(|error| log::line(&format!("setup build verdict: {error}")))
+            .ok()
+    } else {
+        None
+    };
     loop {
         if let Some(code) = exits.requested(250) {
             return code;
@@ -238,10 +246,8 @@ fn signal_legacy_ready(name: Option<&str>) -> bool {
     }
 }
 
-fn signal(event: &events::Owned, phase: &str) {
-    if let Err(e) = event.signal() {
-        log::line(&format!("{phase} event: {e}"));
-    }
+fn signal(event: &events::Owned, phase: &str) -> bool {
+    event.signal().inspect_err(|e| log::line(&format!("{phase} event: {e}"))).is_ok()
 }
 
 struct ExitRequests {
