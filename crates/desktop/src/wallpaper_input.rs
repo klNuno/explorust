@@ -1,11 +1,13 @@
 //! Keep wallpaper input intact while giving the desktop its blank-area right click.
 
 use super::folder_view;
-use std::cell::Cell;
+use crate::click_activation::ClickActivation;
+use std::cell::{Cell, OnceCell};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::Arc;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent};
 use windows::Win32::UI::Controls::{LVIS_SELECTED, LVITEMW, LVM_SETITEMSTATE};
 use windows::Win32::UI::HiDpi::{
@@ -22,12 +24,20 @@ struct Target {
     worker: HWND,
 }
 
-thread_local! {
-    static TARGET: Cell<Option<Target>> = const { Cell::new(None) };
-    static DOWN_ON_WALLPAPER: Cell<bool> = const { Cell::new(false) };
+struct Observer {
+    target: Target,
+    activation: Arc<ClickActivation>,
+    down_on_wallpaper: Cell<Option<POINT>>,
 }
 
-pub struct Hook(Arc<OwnedHandle>);
+thread_local! {
+    static OBSERVER: OnceCell<Observer> = const { OnceCell::new() };
+}
+
+pub struct Hook {
+    stop: Arc<OwnedHandle>,
+    activation: Arc<ClickActivation>,
+}
 
 impl Hook {
     pub fn new(progman: HWND, view: HWND, worker: HWND) -> Result<Self, String> {
@@ -35,6 +45,8 @@ impl Hook {
         let event = unsafe { CreateEventW(None, true, false, None) }.map_err(|e| e.to_string())?;
         let stop = Arc::new(unsafe { OwnedHandle::from_raw_handle(event.0) });
         let shutdown = stop.clone();
+        let activation = Arc::new(ClickActivation::default());
+        let hook_activation = activation.clone();
         let (progman, view, worker) = (progman.0 as usize, view.0 as usize, worker.0 as usize);
         std::thread::Builder::new()
             .name("wallpaper-input".into())
@@ -44,28 +56,49 @@ impl Hook {
                     view: HWND(view as _),
                     worker: HWND(worker as _),
                 };
-                if let Err(e) = observe(target, HANDLE(shutdown.as_raw_handle())) {
+                let observer = Observer {
+                    target,
+                    activation: hook_activation,
+                    down_on_wallpaper: Cell::new(None),
+                };
+                if let Err(e) = observe(observer, HANDLE(shutdown.as_raw_handle())) {
                     crate::log::line(&format!("wallpaper input observation: {e}"));
                 }
             })
             .map_err(|e| e.to_string())?;
-        Ok(Self(stop))
+        Ok(Self { stop, activation })
+    }
+
+    pub fn right_click_activation(&self, lp: LPARAM) -> Option<LRESULT> {
+        let mouse_message = (lp.0 >> 16) as u16 as u32;
+        // Progman can receive click activation after the observer has opened the menu.
+        // The pointer can already be over the popup, so use the original hit from the hook.
+        if matches!(mouse_message, WM_RBUTTONDOWN | WM_NCRBUTTONDOWN)
+            && self
+                .activation
+                .suppresses_activation(unsafe { GetTickCount64() })
+        {
+            return Some(LRESULT(MA_NOACTIVATE as isize));
+        }
+        None
     }
 }
 
 impl Drop for Hook {
     fn drop(&mut self) {
         // The observer owns the hook. The desktop never waits on the hook chain.
-        let _ = unsafe { SetEvent(HANDLE(self.0.as_raw_handle())) };
+        let _ = unsafe { SetEvent(HANDLE(self.stop.as_raw_handle())) };
     }
 }
 
-fn observe(target: Target, stop: HANDLE) -> windows_core::Result<()> {
+fn observe(observer: Observer, stop: HANDLE) -> windows_core::Result<()> {
     // SAFETY: these calls only set up this thread and pump its message queue. The low-level
     // callback runs when the owning thread receives the system's message.
     unsafe {
         let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        TARGET.set(Some(target));
+        OBSERVER.with(|slot| {
+            let _ = slot.set(observer);
+        });
         let mut msg = MSG::default();
         let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
         let hook = SetWindowsHookExW(
@@ -97,19 +130,26 @@ fn observe(target: Target, stop: HANDLE) -> windows_core::Result<()> {
 
 unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let msg = wp.0 as u32;
-    if code == HC_ACTION as i32
-        && matches!(msg, WM_RBUTTONDOWN | WM_RBUTTONUP)
-        && let Some(target) = TARGET.get()
-    {
-        // SAFETY: the low-level hook receives MSLLHOOKSTRUCT in screen coordinates. No COM,
-        // send to a foreign thread, or menu operations are performed in the hook.
-        let pt = unsafe { (*(lp.0 as *const MSLLHOOKSTRUCT)).pt };
-        if msg == WM_RBUTTONDOWN {
-            DOWN_ON_WALLPAPER.set(on_wallpaper(target, pt));
-        }
-        if msg == WM_RBUTTONUP && DOWN_ON_WALLPAPER.replace(false) && on_wallpaper(target, pt) {
-            let _ = unsafe { PostMessageW(Some(target.progman), MSG_RIGHT, WPARAM(0), pack(pt)) };
-        }
+    if code == HC_ACTION as i32 && matches!(msg, WM_RBUTTONDOWN | WM_RBUTTONUP) {
+        OBSERVER.with(|observer| {
+            let Some(observer) = observer.get() else {
+                return;
+            };
+            let target = observer.target;
+            // SAFETY: the low-level hook receives MSLLHOOKSTRUCT in screen coordinates. No COM,
+            // send to a foreign thread, or menu operations are performed in the hook.
+            let pt = unsafe { (*(lp.0 as *const MSLLHOOKSTRUCT)).pt };
+            if msg == WM_RBUTTONDOWN {
+                let down = on_wallpaper(target, pt).then_some(pt);
+                observer.down_on_wallpaper.set(down);
+                observer
+                    .activation
+                    .record_down(down.is_some(), unsafe { GetTickCount64() });
+            } else if observer.down_on_wallpaper.take().is_some() && on_wallpaper(target, pt) {
+                let _ =
+                    unsafe { PostMessageW(Some(target.progman), MSG_RIGHT, WPARAM(0), pack(pt)) };
+            }
+        });
     }
     unsafe { CallNextHookEx(None, code, wp, lp) }
 }
@@ -129,19 +169,6 @@ fn on_wallpaper(target: Target, pt: POINT) -> bool {
                     && hit != target.view
                     && !IsChild(target.view, hit).as_bool()))
     }
-}
-
-pub fn right_click_activation(progman: HWND, view: HWND, worker: HWND, lp: LPARAM) -> Option<LRESULT> {
-    let mouse_message = (lp.0 >> 16) as u16 as u32;
-    if !matches!(mouse_message, WM_RBUTTONDOWN | WM_NCRBUTTONDOWN) {
-        return None;
-    }
-    let mut pt = POINT::default();
-    // SAFETY: GetCursorPos writes to the local point.
-    unsafe { GetCursorPos(&mut pt) }.ok()?;
-    // The wallpaper still gets the click. A click activation of Progman can arrive
-    // after the cross-thread click observer has already opened the desktop menu.
-    on_wallpaper(Target { progman, view, worker }, pt).then_some(LRESULT(MA_NOACTIVATE as isize))
 }
 
 pub fn right_click(progman: HWND, view: HWND, worker: HWND, lp: LPARAM) {

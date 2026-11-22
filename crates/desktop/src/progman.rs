@@ -291,11 +291,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             raise(hwnd, wp, lp);
             Some(LRESULT(0))
         }
-        WM_MOUSEACTIVATE => {
-            let view = defview()?;
-            let worker = with(|s| s.wallpaper_input.as_ref().and(s.workerw)).flatten()?;
-            workerw::input::right_click_activation(hwnd, view, worker, lp)
-        }
+        WM_MOUSEACTIVATE => with(|s| s.wallpaper_input.as_ref()?.right_click_activation(lp)).flatten(),
         workerw::input::MSG_RIGHT => {
             if let (Some(view), Some(worker)) = (defview(), with(|s| s.wallpaper_input.as_ref().and(s.workerw)).flatten()) {
                 workerw::input::right_click(hwnd, view, worker, lp);
