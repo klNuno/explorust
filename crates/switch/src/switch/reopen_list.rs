@@ -1,42 +1,67 @@
 use std::collections::HashSet;
 use std::io;
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct Folder {
+    pub hwnd: isize,
+    pub owner: u32,
+    pub path: String,
+}
+
 /// ShellWindows can enumerate several tabs for one HWND. Keep each window's active folder,
 /// including two different windows that happen to be on the same folder.
-pub fn folders(entries: impl IntoIterator<Item = (isize, String)>) -> Vec<(isize, String)> {
+pub fn folders(entries: impl IntoIterator<Item = Folder>) -> Vec<Folder> {
     let mut seen = HashSet::new();
     entries
         .into_iter()
-        .filter_map(|(hwnd, folder)| {
-            (!folder.is_empty() && !folder.contains('\0') && seen.insert(hwnd))
-                .then_some((hwnd, folder))
+        .filter(|folder| {
+            !folder.path.is_empty() && !folder.path.contains('\0') && seen.insert(folder.hwnd)
         })
         .collect()
 }
 
-pub fn same_windows(saved: &[(isize, String)], observed: impl Iterator<Item = isize>) -> bool {
-    let saved_handles: HashSet<_> = saved.iter().map(|(hwnd, _)| *hwnd).collect();
+pub fn same_windows(saved: &[Folder], observed: impl Iterator<Item = (isize, u32)>) -> bool {
+    let saved_handles: HashSet<_> = saved
+        .iter()
+        .map(|folder| (folder.hwnd, folder.owner))
+        .collect();
     saved_handles == observed.collect()
 }
 
 /// Keep the window identity alongside its parsing name for recovery in either process.
-pub fn encode(entries: &[(isize, String)]) -> String {
+pub fn encode(entries: &[Folder]) -> String {
     use std::fmt::Write;
     let mut snapshot = String::new();
-    for (hwnd, path) in entries {
-        let _ = write!(snapshot, "{hwnd}\0{path}\0");
+    for Folder { hwnd, owner, path } in entries {
+        let _ = write!(snapshot, "{hwnd}\0{owner}\0{path}\0");
     }
     snapshot
 }
 
-pub fn decode(snapshot: &str) -> io::Result<Vec<(isize, String)>> {
+pub fn decode(snapshot: &str) -> io::Result<Vec<Folder>> {
     let mut fields = snapshot.split_terminator('\0');
     let mut entries = Vec::new();
-    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid Explorer folder snapshot");
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Explorer folder snapshot",
+        )
+    };
     while let Some(hwnd) = fields.next() {
         let hwnd = hwnd.parse().map_err(|_| invalid())?;
-        let path = fields.next().filter(|path| !path.is_empty()).ok_or_else(invalid)?;
-        entries.push((hwnd, path.to_owned()));
+        let owner = fields
+            .next()
+            .and_then(|pid| pid.parse().ok())
+            .ok_or_else(invalid)?;
+        let path = fields
+            .next()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(invalid)?;
+        entries.push(Folder {
+            hwnd,
+            owner,
+            path: path.to_owned(),
+        });
     }
     Ok(entries)
 }
@@ -45,12 +70,21 @@ pub fn decode(snapshot: &str) -> io::Result<Vec<(isize, String)>> {
 mod tests {
     use super::*;
 
+    fn folder(hwnd: isize, owner: u32, path: &str) -> Folder {
+        Folder {
+            hwnd,
+            owner,
+            path: path.to_owned(),
+        }
+    }
+
     #[test]
     fn recapture_when_a_folder_window_opens_or_closes() {
-        let saved = [(1, "a".to_owned()), (2, "b".to_owned())];
-        assert!(same_windows(&saved, [2, 1].into_iter()));
-        assert!(!same_windows(&saved, [1, 2, 3].into_iter()));
-        assert!(!same_windows(&saved, [2].into_iter()));
+        let saved = [folder(1, 1, "a"), folder(2, 2, "b")];
+        assert!(same_windows(&saved, [(2, 2), (1, 1)].into_iter()));
+        assert!(!same_windows(&saved, [(1, 1), (2, 2), (3, 3)].into_iter()));
+        assert!(!same_windows(&saved, [(1, 1)].into_iter()));
+        assert!(!same_windows(&saved, [(1, 1), (2, 3)].into_iter()));
     }
 
     #[test]
@@ -58,22 +92,29 @@ mod tests {
         let local = r"C:\Windows\Web";
         let virtual_folder = "::{namespace}\\Échantillon\nsecond line";
         let entries = [
-            (1, ""),
-            (1, local),
-            (1, "duplicate"),
-            (2, local),
-            (3, virtual_folder),
-            (4, "bad\0path"),
+            folder(1, 1, ""),
+            folder(1, 1, local),
+            folder(1, 1, "duplicate"),
+            folder(2, 1, local),
+            folder(3, 2, virtual_folder),
+            folder(4, 2, "bad\0path"),
         ];
         assert_eq!(
-            folders(entries.map(|(h, folder)| (h, folder.to_owned()))),
-            [(1, local.to_owned()), (2, local.to_owned()), (3, virtual_folder.to_owned())]
+            folders(entries),
+            [
+                folder(1, 1, local),
+                folder(2, 1, local),
+                folder(3, 2, virtual_folder)
+            ]
         );
     }
 
     #[test]
     fn recovery_snapshot_keeps_window_ids_and_parsing_names() {
-        let entries = [(17, r"C:\Windows\Web".to_owned()), (23, "::{namespace}\\É\nWeb".to_owned())];
+        let entries = [
+            folder(17, 21, r"C:\Windows\Web"),
+            folder(23, 19, "::{namespace}\\É\nWeb"),
+        ];
         assert_eq!(decode(&encode(&entries)).unwrap(), entries);
         assert!(decode("17\0").is_err());
         assert!(decode("").unwrap().is_empty());

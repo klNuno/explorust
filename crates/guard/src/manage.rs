@@ -4,7 +4,7 @@
 //! signed-in user's own process). The order keeps a way back at every step: on install, the Apps
 //! entry exists before the Shell value; on removal, the Shell value is gone before any file.
 
-use crate::policy::{RECOVERY_LIMIT, Recovery, explorer_retry_due, recovery_step};
+use crate::policy::{ExplorerRecovery, Recovery};
 use crate::{account, apps, folders, install, log, package, proc, reg, supervise, taskbar};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -146,8 +146,8 @@ pub fn restore_session() -> (Result<String, String>, Result<String, String>) {
     let lock = || {
         let cancel = proc::Event::named(crate::switch_events::CANCEL_FOR_RESTORE)?;
         cancel.signal()?;
-        let setup = install::lock_for(240_000)?;
-        let recovery = install::recovery_lock_for(240_000)?;
+        let setup = install::lock_for(300_000)?;
+        let recovery = install::recovery_lock_for(300_000)?;
         Ok((setup, recovery))
     };
     let _locks = match lock() {
@@ -190,9 +190,10 @@ pub fn bring_back_explorer_except(retiring: Option<&proc::Child>) -> Result<Stri
 fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
     let retiring_pid = retiring.map(|process| process.pid);
     let started = Instant::now();
+    let mut recovery = ExplorerRecovery::default();
     let mut requested = false;
-    let mut launch: Option<(proc::Child, Option<Duration>)> = None;
-    let mut retried = false;
+    let mut launch: Option<proc::Child> = None;
+    let mut last_error = None;
     loop {
         let ready = taskbar::explorer_except(retiring_pid);
         // A live switch starts its new guard only after the old process exits. If the
@@ -203,33 +204,49 @@ fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
             && retiring.is_none_or(proc::Child::ended)
             && proc::Event::set_existing(supervise::FALLBACK_EVENT).is_ok();
         requested |= guard_waiting;
-        let elapsed = started.elapsed();
-        let launch_pending = launch.as_mut().is_some_and(|(child, ended_at)| {
-            // Explorer can forward the request and exit before the other process creates a tray.
-            retried
-                || !child.ended()
-                || !explorer_retry_due(elapsed, elapsed - *ended_at.get_or_insert(elapsed))
-        });
-        match recovery_step(ready, taskbar::any(), guard_waiting || launch_pending) {
+        match recovery.step(
+            started.elapsed(),
+            ready,
+            taskbar::any(),
+            guard_waiting,
+            launch.as_ref().is_none_or(proc::Child::ended),
+        ) {
             Recovery::Ready(pid) if launch.is_some() => return Ok(format!("replacement Explorer taskbar answers (pid {pid})")),
             Recovery::Ready(pid) if requested => return Ok(format!("the guard brought explorer back (pid {pid})")),
             Recovery::Ready(pid) => return Ok(format!("explorer's taskbar already answers (pid {pid})")),
-            _ if elapsed >= RECOVERY_LIMIT => {
-                return Err("no replacement Explorer taskbar is answering after 45 s".into());
+            Recovery::Exhausted => {
+                return Err(last_error.unwrap_or_else(|| "Explorer recovery ended without an answering taskbar".into()));
             }
             Recovery::Start if !taskbar::any() => {
                 // Explorer must run unelevated as the shell.
                 if install::elevated() {
                     return Err("no shell runs: start explorer.exe from Task Manager".into());
                 }
-                if let Some((child, _)) = &launch {
-                    say(&format!("restore: retrying after Explorer pid {} exited without a taskbar", child.pid));
+                if let Some(child) = &launch {
+                    say(&format!("restore: retrying after Explorer pid {} did not produce an answering taskbar", child.pid));
+                    // This is our launcher, with no taskbar. A hung one can otherwise take
+                    // the next Explorer launch as a forward and prevent it from starting.
+                    if !child.ended() && !taskbar::any() {
+                        child.kill();
+                    }
                 }
-                let child = proc::Child::spawn(&supervise::explorer_path(), "")
-                    .map_err(|e| format!("explorer did not start: {e}"))?;
-                say(&format!("restore: started Explorer pid {} and waiting for its taskbar", child.pid));
-                retried = launch.is_some();
-                launch = Some((child, None));
+                if taskbar::any() {
+                    continue;
+                }
+                launch = match proc::Child::spawn(&supervise::explorer_path(), "") {
+                    Ok(child) => {
+                        last_error = None;
+                        say(&format!("restore: started Explorer pid {} and waiting for its taskbar", child.pid));
+                        Some(child)
+                    }
+                    Err(e) => {
+                        let error = format!("explorer did not start: {e}");
+                        say(&format!("restore: {error}"));
+                        last_error = Some(error);
+                        None
+                    }
+                };
+                recovery.started(started.elapsed());
             }
             Recovery::Start | Recovery::Wait => std::thread::sleep(Duration::from_millis(200)),
         }

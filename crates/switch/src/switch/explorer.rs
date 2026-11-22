@@ -1,6 +1,6 @@
 //! Observe and close only Explorer processes on this desktop and in this Windows session.
 
-use super::reopen_list;
+use super::reopen_list::{self, Folder};
 use guard::{explorer_launch::Apartment, explorer_path, log, taskbar};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE, HWND, LPARAM, WPARAM};
@@ -17,8 +17,7 @@ use windows::Win32::UI::Shell::{
     SHCreateItemFromIDList, SID_STopLevelBrowser, SIGDN_DESKTOPABSOLUTEPARSING, ShellWindows,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetWindowThreadProcessId, IsWindow, PostMessageW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-    SendMessageTimeoutW, WM_CLOSE,
+    FindWindowExW, GetWindowThreadProcessId, PostMessageW,
 };
 use windows::core::{Interface, PCWSTR, w};
 
@@ -102,15 +101,16 @@ pub fn file_operations() -> bool {
     !windows(w!("OperationStatusWindow")).is_empty()
 }
 
-fn folder_windows() -> Vec<(HWND, u32)> {
+pub fn folder_windows() -> Vec<(isize, u32)> {
     windows(w!("CabinetWClass"))
         .into_iter()
         .filter(|(_, pid)| taskbar::is_explorer(*pid))
+        .map(|(window, pid)| (window.0 as isize, pid))
         .collect()
 }
 
 /// Returns None if windows came or went while COM was reading their folders.
-pub fn open_folders() -> Result<Option<Vec<(isize, String)>>, String> {
+pub fn open_folders() -> Result<Option<Vec<Folder>>, String> {
     let open = folder_windows();
     if open.is_empty() {
         return Ok(Some(Vec::new()));
@@ -132,12 +132,12 @@ pub fn open_folders() -> Result<Option<Vec<(isize, String)>>, String> {
                 continue;
             };
             let Ok(hwnd) = browser.HWND() else { continue };
-            if !open.iter().any(|(h, _)| h.0 as isize == hwnd.0) {
+            let Some(&(_, owner)) = open.iter().find(|(h, _)| *h == hwnd.0) else {
                 continue;
-            }
+            };
             match active_folder(&browser) {
                 Ok(folder) if !folder.is_empty() && !folder.contains('\0') => {
-                    entries.push((hwnd.0, folder))
+                    entries.push(Folder { hwnd: hwnd.0, owner, path: folder })
                 }
                 Ok(_) => log::line(&format!(
                     "switch: folder window {:#x} has no parsing name",
@@ -153,26 +153,25 @@ pub fn open_folders() -> Result<Option<Vec<(isize, String)>>, String> {
         if current.len() != open.len() || current.iter().any(|window| !open.contains(window)) {
             return Ok(None);
         }
-        if !reopen_list::same_windows(&entries, open.into_iter().map(|(h, _)| h.0 as isize)) {
+        if !reopen_list::same_windows(&entries, open.into_iter()) {
             return Err("one or more Explorer windows could not be saved".into());
         }
         Ok(Some(reopen_list::folders(entries)))
     }
 }
 
-pub fn restore_folders(folders: &[(isize, String)]) {
+pub fn restore_desktop_folders(folders: &[Folder], desktop: u32) {
     let existing = folder_windows();
-    let mut reopened = 0;
-    for (handle, folder) in folders {
-        if existing.iter().any(|(window, _)| window.0 as isize == *handle) {
-            continue;
-        }
-        match std::process::Command::new(explorer_path()).arg(folder).spawn() {
-            Ok(_) => reopened += 1,
-            Err(e) => log::line(&format!("switch: could not reopen Explorer folder {folder}: {e}")),
-        }
+    for folder in folders.iter().filter(|folder| folder.owner == desktop && !existing.contains(&(folder.hwnd, folder.owner))) {
+        reopen_folder(&folder.path);
     }
-    log::line(&format!("switch: reopened {reopened} closed folder windows in Explorer"));
+}
+
+pub fn reopen_folder(folder: &str) {
+    match std::process::Command::new(explorer_path()).arg(folder).spawn() {
+        Ok(_) => log::line(&format!("switch: reopened Explorer folder {folder}")),
+        Err(e) => log::line(&format!("switch: could not reopen Explorer folder {folder}: {e}")),
+    }
 }
 
 unsafe fn active_folder(browser: &IWebBrowser2) -> windows::core::Result<String> {
@@ -195,12 +194,12 @@ unsafe fn active_folder(browser: &IWebBrowser2) -> windows::core::Result<String>
     }
 }
 
-/// Returns false when the captured window list is stale, before closing anything.
-pub fn exit(
+/// Returns false when the desktop exit has to wait for a new file operation.
+pub fn exit_desktop(
     tray: HWND,
     pid: u32,
-    saved: &[(isize, String)],
-    commit: impl FnOnce() -> Result<(), String>,
+    arm: impl FnOnce() -> Result<(), String>,
+    posted: impl FnOnce() -> Result<(), String>,
 ) -> Result<bool, String> {
     if taskbar::explorer_window() != Some((tray, pid)) {
         return Err("Explorer's taskbar changed while preparing to switch".into());
@@ -211,42 +210,17 @@ pub fn exit(
         .filter(|&owner| taskbar::is_explorer(owner))
         .chain([pid])
         .collect();
-    let open = folder_windows();
-    if !reopen_list::same_windows(saved, open.iter().map(|(window, _)| window.0 as isize)) {
+    arm()?;
+    // Keep this check beside PostMessage. Separate folders can take seconds to close.
+    if file_operations() {
+        log::line("switch: a file operation started before Exit Explorer");
         return Ok(false);
     }
-    commit()?;
     let started = Instant::now();
-    // The outgoing desktop can still service these separate processes as their windows close.
-    for (folder, owner) in open {
-        if owner == pid {
-            continue;
-        }
-        let budget = EXIT_BUDGET.saturating_sub(started.elapsed()).min(Duration::from_secs(2));
-        if budget.is_zero() {
-            break;
-        }
-        // A timed send withdraws a close the folder thread has not begun to handle. A posted
-        // close would stay queued and could close the folder after rollback had kept it open.
-        // SAFETY: WM_CLOSE has no pointer arguments and the target may disappear at any time.
-        let closed = unsafe {
-            SendMessageTimeoutW(
-                folder,
-                WM_CLOSE,
-                WPARAM(0),
-                LPARAM(0),
-                SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                budget.as_millis().max(1) as u32,
-                None,
-            )
-        };
-        if closed.0 == 0 && unsafe { IsWindow(Some(folder)).as_bool() } {
-            log::line(&format!("switch: Explorer folder in pid {owner} did not complete the close request"));
-        }
-    }
     // SAFETY: this is the taskbar's Exit Explorer command, with no pointer arguments.
     unsafe { PostMessageW(Some(tray), EXIT_EXPLORER, WPARAM(0), LPARAM(0)) }
         .map_err(|e| format!("request Exit Explorer: {e}"))?;
+    posted()?;
     log::line(&format!("switch: requested Exit Explorer for pid {pid}"));
     loop {
         if let Some((_, owner)) = taskbar::explorer_window()
@@ -261,8 +235,7 @@ pub fn exit(
             .into_iter()
             .any(|(_, owner)| taskbar::is_explorer(owner));
         let desktop_exited = !desktop_present && !new_desktop;
-        // A separate-process folder can outlive the desktop. Files may reopen it only once
-        // the original window closes, so keep waiting even if the old desktop is already gone.
+        // Wait until every original Explorer folder window is gone before handing over to Files.
         if desktop_exited && folder_windows().is_empty() {
             log::line(&format!(
                 "switch: Explorer desktop exited after {} ms (background Explorer pids: {pids:?})",

@@ -81,24 +81,59 @@ pub enum Recovery {
     Ready(u32),
     Wait,
     Start,
+    Exhausted,
 }
 
-pub const RECOVERY_LIMIT: Duration = Duration::from_secs(45);
+const EXPLORER_ATTEMPTS: u8 = 3;
+const EXPLORER_WINDOW: Duration = Duration::from_secs(45);
 const EXPLORER_RELAUNCH_GRACE: Duration = Duration::from_secs(10);
+/// One window for the existing desktop owner and each fresh Explorer process, plus time to
+/// reap a hung launcher between attempts and finish the last taskbar probe.
+pub const RECOVERY_BUDGET: Duration =
+    Duration::from_secs(EXPLORER_WINDOW.as_secs() * (1 + EXPLORER_ATTEMPTS as u64) + 30);
 
-/// Give a forwarded launch time to create a tray while leaving time for a retry.
-pub fn explorer_retry_due(elapsed: Duration, since_exit: Duration) -> bool {
-    since_exit >= EXPLORER_RELAUNCH_GRACE
-        || RECOVERY_LIMIT.saturating_sub(elapsed) <= EXPLORER_RELAUNCH_GRACE
+#[derive(Default)]
+pub struct ExplorerRecovery {
+    attempts: u8,
+    started: Duration,
+    ended: Option<Duration>,
 }
 
-pub fn recovery_step(replacement: Option<u32>, taskbar_present: bool, launch_pending: bool) -> Recovery {
-    if let Some(pid) = replacement {
-        Recovery::Ready(pid)
-    } else if taskbar_present || launch_pending {
-        Recovery::Wait
-    } else {
-        Recovery::Start
+impl ExplorerRecovery {
+    pub fn started(&mut self, now: Duration) {
+        self.attempts += 1;
+        self.started = now;
+        self.ended = None;
+    }
+
+    pub fn step(
+        &mut self,
+        now: Duration,
+        ready: Option<u32>,
+        taskbar_present: bool,
+        guard_waiting: bool,
+        launcher_ended: bool,
+    ) -> Recovery {
+        if let Some(pid) = ready {
+            return Recovery::Ready(pid);
+        }
+        let expired = now - self.started >= EXPLORER_WINDOW;
+        if self.attempts > 0 {
+            // Explorer can hand the launch to another process before the tray appears.
+            let handed_off = launcher_ended
+                && now - *self.ended.get_or_insert(now) >= EXPLORER_RELAUNCH_GRACE;
+            if !expired && !handed_off {
+                return Recovery::Wait;
+            }
+        }
+        if taskbar_present || guard_waiting {
+            return if expired { Recovery::Exhausted } else { Recovery::Wait };
+        }
+        if self.attempts == EXPLORER_ATTEMPTS {
+            Recovery::Exhausted
+        } else {
+            Recovery::Start
+        }
     }
 }
 
@@ -115,31 +150,64 @@ mod tests {
 
     #[test]
     fn recovery_starts_once_the_retiring_taskbar_is_gone() {
-        assert_eq!(recovery_step(None, true, false), Recovery::Wait);
+        let mut recovery = ExplorerRecovery::default();
+        assert_eq!(recovery.step(secs(0), None, true, false, false), Recovery::Wait);
         // The retiring process can still be alive without a desktop taskbar.
-        assert_eq!(recovery_step(None, false, false), Recovery::Start);
-        assert_eq!(recovery_step(Some(42), false, false), Recovery::Ready(42));
+        assert_eq!(recovery.step(secs(1), None, false, false, false), Recovery::Start);
+        assert_eq!(recovery.step(secs(2), Some(42), true, false, false), Recovery::Ready(42));
     }
 
     #[test]
     fn recovery_starts_directly_when_the_signalled_guard_disappears() {
-        assert_eq!(recovery_step(None, false, true), Recovery::Wait);
-        assert_eq!(recovery_step(None, false, false), Recovery::Start);
+        let mut recovery = ExplorerRecovery::default();
+        assert_eq!(recovery.step(secs(0), None, false, true, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(1), None, false, false, false), Recovery::Start);
     }
 
     #[test]
-    fn recovery_leaves_time_to_retry_when_the_first_explorer_exits_late() {
-        assert!(!explorer_retry_due(secs(7), secs(2)));
-        assert!(explorer_retry_due(secs(15), secs(10)));
-        assert!(explorer_retry_due(secs(39), Duration::ZERO));
+    fn every_first_exit_or_timeout_leaves_a_full_second_attempt() {
+        for first_exit in 0..=60 {
+            let mut recovery = ExplorerRecovery::default();
+            recovery.started(secs(0));
+            let retry = (0..=60).find(|&now| {
+                let step = recovery.step(secs(now), None, false, false, now >= first_exit);
+                assert_ne!(step, Recovery::Exhausted);
+                step == Recovery::Start
+            }).unwrap();
+            assert_eq!(retry, (first_exit + 10).min(45));
+            recovery.started(secs(retry));
+            assert_eq!(recovery.step(secs(retry + 44), None, false, false, false), Recovery::Wait);
+            assert_eq!(recovery.step(secs(retry + 45), Some(42), true, false, true), Recovery::Ready(42));
+        }
     }
 
     #[test]
     fn recovery_waits_for_adoption_when_the_shell_still_owns_the_taskbar() {
-        assert_eq!(recovery_step(None, true, true), Recovery::Wait);
-        assert_eq!(recovery_step(None, true, false), Recovery::Wait);
-        assert_eq!(recovery_step(None, true, true), Recovery::Wait);
-        assert_eq!(recovery_step(Some(42), false, true), Recovery::Ready(42));
+        let mut recovery = ExplorerRecovery::default();
+        assert_eq!(recovery.step(secs(0), None, true, true, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(1), None, true, false, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(45), Some(42), true, true, false), Recovery::Ready(42));
+    }
+
+    #[test]
+    fn recovery_probes_before_exhausting_the_last_attempt() {
+        let mut recovery = ExplorerRecovery::default();
+        for attempt in 0..3 {
+            let start = secs(attempt * 45);
+            assert_eq!(recovery.step(start, None, false, false, false), Recovery::Start);
+            recovery.started(start);
+        }
+        assert_eq!(recovery.step(secs(134), None, false, false, false), Recovery::Wait);
+        assert_eq!(recovery.step(secs(135), None, false, false, true), Recovery::Exhausted);
+        assert_eq!(recovery.step(secs(135), Some(42), true, false, true), Recovery::Ready(42));
+    }
+
+    #[test]
+    fn recovery_accepts_a_tray_created_by_the_forwarded_process() {
+        let mut recovery = ExplorerRecovery::default();
+        recovery.started(secs(0));
+        assert_eq!(recovery.step(secs(1), None, false, false, true), Recovery::Wait);
+        assert_eq!(recovery.step(secs(11), Some(42), true, false, true), Recovery::Ready(42));
     }
 
     fn secs(n: u64) -> Duration {

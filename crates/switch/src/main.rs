@@ -9,6 +9,7 @@ fn main() {
         None | Some("--switch") => switch::run(),
         Some("--switch-worker") => switch::run_worker(),
         Some("--watch-switch") => switch::watcher::run(std::env::args().skip(2)),
+        Some("--close-folder") => switch::folder_close::run(std::env::args().skip(2)),
         _ => 2,
     };
     std::process::exit(code as i32);
