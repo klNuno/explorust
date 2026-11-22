@@ -1,14 +1,15 @@
 //! Keep each WM_CLOSE receipt alive through rollback, even if the watcher exits.
 
 use super::{
-    close_progress::{Close, close_state},
+    close_progress::{Close, close_state, close_wait},
     explorer,
     reopen_list::Folder,
     watcher::{Signals, read_snapshot},
 };
 use guard::proc::{Child, Event, wait_any};
-use guard::switch_events::{SWITCH_EXE, switch_event};
+use guard::switch_events::{CANCEL_FOR_RESTORE, SWITCH_EXE, switch_event};
 use guard::{account, install, log, reopen, taskbar};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -16,6 +17,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageCallbackW, SendMessageTimeoutW, SetPropW, WM_CLOSE, WM_NULL,
 };
 use windows::core::HSTRING;
+
+const RESPONSIVENESS_CHECK: Duration = Duration::from_millis(500);
+static CLOSE_ACKNOWLEDGED: AtomicBool = AtomicBool::new(false);
 
 fn receipt_name(stamp: u64, hwnd: isize) -> String {
     switch_event(stamp, &format!("folder-{hwnd}"))
@@ -37,7 +41,7 @@ pub fn close(owner: u32, stamp: u64, folder: &Folder, budget: Duration) -> Resul
         // The earlier receipt keeps its lock while we hold the recovery mutex. Leave it
         // responsible for reopening this window after the new switch commits or rolls back.
         while open() {
-            let remaining = budget.saturating_sub(started.elapsed());
+            let remaining = close_wait(budget, started.elapsed(), false);
             if remaining.is_zero() {
                 return Ok(Handoff::Pending);
             }
@@ -54,8 +58,24 @@ pub fn close(owner: u32, stamp: u64, folder: &Folder, budget: Duration) -> Resul
         &install::dir().join(SWITCH_EXE),
         &format!("--close-folder {watcher} {owner} {stamp} {hwnd}"),
     )?;
-    let remaining = budget.saturating_sub(started.elapsed());
-    wait_any(&[settled.0, closer.handle], Some(remaining.as_millis() as u32));
+    let wait = |duration: Duration| {
+        wait_any(&[settled.0, closer.handle], Some(duration.as_millis() as u32)).is_none()
+    };
+    let mut pending = wait(close_wait(budget, started.elapsed(), false));
+    while pending && open() {
+        let remaining = close_wait(budget, started.elapsed(), true);
+        if remaining.is_zero()
+            || Event::is_signalled(CANCEL_FOR_RESTORE)
+            || explorer::file_operations()
+            || !window_answers(HWND(hwnd as *mut _), remaining.min(RESPONSIVENESS_CHECK))
+        {
+            break;
+        }
+        // A message reply cannot replace the close receipt. Give it short intervals to settle
+        // so an unresponsive window or a new file operation postpones the switch promptly.
+        let remaining = close_wait(budget, started.elapsed(), true);
+        pending = wait(remaining.min(RESPONSIVENESS_CHECK));
+    }
     // Even on timeout, the close process owns the request and can reopen this folder later.
     Ok(if open() { Handoff::Pending } else { Handoff::Snapshot })
 }
@@ -109,7 +129,7 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
         return Ok(());
     }
     let window = TrackedWindow::new(HWND(hwnd as *mut _), &receipt_name(stamp, hwnd))?;
-    if !window.answers() || !window.exists() {
+    if !window_answers(window.hwnd, RESPONSIVENESS_CHECK) || !window.exists() {
         return Err(format!(
             "Explorer folder in pid {} did not answer before the close request",
             folder.owner
@@ -122,6 +142,7 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     {
         return Ok(());
     }
+    let started = Instant::now();
     let request = window.request_close();
     if request.is_ok() {
         log::line(&format!(
@@ -131,16 +152,27 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     }
     // Track the original HWND through rollback. An acknowledgment from its message pump
     // cannot confirm destruction or that Explorer has abandoned the request.
-    let started = Instant::now();
     loop {
         if signals.completed.signalled() {
             return Ok(());
         }
         // SAFETY: PeekMessage dispatches the reply callback on the owning thread.
         let _ = unsafe { PeekMessageW(&mut MSG::default(), None, 0, 0, PM_NOREMOVE) };
+        if CLOSE_ACKNOWLEDGED.swap(false, Ordering::Relaxed) {
+            log::line(&format!(
+                "switch: Explorer folder HWND {hwnd:#x} acknowledged WM_CLOSE after {} ms",
+                started.elapsed().as_millis()
+            ));
+        }
         match close_state(request.is_ok(), window.exists()) {
             Close::Abandoned => return request,
-            Close::Destroyed => break,
+            Close::Destroyed => {
+                log::line(&format!(
+                    "switch: Explorer folder HWND {hwnd:#x} destroyed after {} ms",
+                    started.elapsed().as_millis()
+                ));
+                break;
+            }
             Close::Pending => {}
         }
         if started.elapsed() >= guard::policy::DESKTOP_OBSERVE_LIMIT
@@ -171,7 +203,25 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     }
 }
 
-unsafe extern "system" fn acknowledged(_: HWND, _: u32, _: usize, _: LRESULT) {}
+unsafe extern "system" fn acknowledged(_: HWND, _: u32, _: usize, _: LRESULT) {
+    CLOSE_ACKNOWLEDGED.store(true, Ordering::Relaxed);
+}
+
+fn window_answers(hwnd: HWND, timeout: Duration) -> bool {
+    // SAFETY: WM_NULL has no pointer arguments.
+    unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            timeout.as_millis() as u32,
+            None,
+        )
+        .0 != 0
+    }
+}
 
 fn reopen_after_rollback(path: &str) -> Result<(), String> {
     let _recovery = install::recovery_lock_for(guard::policy::DESKTOP_OBSERVE_LIMIT.as_millis() as u32)?;
@@ -215,22 +265,6 @@ impl TrackedWindow {
     fn exists(&self) -> bool {
         // SAFETY: a dead or reused HWND has no marker.
         unsafe { !GetPropW(self.hwnd, &self.property).is_invalid() }
-    }
-
-    fn answers(&self) -> bool {
-        // SAFETY: WM_NULL has no pointer arguments. A suspended window never gets a close.
-        unsafe {
-            SendMessageTimeoutW(
-                self.hwnd,
-                WM_NULL,
-                WPARAM(0),
-                LPARAM(0),
-                SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                500,
-                None,
-            )
-            .0 != 0
-        }
     }
 
     fn request_close(&self) -> Result<(), String> {

@@ -499,7 +499,7 @@ fn close_folders(
             log::line("switch: a file operation started during folder closing");
             return Ok(None);
         }
-        let budget = explorer::CLOSE_BUDGET.saturating_sub(started.elapsed()).min(Duration::from_secs(2));
+        let budget = explorer::CLOSE_BUDGET.saturating_sub(started.elapsed());
         let handoff = if budget.is_zero() {
             folder_close::Handoff::Pending
         } else {
