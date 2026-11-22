@@ -85,8 +85,8 @@ mod tests {
 
     #[test]
     fn safe_save_pin_points_to_the_original_shortcut() {
-        assert_eq!(shortcut_name("Mullvad Browser.lnk~RF21949e.TMP"), Some("Mullvad Browser.lnk"));
-        assert_eq!(shortcut_name("Accshift.LNK"), Some("Accshift.LNK"));
+        assert_eq!(shortcut_name("Web Browser.lnk~RF21949e.TMP"), Some("Web Browser.lnk"));
+        assert_eq!(shortcut_name("Notes.LNK"), Some("Notes.LNK"));
         assert_eq!(shortcut_name("Tombstones"), None);
         assert_eq!(shortcut_name("random.TMP"), None);
         assert_eq!(shortcut_name("brouillon.lnk~RFnotes.TMP"), None);
