@@ -61,6 +61,8 @@ const THUMB_CLOSE_MS: u32 = 300;
 const TIMER_SLIDE: usize = 7;
 const TIMER_HIDE: usize = 8;
 const TIMER_PROGRESS: usize = 9;
+const TIMER_REVEAL: usize = 10;
+const REVEAL_CHECK_MS: u32 = 50;
 const HSHELL_RUDEAPPACTIVATED: usize = 0x8004;
 const HSHELL_FLASH: usize = 0x8006;
 const EVENT_MINIMIZESTART: u32 = 0x0016;
@@ -275,9 +277,10 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         let (h_px, scene) = place(hwnd, monitor, &theme)?;
         if settings.autohide {
             let _ = SetWindowPos(hwnd, None, monitor.left, S::slide_top(monitor.bottom, h_px, 0.0), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        let work = WorkArea::reserve(monitor, if settings.autohide { 0 } else { h_px });
+        let work = WorkArea::reserve(monitor, settings.reserved_height(h_px));
         let shellhook = RegisterWindowMessageW(w!("SHELLHOOK"));
         let taskband = Taskband::publish(hwnd, hwnd, shellhook);
         let hooked = RegisterShellHookWindow(hwnd).as_bool();
@@ -289,6 +292,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
             (EVENT_MINIMIZESTART, EVENT_MINIMIZEEND),
             (EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE),
+            (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
             (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
             (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
         ] {
@@ -356,6 +360,8 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         };
         BAR.with(|b| *b.borrow_mut() = Some(bar));
         with_bar(|b| {
+            b.fullscreen_changed(fg);
+            b.sync_reveal_timer();
             b.rebuild();
             b.paint();
         });
@@ -437,14 +443,8 @@ fn run_effect(e: Effect) {
         }
         Effect::WorkArea => {
             let _ = with_bar(|b| {
-                let mut bar = RECT::default();
-                // SAFETY: reads our own window's rect.
-                let _ = unsafe { GetWindowRect(b.hwnd, &mut bar) };
                 if b.work.is_some() {
-                    if b.settings.autohide {
-                        bar = RECT { top: b.monitor.bottom, bottom: b.monitor.bottom, ..bar };
-                    }
-                    let r = b.side.work_area(b.monitor, bar);
+                    let r = b.side.work_area(b.monitor, b.reserved_rect());
                     super::workarea::apply_rect(RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom });
                 }
             });
@@ -504,11 +504,22 @@ unsafe extern "system" fn on_winevent(_: HWINEVENTHOOK, event: u32, hwnd: HWND, 
     if bar.0.is_null() || hwnd == bar {
         return;
     }
+    // A foreground window can enter or leave fullscreen without changing activation.
+    if event == EVENT_OBJECT_LOCATIONCHANGE && hwnd != unsafe { GetForegroundWindow() } {
+        return;
+    }
     // SAFETY: posts to our own window; handled in order with the shell hook messages.
     let _ = unsafe { PostMessageW(Some(bar), WM_APP_EVENT, WPARAM(hwnd.0 as usize), LPARAM(event as isize)) };
 }
 
 impl Bar {
+    /// The taskbar's work-area reservation stays put during the slide.
+    fn reserved_rect(&self) -> crate::appbar::Rect {
+        let monitor = super::appbars::to_rect(self.monitor);
+        let top = monitor.bottom - self.settings.reserved_height(self.h_px);
+        crate::appbar::Rect { top, ..monitor }
+    }
+
     fn row(&self) -> Row {
         Row { width: self.scene.as_ref().map_or(1280.0, |s| s.width), buttons: self.groups.len() + 1, left: self.settings.align_left }
     }
@@ -804,6 +815,47 @@ impl Bar {
             let _ = KillTimer(Some(self.hwnd), TIMER_HIDE);
             SetTimer(Some(self.hwnd), TIMER_SLIDE, 8, None);
         }
+        self.sync_reveal_timer();
+    }
+
+    fn sync_reveal_timer(&self) {
+        // SAFETY: these timers belong to the bar on this thread.
+        unsafe {
+            if self.settings.autohide && !self.want_shown {
+                SetTimer(Some(self.hwnd), TIMER_REVEAL, REVEAL_CHECK_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_REVEAL);
+            }
+        }
+    }
+
+    fn fullscreen_changed(&mut self, foreground: HWND) {
+        let (hwnd, monitor, scale) = self.ctx();
+        let cx = Ctx { hwnd, monitor, scale, theme: &self.theme };
+        let asks = self.side.on_foreground(foreground, &cx);
+        self.asks(asks);
+        if self.side.appbars.fullscreen {
+            self.slide_to(false);
+        }
+    }
+
+    fn maybe_reveal(&mut self) {
+        if !self.settings.autohide || self.want_shown {
+            return;
+        }
+        let mut pt = POINT::default();
+        // SAFETY: takes a screen-coordinate snapshot, independent of window hit testing.
+        if unsafe { GetCursorPos(&mut pt) }.is_err()
+            || !S::at_reveal_edge(super::appbars::to_rect(self.monitor), pt.x, pt.y)
+        {
+            return;
+        }
+        // The foreground can enter or leave borderless mode without changing windows.
+        self.fullscreen_changed(unsafe { GetForegroundWindow() });
+        if !self.side.appbars.fullscreen {
+            self.effects.push(Effect::Topmost(true));
+            self.slide_to(true);
+        }
     }
 
     /// One slide frame; false once it arrived.
@@ -824,8 +876,13 @@ impl Bar {
     fn place_slide(&self) {
         let k = if self.want_shown { S::ease_out(self.shown) } else { 1.0 - S::ease_out(1.0 - self.shown) };
         let top = if self.settings.autohide { S::slide_top(self.monitor.bottom, self.h_px, k) } else { self.monitor.bottom - self.h_px };
+        let visibility = if self.settings.autohide && !self.want_shown && self.shown == 0.0 {
+            SWP_HIDEWINDOW
+        } else {
+            SWP_SHOWWINDOW
+        };
         // SAFETY: moves our own window.
-        let _ = unsafe { SetWindowPos(self.hwnd, None, self.monitor.left, top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
+        let _ = unsafe { SetWindowPos(self.hwnd, None, self.monitor.left, top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | visibility) };
     }
 
     /// Auto-hide: the pointer left; hide unless a flyout or the keyboard keeps the bar.
@@ -835,12 +892,12 @@ impl Bar {
         }
         let mut pt = POINT::default();
         // SAFETY: reads the cursor position.
-        let _ = unsafe { GetCursorPos(&mut pt) };
-        let wr = self.window_rect();
-        let inside = pt.x >= wr.left && pt.x < wr.right && pt.y >= wr.top && pt.y < wr.bottom;
+        let cursor_read = unsafe { GetCursorPos(&mut pt) }.is_ok();
         // SAFETY: reads the foreground window.
         let fg = unsafe { GetForegroundWindow() };
-        if inside || self.thumbs.is_some() || fg == self.hwnd {
+        let held_open = self.thumbs.is_some() || self.side.flyout.is_some() || fg == self.hwnd;
+        let bar = super::appbars::to_rect(self.window_rect());
+        if !cursor_read || !S::should_hide(bar, pt.x, pt.y, held_open) {
             // SAFETY: a timer on our own window.
             unsafe { SetTimer(Some(self.hwnd), TIMER_HIDE, S::HIDE_DELAY_MS, None) };
             return;
@@ -859,6 +916,12 @@ impl Bar {
         if autohide_changed {
             self.want_shown = !s.autohide;
             self.shown = if s.autohide { 0.0 } else { 1.0 };
+            // SAFETY: the new setting starts from a settled position.
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_HIDE);
+                let _ = KillTimer(Some(self.hwnd), TIMER_SLIDE);
+            }
+            self.sync_reveal_timer();
         }
         true
     }
@@ -940,6 +1003,9 @@ impl Bar {
                 self.h_px = h;
                 self.scene = Some(s);
                 self.place_slide();
+                if self.side.appbars.fullscreen {
+                    self.effects.push(Effect::Topmost(false));
+                }
                 if let Some(scene) = self.scene.as_mut() {
                     // Badges were drawn at the old scale: redraw them at the new one.
                     for (h, img) in &self.taskband.images {
@@ -1397,7 +1463,8 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             let cds = unsafe { &*(lp.0 as *const windows::Win32::System::DataExchange::COPYDATASTRUCT) };
             let (h, m, k) = b.ctx();
             let cx = Ctx { hwnd: h, monitor: m, scale: k, theme: &b.theme };
-            let (r, a) = b.side.on_copydata(cds, &cx);
+            let reserved = b.reserved_rect();
+            let (r, a) = b.side.on_copydata(cds, &cx, reserved);
             b.asks(a);
             LRESULT(r)
         }),
@@ -1460,10 +1527,11 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             match lp.0 as u32 {
                 EVENT_SYSTEM_FOREGROUND => {
                     b.set_active(h);
-                    let (hw, m, k) = b.ctx();
-                    let cx = Ctx { hwnd: hw, monitor: m, scale: k, theme: &b.theme };
-                    let a = b.side.on_foreground(h, &cx);
-                    b.asks(a);
+                    b.fullscreen_changed(h);
+                }
+                EVENT_OBJECT_LOCATIONCHANGE => {
+                    // SAFETY: a queued event can outlive the window's foreground activation.
+                    b.fullscreen_changed(unsafe { GetForegroundWindow() });
                 }
                 EVENT_MINIMIZEEND => b.set_active(h),
                 EVENT_MINIMIZESTART => {
@@ -1479,7 +1547,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
             // SAFETY: tracks the pointer leaving our own window.
             let _ = unsafe { TrackMouseEvent(&mut tme) };
-            if b.settings.autohide {
+            if b.settings.autohide && !b.side.appbars.fullscreen {
                 // SAFETY: a timer on our own window.
                 let _ = unsafe { KillTimer(Some(hwnd), TIMER_HIDE) };
                 b.slide_to(true);
@@ -1585,6 +1653,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
                     let _ = unsafe { KillTimer(Some(hwnd), TIMER_HIDE) };
                     b.maybe_hide();
                 }
+                TIMER_REVEAL => b.maybe_reveal(),
                 TIMER_PROGRESS => b.paint(),
                 TIMER_THUMB_OPEN => {
                     // SAFETY: our own timer.
