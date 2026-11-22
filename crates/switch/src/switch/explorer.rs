@@ -17,7 +17,8 @@ use windows::Win32::UI::Shell::{
     SHCreateItemFromIDList, SID_STopLevelBrowser, SIGDN_DESKTOPABSOLUTEPARSING, ShellWindows,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+    FindWindowExW, GetWindowThreadProcessId, IsWindow, PostMessageW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+    SendMessageTimeoutW, WM_CLOSE,
 };
 use windows::core::{Interface, PCWSTR, w};
 
@@ -215,22 +216,38 @@ pub fn exit(
         return Ok(false);
     }
     commit()?;
+    let started = Instant::now();
     // The outgoing desktop can still service these separate processes as their windows close.
     for (folder, owner) in open {
-        if owner != pid {
-            // SAFETY: standard close to a folder window in a separate Explorer process.
-            if let Err(e) = unsafe { PostMessageW(Some(folder), WM_CLOSE, WPARAM(0), LPARAM(0)) } {
-                log::line(&format!(
-                    "switch: could not close the folder window in Explorer pid {owner}: {e}"
-                ));
-            }
+        if owner == pid {
+            continue;
+        }
+        let budget = EXIT_BUDGET.saturating_sub(started.elapsed()).min(Duration::from_secs(2));
+        if budget.is_zero() {
+            break;
+        }
+        // A timed send withdraws a close the folder thread has not begun to handle. A posted
+        // close would stay queued and could close the folder after rollback had kept it open.
+        // SAFETY: WM_CLOSE has no pointer arguments and the target may disappear at any time.
+        let closed = unsafe {
+            SendMessageTimeoutW(
+                folder,
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                budget.as_millis().max(1) as u32,
+                None,
+            )
+        };
+        if closed.0 == 0 && unsafe { IsWindow(Some(folder)).as_bool() } {
+            log::line(&format!("switch: Explorer folder in pid {owner} did not complete the close request"));
         }
     }
     // SAFETY: this is the taskbar's Exit Explorer command, with no pointer arguments.
     unsafe { PostMessageW(Some(tray), EXIT_EXPLORER, WPARAM(0), LPARAM(0)) }
         .map_err(|e| format!("request Exit Explorer: {e}"))?;
     log::line(&format!("switch: requested Exit Explorer for pid {pid}"));
-    let started = Instant::now();
     loop {
         if let Some((_, owner)) = taskbar::explorer_window()
             && owner != pid

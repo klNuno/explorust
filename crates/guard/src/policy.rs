@@ -83,6 +83,15 @@ pub enum Recovery {
     Start,
 }
 
+pub const RECOVERY_LIMIT: Duration = Duration::from_secs(45);
+const EXPLORER_RELAUNCH_GRACE: Duration = Duration::from_secs(10);
+
+/// Give a forwarded launch time to create a tray while leaving time for a retry.
+pub fn explorer_retry_due(elapsed: Duration, since_exit: Duration) -> bool {
+    since_exit >= EXPLORER_RELAUNCH_GRACE
+        || RECOVERY_LIMIT.saturating_sub(elapsed) <= EXPLORER_RELAUNCH_GRACE
+}
+
 pub fn recovery_step(replacement: Option<u32>, taskbar_present: bool, launch_pending: bool) -> Recovery {
     if let Some(pid) = replacement {
         Recovery::Ready(pid)
@@ -116,6 +125,13 @@ mod tests {
     fn recovery_starts_directly_when_the_signalled_guard_disappears() {
         assert_eq!(recovery_step(None, false, true), Recovery::Wait);
         assert_eq!(recovery_step(None, false, false), Recovery::Start);
+    }
+
+    #[test]
+    fn recovery_leaves_time_to_retry_when_the_first_explorer_exits_late() {
+        assert!(!explorer_retry_due(secs(7), secs(2)));
+        assert!(explorer_retry_due(secs(15), secs(10)));
+        assert!(explorer_retry_due(secs(39), Duration::ZERO));
     }
 
     #[test]

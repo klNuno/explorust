@@ -4,7 +4,7 @@
 //! signed-in user's own process). The order keeps a way back at every step: on install, the Apps
 //! entry exists before the Shell value; on removal, the Shell value is gone before any file.
 
-use crate::policy::{Recovery, recovery_step};
+use crate::policy::{RECOVERY_LIMIT, Recovery, explorer_retry_due, recovery_step};
 use crate::{account, apps, folders, install, log, package, proc, reg, supervise, taskbar};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -188,11 +188,10 @@ pub fn bring_back_explorer_except(retiring: Option<&proc::Child>) -> Result<Stri
 }
 
 fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
-    const EXIT_GRACE: Duration = Duration::from_secs(10);
     let retiring_pid = retiring.map(|process| process.pid);
     let started = Instant::now();
     let mut requested = false;
-    let mut launch: Option<(proc::Child, Option<Instant>)> = None;
+    let mut launch: Option<(proc::Child, Option<Duration>)> = None;
     let mut retried = false;
     loop {
         let ready = taskbar::explorer_except(retiring_pid);
@@ -204,17 +203,18 @@ fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
             && retiring.is_none_or(proc::Child::ended)
             && proc::Event::set_existing(supervise::FALLBACK_EVENT).is_ok();
         requested |= guard_waiting;
+        let elapsed = started.elapsed();
         let launch_pending = launch.as_mut().is_some_and(|(child, ended_at)| {
             // Explorer can forward the request and exit before the other process creates a tray.
             retried
                 || !child.ended()
-                || ended_at.get_or_insert_with(Instant::now).elapsed() < EXIT_GRACE
+                || !explorer_retry_due(elapsed, elapsed - *ended_at.get_or_insert(elapsed))
         });
         match recovery_step(ready, taskbar::any(), guard_waiting || launch_pending) {
             Recovery::Ready(pid) if launch.is_some() => return Ok(format!("replacement Explorer taskbar answers (pid {pid})")),
             Recovery::Ready(pid) if requested => return Ok(format!("the guard brought explorer back (pid {pid})")),
             Recovery::Ready(pid) => return Ok(format!("explorer's taskbar already answers (pid {pid})")),
-            _ if started.elapsed() >= Duration::from_secs(45) => {
+            _ if elapsed >= RECOVERY_LIMIT => {
                 return Err("no replacement Explorer taskbar is answering after 45 s".into());
             }
             Recovery::Start if !taskbar::any() => {
