@@ -200,7 +200,7 @@ fn switch(
                     return Err("the switch stopped while preparing Explorer".into());
                 }
                 log::line(&format!("switch: {e}; restoring Windows directly"));
-                watcher.recover(exe, tray, &explorer_process)?;
+                watcher.recover(exe, &explorer_process)?;
             }
             Ok(Outcome::Windows)
         }

@@ -178,7 +178,7 @@ pub fn bring_back_explorer() -> Result<String, String> {
     bring_back_explorer_except(None)
 }
 
-/// During rollback the original Explorer's taskbar cannot confirm recovery.
+/// A switch rollback keeps recovering until a replacement taskbar answers.
 pub fn bring_back_explorer_except(retiring: Option<&proc::Child>) -> Result<String, String> {
     let result = restore_desktop(retiring);
     match &result {
@@ -205,16 +205,24 @@ fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
             && proc::Event::set_existing(supervise::FALLBACK_EVENT).is_ok();
         requested |= guard_waiting;
         let launched = launch.as_ref().map(|child| child.pid);
+        let tray = taskbar::recovery_tray(launched);
         match recovery.step(
             started.elapsed(),
             ready,
-            taskbar::recovery_tray(launched),
+            tray,
             guard_waiting,
             launch.as_ref().is_none_or(proc::Child::ended),
         ) {
             Recovery::Ready(pid) if launch.is_some() => return Ok(format!("replacement Explorer taskbar answers (pid {pid})")),
             Recovery::Ready(pid) if requested => return Ok(format!("the guard brought explorer back (pid {pid})")),
             Recovery::Ready(pid) => return Ok(format!("explorer's taskbar already answers (pid {pid})")),
+            Recovery::Exhausted if retiring.is_some() => {
+                if !guard_waiting && tray != RecoveryTray::Other {
+                    // Keep the launcher handle so the next attempt can stop its hung process.
+                    recovery = ExplorerRecovery::default();
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
             Recovery::Exhausted => {
                 return Err(last_error.unwrap_or_else(|| "Explorer recovery ended without an answering taskbar".into()));
             }

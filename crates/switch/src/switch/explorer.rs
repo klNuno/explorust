@@ -22,7 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{Interface, PCWSTR, w};
 
 const EXIT_EXPLORER: u32 = 0x5B4;
-pub const EXIT_BUDGET: Duration = Duration::from_secs(30);
+pub const CLOSE_BUDGET: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 pub struct Process {
@@ -215,42 +215,21 @@ pub fn post_exit(
     Ok(true)
 }
 
-pub fn wait_for_exit(pid: u32) -> Result<(), String> {
-    let desktop_owners: Vec<_> = windows(w!("Progman"))
-        .into_iter()
-        .map(|(_, owner)| owner)
-        .filter(|&owner| taskbar::is_explorer(owner))
-        .chain([pid])
-        .collect();
+pub fn wait_for_desktop_windows() -> Result<(), String> {
     let started = Instant::now();
     loop {
-        if let Some((_, owner)) = taskbar::explorer_window()
-            && owner != pid
-        {
+        if let Some((_, owner)) = taskbar::explorer_window() {
             return Err(format!("Windows restarted Explorer as pid {owner}"));
         }
-        let running = processes("explorer.exe")?;
-        let pids: Vec<_> = running.iter().map(|process| process.pid).collect();
-        let desktop_present = pids.iter().any(|owner| desktop_owners.contains(owner));
-        let new_desktop = windows(w!("Progman"))
+        let desktop_window = windows(w!("Progman"))
             .into_iter()
             .any(|(_, owner)| taskbar::is_explorer(owner));
-        let desktop_exited = !desktop_present && !new_desktop;
         // Wait until every original Explorer folder window is gone before handing over to Files.
-        if desktop_exited && folder_windows().is_empty() {
-            log::line(&format!(
-                "switch: Explorer desktop exited after {} ms (background Explorer pids: {pids:?})",
-                started.elapsed().as_millis()
-            ));
+        if !desktop_window && folder_windows().is_empty() {
             return Ok(());
         }
-        if started.elapsed() >= EXIT_BUDGET {
-            if desktop_exited {
-                return Err("Explorer folder windows did not close within 30 s".into());
-            }
-            return Err(format!(
-                "Explorer's desktop did not exit within 30 s (remaining pids {pids:?})"
-            ));
+        if started.elapsed() >= CLOSE_BUDGET {
+            return Err("Explorer windows stayed open after the original desktop process exited".into());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
