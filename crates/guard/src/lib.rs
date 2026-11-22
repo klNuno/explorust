@@ -2,6 +2,7 @@
 
 pub mod account;
 mod apps;
+pub mod desktop_recovery;
 mod folders;
 mod hotkey;
 pub mod install;
@@ -26,7 +27,6 @@ pub mod taskbar;
 pub mod ui;
 mod uninstall;
 
-pub use manage::bring_back_explorer_except;
 pub use supervise::explorer_path;
 pub use command::run;
 mod command;

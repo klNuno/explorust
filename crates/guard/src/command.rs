@@ -19,7 +19,7 @@
 
 use crate::{account, install, log, manage, proc, reg, reopen, setup, supervise, taskbar, uninstall};
 use crate::proc::Event;
-use crate::switch_events::{GUARD_MUTEX, SWITCH_EXE, switch_event};
+use crate::switch_events::{CANCEL_FOR_RESTORE, GUARD_MUTEX, SWITCH_EXE, switch_event};
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use windows::Win32::System::Threading::CreateMutexW;
@@ -107,7 +107,8 @@ fn run_live() -> u32 {
         }
     };
     let switch = install::dir().join(SWITCH_EXE);
-    if install::elevated()
+    if Event::is_signalled(CANCEL_FOR_RESTORE)
+        || install::elevated()
         || !account::is_session_user()
         || reopen::guard_stamp(worker) != Some(stamp)
         || !taskbar::image_path(worker).is_some_and(|path| {

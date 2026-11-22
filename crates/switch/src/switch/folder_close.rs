@@ -11,6 +11,7 @@ use guard::switch_events::{SWITCH_EXE, switch_event};
 use guard::{account, install, log, reopen, taskbar};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetPropW, MSG, PM_NOREMOVE, PeekMessageW, RemovePropW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
     SendMessageCallbackW, SendMessageTimeoutW, SetPropW, WM_CLOSE, WM_NULL,
@@ -161,7 +162,11 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
 unsafe extern "system" fn acknowledged(_: HWND, _: u32, _: usize, _: LRESULT) {}
 
 fn reopen_after_rollback(path: &str) -> Result<(), String> {
-    let _recovery = install::recovery_lock_for(300_000)?;
+    let _recovery = install::recovery_lock_for(INFINITE)?;
+    reopen_in_current_shell(path)
+}
+
+pub(super) fn reopen_in_current_shell(path: &str) -> Result<(), String> {
     let installed = install::dir();
     // Another switch can succeed after this HWND is gone, while this receipt waits to reopen it.
     if taskbar::explorust(&installed.join("explorust.exe")).is_some() {

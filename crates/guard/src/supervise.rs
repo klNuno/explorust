@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub use launch_timing::FALLBACK_EVENT;
-use crate::switch_events::{EXITING_EXPLORER, RELEASE_EXPLORER, WATCHES_EXPLORER_HANDOFF};
+use crate::switch_events::{CANCEL_FOR_RESTORE, EXITING_EXPLORER, RELEASE_EXPLORER, WATCHES_EXPLORER_HANDOFF};
 
 enum End {
     /// The switch began rollback before the supervisor could launch the shell.
@@ -206,7 +206,9 @@ fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &E
         args.push_str(" --self-test");
     }
     let _ = std::fs::remove_file(problem_file());
-    if rollback.is_some_and(|event| event.signalled() || taskbar::explorer_window().is_some()) {
+    if rollback.is_some_and(|event| {
+        event.signalled() || Event::is_signalled(CANCEL_FOR_RESTORE) || taskbar::explorer_window().is_some()
+    }) {
         log::line("guard: live handoff rolled back before shell launch");
         return End::HandoffAborted;
     }

@@ -4,10 +4,10 @@
 //! signed-in user's own process). The order keeps a way back at every step: on install, the Apps
 //! entry exists before the Shell value; on removal, the Shell value is gone before any file.
 
-use crate::policy::{ExplorerRecovery, Recovery, RecoveryTray};
-use crate::{account, apps, folders, install, log, package, proc, reg, supervise, taskbar};
+use crate::{account, apps, desktop_recovery, folders, install, log, package, proc, reg};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use windows::Win32::System::Threading::INFINITE;
 
 /// Exit codes shared by `--install`, `--setup` and `--uninstall`.
 pub const FAILED: u32 = 1;
@@ -146,9 +146,10 @@ pub fn restore_session() -> (Result<String, String>, Result<String, String>) {
     let lock = || {
         let cancel = proc::Event::named(crate::switch_events::CANCEL_FOR_RESTORE)?;
         cancel.signal()?;
-        let setup = install::lock_for(300_000)?;
-        let recovery = install::recovery_lock_for(300_000)?;
-        Ok((setup, recovery))
+        say("restore: requested Windows desktop and waiting for pending handoffs");
+        let setup = install::lock_for(INFINITE)?;
+        let recovery = install::recovery_lock_for(INFINITE)?;
+        Ok((cancel, setup, recovery))
     };
     let _locks = match lock() {
         Ok(lock) => lock,
@@ -175,97 +176,11 @@ pub fn remove_package() {
 /// Brings explorer's taskbar back now and says so only once it answers. A running guard does it
 /// (it ends explorust and keeps explorer up); with no guard and no taskbar, explorer starts here.
 pub fn bring_back_explorer() -> Result<String, String> {
-    bring_back_explorer_except(None)
-}
-
-/// A switch rollback keeps recovering until a replacement taskbar answers.
-pub fn bring_back_explorer_except(retiring: Option<&proc::Child>) -> Result<String, String> {
-    let result = restore_desktop(retiring);
+    let result = desktop_recovery::restore_desktop(&install::dir().join("explorust.exe"), None);
     match &result {
         Ok(status) | Err(status) => say(&format!("restore: {status}")),
     }
     result
-}
-
-fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
-    let retiring_pid = retiring.map(|process| process.pid);
-    let started = Instant::now();
-    let mut recovery = ExplorerRecovery::default();
-    let mut requested = false;
-    let mut launch: Option<proc::Child> = None;
-    let mut last_error = None;
-    loop {
-        let ready = taskbar::explorer_except(retiring_pid);
-        // A live switch starts its new guard only after the old process exits. If the
-        // process remains without its taskbar, any guard is still waiting on the old desktop.
-        // Reopen and signal the event on each poll. A replacement guard can publish a new
-        // event while its adopted taskbar still owns the desktop.
-        let guard_waiting = ready.is_none()
-            && retiring.is_none_or(proc::Child::ended)
-            && proc::Event::set_existing(supervise::FALLBACK_EVENT).is_ok();
-        requested |= guard_waiting;
-        let launched = launch.as_ref().map(|child| child.pid);
-        let tray = taskbar::recovery_tray(launched);
-        match recovery.step(
-            started.elapsed(),
-            ready,
-            tray,
-            guard_waiting,
-            launch.as_ref().is_none_or(proc::Child::ended),
-        ) {
-            Recovery::Ready(pid) if launch.is_some() => return Ok(format!("replacement Explorer taskbar answers (pid {pid})")),
-            Recovery::Ready(pid) if requested => return Ok(format!("the guard brought explorer back (pid {pid})")),
-            Recovery::Ready(pid) => return Ok(format!("explorer's taskbar already answers (pid {pid})")),
-            Recovery::Exhausted if retiring.is_some() => {
-                if !guard_waiting && tray != RecoveryTray::Other {
-                    // Keep the launcher handle so the next attempt can stop its hung process.
-                    recovery = ExplorerRecovery::default();
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-            Recovery::Exhausted => {
-                return Err(last_error.unwrap_or_else(|| "Explorer recovery ended without an answering taskbar".into()));
-            }
-            Recovery::Start if taskbar::recovery_tray(launched) != RecoveryTray::Other => {
-                // Explorer must run unelevated as the shell.
-                if install::elevated() {
-                    return Err("no shell runs: start explorer.exe from Task Manager".into());
-                }
-                if let Some(child) = &launch {
-                    if !child.ended() {
-                        // Check once more before stopping our own launcher. It might have
-                        // acquired a responsive tray while the previous probe was timing out.
-                        if taskbar::explorer_except(retiring_pid).is_some()
-                            || taskbar::recovery_tray(launched) == RecoveryTray::Other
-                        {
-                            continue;
-                        }
-                        say(&format!("restore: stopping unresponsive recovery Explorer pid {}", child.pid));
-                        child.kill();
-                    }
-                    say(&format!("restore: retrying after Explorer pid {} did not produce an answering taskbar", child.pid));
-                }
-                if taskbar::any() {
-                    continue;
-                }
-                launch = match proc::Child::spawn(&supervise::explorer_path(), "") {
-                    Ok(child) => {
-                        last_error = None;
-                        say(&format!("restore: started Explorer pid {} and waiting for its taskbar", child.pid));
-                        Some(child)
-                    }
-                    Err(e) => {
-                        let error = format!("explorer did not start: {e}");
-                        say(&format!("restore: {error}"));
-                        last_error = Some(error);
-                        None
-                    }
-                };
-                recovery.started(started.elapsed());
-            }
-            Recovery::Start | Recovery::Wait => std::thread::sleep(Duration::from_millis(200)),
-        }
-    }
 }
 
 /// The machine half, elevated. Kept (Ok(false)) while another account's Shell value still points to

@@ -1,7 +1,6 @@
 //! Hand the current desktop from Explorer to explorust without ending the logon session.
 
 mod close_progress;
-mod exit_state;
 mod explorer;
 pub(crate) mod folder_close;
 mod prepare_lock;
@@ -147,7 +146,7 @@ fn switch(
     exe: &Path,
     cancel: &ui::Cancel,
 ) -> Result<Outcome, String> {
-    let _lock = install::lock()?;
+    let lock = install::lock()?;
     let expected = format!("\"{}\"", guard.display());
     if !reg::shell().is_some_and(|value| value.eq_ignore_ascii_case(&expected)) || !exe.is_file() {
         return Err("explorust is not installed as this user's sign-in shell".into());
@@ -185,6 +184,9 @@ fn switch(
             watcher::Desktop::Vacated => {}
         }
         release_previous_guard(previous)?;
+        if Event::is_signalled(CANCEL_FOR_RESTORE) {
+            return Err("turning off explorust before starting the new shell".into());
+        }
         let supervisor = Child::spawn(guard, &format!("--live {worker_pid} {stamp}"))?;
         log::line(&format!("switch: guard pid {} took over the session", supervisor.pid));
         wait_for_verdict(exe, &supervisor)?;
@@ -200,7 +202,11 @@ fn switch(
                     return Err("the switch stopped while preparing Explorer".into());
                 }
                 log::line(&format!("switch: {e}; restoring Windows directly"));
-                watcher.recover(exe, &explorer_process)?;
+                let late_folders = watcher.recover(exe, tray, &explorer_process)?;
+                drop(lock);
+                if let Some(folders) = late_folders {
+                    watcher::restore_late_folders(&explorer_process, &folders)?;
+                }
             }
             Ok(Outcome::Windows)
         }
