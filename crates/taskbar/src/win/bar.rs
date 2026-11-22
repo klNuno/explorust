@@ -365,6 +365,8 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             b.rebuild();
             b.paint();
         });
+        // Tells the shell's start check the bar is up, also when auto-hide keeps it hidden.
+        let _ = SetPropW(hwnd, &HSTRING::from(bus::PAINTED_PROP), Some(HANDLE(1 as _)));
         log::line("initial taskbar paint returned; starting pin resolution");
         pin_worker::start(hwnd, (G::ICON * dpi as f32 / 96.0).round() as i32, &pin_inbox);
         SetTimer(Some(hwnd), TIMER_CLOCK, shelldata::clock::ms_to_next_minute() as u32, None);

@@ -142,9 +142,7 @@ fn find_window_for_pid(
 
 pub fn ready(owner: bus::Owner) -> bool {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        IsWindowVisible, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL};
     let visible_class = match owner {
         bus::Owner::Taskbar => Some("Shell_TrayWnd"),
         bus::Owner::Desktop => Some("Progman"),
@@ -152,7 +150,7 @@ pub fn ready(owner: bus::Owner) -> bool {
     };
     let window = match visible_class {
         Some(class) => find_window_for_pid(None, &windows::core::HSTRING::from(class), std::process::id())
-            .filter(|&window| unsafe { IsWindowVisible(window) }.as_bool()),
+            .filter(|&window| shown_or_painted(window)),
         None => own_window(owner),
     };
     // SAFETY: a bounded send of a message every window accepts.
@@ -161,9 +159,16 @@ pub fn ready(owner: bus::Owner) -> bool {
     }.0 != 0)
 }
 
+/// Visible, or drawn and kept hidden on purpose (an auto-hidden taskbar at start).
+fn shown_or_painted(window: windows::Win32::Foundation::HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetPropW, IsWindowVisible};
+    // SAFETY: reads of a window that may be gone (then both are false).
+    unsafe { IsWindowVisible(window).as_bool() || !GetPropW(window, &windows::core::HSTRING::from(bus::PAINTED_PROP)).is_invalid() }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::find_window_for_pid;
+    use super::{find_window_for_pid, ready};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -176,6 +181,45 @@ mod tests {
 
     unsafe extern "system" fn fixture_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    }
+
+    /// His PC, 2026-11-22: with auto-hide on, the bar starts hidden and the shell gave up after 20 s.
+    #[test]
+    fn a_hidden_auto_hide_taskbar_is_ready_once_painted() {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::UI::WindowsAndMessaging::{SetPropW, WS_POPUP};
+        let class = HSTRING::from("Shell_TrayWnd");
+        let window = unsafe {
+            let module = GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSW { lpfnWndProc: Some(fixture_proc), hInstance: module, lpszClassName: PCWSTR(class.as_ptr()), ..Default::default() };
+            assert_ne!(RegisterClassW(&wc), 0);
+            // A top-level popup never shown, like the auto-hidden bar before its first reveal.
+            CreateWindowExW(WINDOW_EX_STYLE(0), &class, None, WS_POPUP, 0, 0, 10, 10, None, None, Some(module), None).unwrap()
+        };
+        // ready() sends WM_NULL from another thread in the shell; answer it from a pump here.
+        let raw = window.0 as isize;
+        let probe = std::thread::spawn(move || {
+            let window = HWND(raw as _);
+            let before = ready(bus::Owner::Taskbar);
+            unsafe { SetPropW(window, &HSTRING::from(bus::PAINTED_PROP), Some(HANDLE(1 as _))).unwrap() };
+            let after = ready(bus::Owner::Taskbar);
+            (before, after)
+        });
+        let started = Instant::now();
+        while !probe.is_finished() && started.elapsed() < Duration::from_secs(5) {
+            let mut msg = Default::default();
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PM_REMOVE, PeekMessageW};
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (before, after) = probe.join().unwrap();
+        unsafe { DestroyWindow(window).unwrap() };
+        assert!(!before, "a hidden bar that has not drawn is not ready");
+        assert!(after, "a hidden bar that has drawn is ready");
     }
 
     #[test]
