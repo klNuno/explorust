@@ -4,6 +4,7 @@ use std::io::{self, Read};
 use std::time::Duration;
 
 pub const FALLBACK_EVENT: &str = r"Local\explorust-guard-fallback";
+pub const GRAPHICS_LOST: u32 = 7;
 pub const REGISTRATION: Duration = Duration::from_secs(20);
 pub const PARTS: Duration = Duration::from_secs(20);
 pub const HOST: Duration = Duration::from_secs(100);

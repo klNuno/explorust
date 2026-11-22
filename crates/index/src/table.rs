@@ -113,6 +113,16 @@ fn word_start(prev: u8) -> bool {
     matches!(prev, b' ' | b'.' | b'-' | b'_' | b'(' | b'[' | b'+' | b',')
 }
 
+/// The default Vec growth can double every arena at once on the first journal insert after
+/// `shrink`. Give large arrays headroom for future writes without committing another table.
+fn reserve_append<T>(vec: &mut Vec<T>, count: usize) {
+    let required = vec.len() + count;
+    if required > vec.capacity() {
+        let headroom = (vec.capacity() / 16).max(4096 / size_of::<T>());
+        vec.reserve_exact((vec.capacity() + headroom).max(required) - vec.len());
+    }
+}
+
 impl Table {
     pub fn new() -> Table {
         Table { case: vec![0], fold: vec![SEP], id: TABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ..Default::default() }
@@ -222,20 +232,6 @@ impl Table {
         self.case[at >> 3] & (1 << (at & 7)) != 0
     }
 
-    fn mark(&mut self, at: usize) {
-        if self.case.len() <= at >> 3 {
-            self.case.resize((at >> 3) + 1, 0);
-        }
-        self.case[at >> 3] |= 1 << (at & 7);
-    }
-
-    fn grow_case(&mut self) {
-        let need = self.fold.len().div_ceil(8);
-        if self.case.len() < need {
-            self.case.resize(need, 0);
-        }
-    }
-
     pub fn name(&self, rec: u32) -> Option<String> {
         let s = self.slots.get(rec as usize)?;
         if s.name == NONE {
@@ -285,6 +281,8 @@ impl Table {
         }
         let r = rec as usize;
         if r >= self.slots.len() {
+            let count = r + 1 - self.slots.len();
+            reserve_append(&mut self.slots, count);
             self.slots.resize(r + 1, FREE);
         }
         if self.pruned_parent(parent) {
@@ -320,19 +318,27 @@ impl Table {
             self.live -= 1;
         }
         let idx = self.starts.len() as u32;
+        reserve_append(&mut self.starts, 1);
+        reserve_append(&mut self.recs, 1);
+        reserve_append(&mut self.meta, 1);
         self.starts.push(self.fold.len() as u32);
         self.recs.push(rec);
         self.meta.push(write_time(modified, previous) | if under { META_NOISY } else { 0 });
         let base = self.fold.len();
-        let mut marks = Vec::new();
-        fold::push_folded(name, &mut self.fold, |i| marks.push(base + i));
+        let count = name.len() + 1;
+        reserve_append(&mut self.fold, count);
+        let case_len = (base + count).div_ceil(8);
+        let extra_case = case_len - self.case.len();
+        reserve_append(&mut self.case, extra_case);
+        self.case.resize(case_len, 0);
+        fold::push_folded(name, &mut self.fold, |i| {
+            let at = base + i;
+            self.case[at >> 3] |= 1 << (at & 7);
+        });
         self.fold.push(SEP);
-        self.grow_case();
-        for m in marks {
-            self.mark(m);
-        }
         self.slots[r] = Slot { parent, name: idx | flags };
         self.live += 1;
+        self.compact_if_needed();
     }
 
     pub fn remove(&mut self, rec: u32) {
@@ -346,41 +352,59 @@ impl Table {
         *s = FREE;
         self.dead += 1;
         self.live -= 1;
-        if self.dead > 200_000 && self.dead > self.live {
+        self.compact_if_needed();
+    }
+
+    fn compact_if_needed(&mut self) {
+        // A busy journal can rename files indefinitely without issuing any deletes. Reclaim
+        // the old names in either case, after enough edits to amortize scanning the arena.
+        if self.dead >= 200_000 && self.dead > self.live / 8 {
             self.compact();
         }
     }
 
-    /// Rewrites the arenas without the names of deleted or renamed records.
+    /// Rewrites the arenas in place without the names of deleted or renamed records.
     pub fn compact(&mut self) {
-        let mut fold = Vec::with_capacity(self.fold.len().saturating_sub(self.dead * 8));
-        fold.push(SEP);
-        let mut case = vec![0u8; self.case.len()];
-        let mut starts = Vec::with_capacity(self.live);
-        let mut recs = Vec::with_capacity(self.live);
-        let mut meta = Vec::with_capacity(self.live);
+        if self.dead == 0 {
+            return;
+        }
+        let mut kept = 0;
+        let mut base = usize::from(self.fold.first() == Some(&SEP));
         for i in 0..self.starts.len() {
             let rec = self.recs[i];
             if rec == NONE {
                 continue;
             }
             let (a, b) = self.name_range(i);
-            let slot = &mut self.slots[rec as usize];
-            slot.name = (slot.name & !IDX) | starts.len() as u32;
-            starts.push(fold.len() as u32);
-            recs.push(rec);
-            meta.push(self.meta[i]);
-            let base = fold.len();
-            for k in a..b {
-                if self.changed(k) {
-                    let at = base + k - a;
-                    case[at >> 3] |= 1 << (at & 7);
+            if base != a {
+                // The write cursor trails the read cursor, so later case bits remain intact.
+                // Copy the separator's zero bit as well, for the next name appended there.
+                for (at, source) in (base..).zip(a..=b) {
+                    let changed = u8::from(self.changed(source));
+                    let mask = 1 << (at & 7);
+                    let byte = &mut self.case[at >> 3];
+                    *byte = (*byte & !mask) | (changed << (at & 7));
                 }
+                self.fold.copy_within(a..=b, base);
             }
-            fold.extend_from_slice(&self.fold[a..=b]);
+            let slot = &mut self.slots[rec as usize];
+            slot.name = (slot.name & !IDX) | kept as u32;
+            self.starts[kept] = base as u32;
+            self.recs[kept] = rec;
+            self.meta[kept] = self.meta[i];
+            base += b + 1 - a;
+            kept += 1;
         }
-        case.truncate(fold.len().div_ceil(8));
-        (self.case, self.fold, self.starts, self.recs, self.meta, self.dead) = (case, fold, starts, recs, meta, 0);
+        self.fold.truncate(base);
+        self.case.truncate(base.div_ceil(8));
+        if base % 8 != 0 && let Some(last) = self.case.last_mut() {
+            *last &= (1 << (base % 8)) - 1;
+        }
+        self.starts.truncate(kept);
+        self.recs.truncate(kept);
+        self.meta.truncate(kept);
+        self.dead = 0;
+        self.shrink();
     }
 
     /// Sets the inherited noisy bit of every record from its folders and drops the names inside
@@ -903,5 +927,124 @@ mod tests {
             assert!(!f.is_empty());
         }
         eprintln!("all queries {:.1} ms", start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    #[test]
+    fn first_journal_update_does_not_double_the_table() {
+        let mut t = Table::new();
+        for rec in 16..32_784 {
+            t.upsert(rec, ROOT, "Some File.txt", false, false, i64::from(rec));
+        }
+        t.shrink();
+        let initial = t.bytes();
+        t.upsert(16, ROOT, "Renamed File.txt", false, false, 0);
+        t.upsert(32_784, ROOT, "Another File.txt", false, false, 10);
+        let updated = t.bytes();
+        assert!(updated <= initial + initial / 8, "{initial} bytes grew to {updated}");
+        assert_eq!(t.query("renamed", 1)[0].modified(), 16);
+        assert_eq!(t.name(32_784).as_deref(), Some("Another File.txt"));
+    }
+
+    #[test]
+    fn compaction_preserves_unicode_case_and_clears_bits_for_the_next_append() {
+        let mut t = Table::new();
+        t.upsert(16, ROOT, "DELETE-A", false, false, 0);
+        t.upsert(17, ROOT, "ÉTÉ-ß.txt", false, false, 11);
+        t.upsert(18, ROOT, "REMOVE-ME.txt", false, false, 0);
+        t.upsert(19, ROOT, "ΣΊΣΥΦΟΣ.txt", false, true, 23);
+        t.remove(16);
+        t.remove(18);
+        t.compact();
+        t.upsert(20, ROOT, "lower.txt", false, false, 0);
+        for (record, name) in [(17, "ÉTÉ-ß.txt"), (19, "ΣΊΣΥΦΟΣ.txt"), (20, "lower.txt")] {
+            assert_eq!(t.name(record).as_deref(), Some(name));
+        }
+        let hit = t.query("σίσυφοσ", 1)[0];
+        assert_eq!((hit.rec, hit.modified(), hit.noisy()), (19, 23, true));
+    }
+
+    #[test]
+    fn rename_only_journal_reclaims_old_names() {
+        let mut t = Table::new();
+        for i in 0..200_010 {
+            let name = if i % 2 == 0 { "renamed.txt" } else { "original.txt" };
+            t.upsert(16, ROOT, name, false, false, i64::from(i));
+        }
+        assert!(t.bytes() < 32 * 1024);
+        assert_eq!(t.name(16).as_deref(), Some("original.txt"));
+        assert_eq!(t.query("original", 1)[0].modified(), 200_009);
+        assert!(t.query("renamed", 1).is_empty());
+    }
+
+    #[test]
+    #[ignore = "release-mode benchmark with 7.7 million names"]
+    fn journal_memory_and_query_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn memory(label: &str, volumes: &[Table]) {
+            let names: usize = volumes.iter().map(Table::len).sum();
+            let bytes: usize = volumes.iter().map(Table::bytes).sum();
+            eprintln!("{label}: {names} names, {bytes} table bytes ({:.1} B/name)", bytes as f64 / names as f64);
+            if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+                for line in s.lines().filter(|s| s.starts_with("Rss:") || s.starts_with("Private_")) {
+                    eprintln!("{line}");
+                }
+            }
+            #[cfg(windows)]
+            {
+                use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+                use windows::Win32::System::Threading::GetCurrentProcess;
+                let size = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+                let mut c = PROCESS_MEMORY_COUNTERS_EX { cb: size, ..Default::default() };
+                // SAFETY: the API fills the structure size supplied here for this process.
+                unsafe { GetProcessMemoryInfo(GetCurrentProcess(), (&mut c as *mut PROCESS_MEMORY_COUNTERS_EX).cast(), size) }.unwrap();
+                eprintln!("private bytes {}, commit {}, peak commit {}, working set {}", c.PrivateUsage, c.PagefileUsage, c.PeakPagefileUsage, c.WorkingSetSize);
+            }
+        }
+
+        let start = Instant::now();
+        let mut volumes = Vec::new();
+        for count in [4_900_000u32, 2_000_000, 800_000] {
+            let mut table = Table::new();
+            let folders = count / 100;
+            for i in 0..count {
+                let rec = 16 + i + i / 8;
+                let dir = i < folders;
+                let folder = i % folders;
+                let parent = if dir { ROOT } else { 16 + folder + folder / 8 };
+                let word = ["Report", "setup", "image", "Microsoft", "config", "data", "readme", "photo", "build", "notes"][i as usize % 10];
+                let name = if dir { format!("{word} folder {i}") } else { format!("{word}_archive_{:07}_{i:07}.txt", i / 1000) };
+                table.upsert(rec, parent, &name, dir, false, 133_800_000_000_000_000 + i64::from(i));
+            }
+            table.settle();
+            table.shrink();
+            volumes.push(table);
+        }
+        eprintln!("build: {:.2} s", start.elapsed().as_secs_f64());
+        memory("published", &volumes);
+        for table in &mut volumes {
+            let count = table.len() as u32;
+            table.upsert(16 + count + count / 8, 16, "renamed final archive.txt", false, false, 1);
+        }
+        memory("after journal insert", &volumes);
+
+        for query in ["r", "rep", "report_archive_0000000", "archive_0004031", "renamed final", "missing file"] {
+            let mut samples = [0; 9];
+            let mut checksum = 0u64;
+            for duration in &mut samples {
+                let start = Instant::now();
+                checksum = 0;
+                for table in &volumes {
+                    for hit in table.query(black_box(query), 24) {
+                        checksum = checksum.wrapping_add(u64::from(hit.rec) ^ hit.modified());
+                    }
+                }
+                black_box(checksum);
+                *duration = start.elapsed().as_micros();
+            }
+            samples.sort_unstable();
+            eprintln!("{query:?}: median {:.2} ms, max {:.2} ms, checksum {checksum}", samples[4] as f64 / 1000.0, samples[8] as f64 / 1000.0);
+        }
     }
 }

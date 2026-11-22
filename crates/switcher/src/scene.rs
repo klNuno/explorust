@@ -49,7 +49,6 @@ fn rounded(r: &Rect, radius: f32) -> D2D1_ROUNDED_RECT {
 }
 
 impl Scene {
-    /// A surface as large as the monitor; the panel window clips it to its own size.
     pub fn new(hwnd: HWND, w_px: u32, h_px: u32) -> Result<Self> {
         let surface = Surface::new(hwnd, w_px, h_px)?;
         let text = Text::new()?;
@@ -62,6 +61,14 @@ impl Scene {
         }
         let glyph = text.format("Segoe Fluent Icons", 10.0, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?;
         Ok(Self { surface, text, title, glyph, bitmaps: HashMap::new() })
+    }
+
+    pub fn resize(&self, w_px: u32, h_px: u32) -> Result<()> {
+        self.surface.resize(w_px, h_px)
+    }
+
+    pub fn keep_icons(&mut self, icons: &HashMap<String, Option<Image>>) {
+        self.bitmaps.retain(|key, _| icons.contains_key(key));
     }
 
     fn bitmap(&mut self, key: &str, icons: &HashMap<String, Option<Image>>) -> Option<ID2D1Bitmap1> {

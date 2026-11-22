@@ -6,12 +6,16 @@ pub mod style;
 #[cfg(windows)]
 pub mod backdrop;
 #[cfg(windows)]
+mod device;
+#[cfg(windows)]
 pub mod surface;
 #[cfg(windows)]
 pub mod text;
 
 #[cfg(windows)]
 pub use surface::{Device, Surface};
+#[cfg(windows)]
+pub use device::SwapChain;
 #[cfg(windows)]
 pub use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F as Color;
 

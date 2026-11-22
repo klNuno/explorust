@@ -278,17 +278,22 @@ impl Sw {
             self.layout = L::layout(&aspects, mw, mh);
             let (x, y) = self.layout.origin(Rect::new(0.0, 0.0, mw, mh));
             let px = |v: f32| (v * s).round() as i32;
+            let (width, height) = (px(self.layout.w), px(self.layout.h));
             let _ = SetWindowPos(
                 self.panel,
                 Some(HWND_TOPMOST),
                 rc.left + px(x),
                 rc.top + px(y),
-                px(self.layout.w),
-                px(self.layout.h),
+                width,
+                height,
                 SWP_NOACTIVATE,
             );
-            if self.scene.is_none() {
-                match Scene::new(self.panel, (rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32) {
+            if let Some(scene) = &self.scene {
+                if let Err(e) = scene.resize(width as u32, height as u32) {
+                    log::line(&format!("scene resize: {e}"));
+                }
+            } else {
+                match Scene::new(self.panel, width as u32, height as u32) {
                     Ok(sc) => self.scene = Some(sc),
                     Err(e) => log::line(&format!("scene: {e}")),
                 }
@@ -363,6 +368,9 @@ impl Sw {
             }
         }
         self.unregister();
+        if shown && let Some(scene) = &self.scene && let Err(e) = scene.resize(1, 1) {
+            log::line(&format!("hidden scene resize: {e}"));
+        }
         shown
     }
 
@@ -383,7 +391,18 @@ impl Sw {
                 }
             }
         }
-        self.entries.len() != before
+        let changed = self.entries.len() != before;
+        if changed {
+            self.keep_icons();
+        }
+        changed
+    }
+
+    fn keep_icons(&mut self) {
+        self.icons.retain(|key, _| self.entries.iter().any(|entry| entry.key == *key));
+        if let Some(scene) = &mut self.scene {
+            scene.keep_icons(&self.icons);
+        }
     }
 }
 
@@ -423,6 +442,7 @@ fn on_next(back: bool) {
         // SAFETY: plain query.
         s.orig = unsafe { GetForegroundWindow() };
         s.entries = wl::snapshot(s.panel);
+        s.keep_icons();
         s.sel = model::first(s.entries.len(), back);
         s.phase = Phase::Pending;
         // SAFETY: timers on our own command window.
@@ -765,7 +785,7 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             // SAFETY: the box was made by `spawn_icons` and is ours now.
             let got = unsafe { Box::from_raw(lp.0 as *mut Vec<(String, Option<Image>)>) };
             with(|s| {
-                s.icons.extend(*got);
+                s.icons.extend(got.into_iter().filter(|(key, _)| s.entries.iter().any(|entry| entry.key == *key)));
                 s.draw();
             });
             LRESULT(0)

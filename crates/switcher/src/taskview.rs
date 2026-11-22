@@ -205,6 +205,10 @@ impl Tv {
     fn build(&mut self) {
         self.unregister();
         self.entries = wl::snapshot(self.hwnd);
+        self.icons.retain(|key, _| self.entries.iter().any(|entry| entry.key == *key));
+        if let Some(painter) = &mut self.painter {
+            painter.keep_icons(&self.icons);
+        }
         self.read_desktops();
         let mut aspects = Vec::with_capacity(self.entries.len());
         for e in &self.entries {
@@ -297,10 +301,15 @@ pub fn toggle() {
             // The work area, not the monitor: Windows 11 keeps the taskbar visible under Task View.
             t.mon = mi.rcWork;
             let rc = t.mon;
-            let _ = SetWindowPos(t.hwnd, Some(HWND_TOPMOST), rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOACTIVATE);
+            let (width, height) = (rc.right - rc.left, rc.bottom - rc.top);
+            let _ = SetWindowPos(t.hwnd, Some(HWND_TOPMOST), rc.left, rc.top, width, height, SWP_NOACTIVATE);
             t.scale = GetDpiForWindow(t.hwnd).max(96) as f32 / 96.0;
-            if t.painter.is_none() {
-                match Painter::new(t.hwnd, (rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32) {
+            if let Some(painter) = &t.painter {
+                if let Err(e) = painter.resize(width as u32, height as u32) {
+                    log::line(&format!("task view resize: {e}"));
+                }
+            } else {
+                match Painter::new(t.hwnd, width as u32, height as u32) {
                     Ok(p) => t.painter = Some(p),
                     Err(e) => log::line(&format!("task view painter: {e}")),
                 }
@@ -364,6 +373,9 @@ fn close(then: Option<HWND>) {
             let _ = ReleaseCapture();
             let _ = KillTimer(Some(t.hwnd), T_REBUILD);
             let _ = ShowWindow(t.hwnd, SW_HIDE);
+        }
+        if let Some(painter) = &t.painter && let Err(e) = painter.resize(1, 1) {
+            log::line(&format!("hidden task view resize: {e}"));
         }
         Some(then.unwrap_or(t.orig))
     })
@@ -539,7 +551,7 @@ fn ms(t: Instant) -> f32 {
 
 pub fn icons_arrived(got: Vec<(String, Option<Image>)>) {
     with(|t| {
-        t.icons.extend(got);
+        t.icons.extend(got.into_iter().filter(|(key, _)| t.entries.iter().any(|entry| entry.key == *key)));
         t.draw();
     });
 }

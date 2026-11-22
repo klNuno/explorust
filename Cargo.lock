@@ -1878,6 +1878,7 @@ dependencies = [
  "inject",
  "keys",
  "notify",
+ "render",
  "start",
  "switcher",
  "taskbar",

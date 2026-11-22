@@ -4,6 +4,7 @@
 use crate::startup_retry::SessionStartup;
 use crate::{actions, components, events, guardwatch, keyhost, launch_timing, log, minimized, problem, selftest};
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
 
@@ -15,6 +16,7 @@ pub const SELF_TEST_FAILED: i32 = 4;
 pub const RELOAD: i32 = 5;
 /// A problem found inside (`problem`): the guard starts explorer.exe and tells the user.
 pub const PROBLEM: i32 = 6;
+static GRAPHICS_LOST: AtomicBool = AtomicBool::new(false);
 struct Args {
     ready_event: Option<String>,
     staged_ready: bool,
@@ -99,6 +101,13 @@ fn shell(args: &Args) -> i32 {
         }
     };
     let exits = ExitRequests { quit, reload };
+    if components::parts_off().iter().any(|line| line == "render-stats") {
+        render::Device::trace(log::line);
+    }
+    render::Device::on_device_lost(|error| {
+        log::line(&format!("graphics device lost: {error}"));
+        GRAPHICS_LOST.store(true, Ordering::Release);
+    });
     let offered = args.ready_event.as_deref()
         .and_then(|name| events::Owned::open_for_signal(&launch_timing::staged_event(name)));
     let negotiated = offered.is_some();
@@ -282,6 +291,8 @@ impl ExitRequests {
         } else if self.reload.wait(0) {
             log::line("reload requested");
             RELOAD
+        } else if GRAPHICS_LOST.load(Ordering::Acquire) {
+            launch_timing::GRAPHICS_LOST as i32
         } else if let Some(why) = problem::take() {
             log::line(&format!("stopping on a problem: {why}"));
             PROBLEM
@@ -295,7 +306,7 @@ impl ExitRequests {
 fn shutdown(code: i32) -> i32 {
     keyhost::stop();
     components::shutdown_all();
-    if code != RELOAD {
+    if code != RELOAD && code != launch_timing::GRAPHICS_LOST as i32 {
         minimized::restore();
     }
     code
