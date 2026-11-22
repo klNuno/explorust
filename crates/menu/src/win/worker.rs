@@ -5,7 +5,7 @@
 //!
 //! Each fill has a generation; the worker keeps the menu of the latest one until the next fill.
 
-use super::{classic, log, read};
+use super::{ClipboardRoute, classic, log, read};
 use crate::model::Entry;
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -42,9 +42,9 @@ pub enum Job {
     Fill { gn: u64, folder: Pidl, children: Vec<Pidl>, flags: u32, reply: isize, owner: isize, site: Option<usize> },
     /// Fills submenu `menu` (row `row` of level `depth`) and reads it.
     Sub { gn: u64, menu: isize, index: u32, depth: usize, row: usize, reply: isize },
-    Invoke { gn: u64, id: u32, owner: isize, at: (i32, i32), shift: bool, ctrl: bool },
+    Invoke { gn: u64, id: u32, owner: isize, at: (i32, i32), shift: bool, ctrl: bool, route: Option<ClipboardRoute> },
     /// Tracks the classic menu of the same HMENU and runs what is picked.
-    Classic { gn: u64, owner: isize, at: (i32, i32) },
+    Classic { gn: u64, owner: isize, at: (i32, i32), route: Option<ClipboardRoute> },
 }
 
 pub enum Reply {
@@ -213,20 +213,20 @@ fn handle(job: Job) {
             });
             post(reply, Reply::Sub { gn, depth, row, entries: entries.unwrap_or_default() });
         }
-        Job::Invoke { gn, id, owner, at, shift, ctrl } => {
+        Job::Invoke { gn, id, owner, at, shift, ctrl, route } => {
             let cm = CURRENT.with(|c| c.borrow().as_ref().filter(|c| c.gn == gn).map(|c| c.cm.clone()));
             match cm {
-                Some(cm) => classic::invoke_with(&cm, HWND(owner as _), id, super::FIRST, POINT { x: at.0, y: at.1 }, shift, ctrl),
+                Some(cm) => classic::invoke_with(&cm, HWND(owner as _), id, super::FIRST, POINT { x: at.0, y: at.1 }, shift, ctrl, route.as_ref()),
                 None => log::line(&format!("worker: invoke {id} of stale menu {gn}")),
             }
         }
-        Job::Classic { gn, owner, at } => {
+        Job::Classic { gn, owner, at, route } => {
             let cur = CURRENT.with(|c| c.borrow().as_ref().filter(|c| c.gn == gn).map(|c| (c.cm.clone(), c.menu)));
             let Some((cm, menu)) = cur else { return };
             let id = classic::track(&cm, menu, at.0, at.1);
             super::give_back(HWND(owner as _));
             if id >= super::FIRST {
-                classic::invoke_with(&cm, HWND(owner as _), id, super::FIRST, POINT { x: at.0, y: at.1 }, false, false);
+                classic::invoke_with(&cm, HWND(owner as _), id, super::FIRST, POINT { x: at.0, y: at.1 }, false, false, route.as_ref());
             }
         }
     }

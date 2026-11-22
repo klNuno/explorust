@@ -24,11 +24,15 @@ impl<T> Default for Inbox<T> {
 
 impl<T> Inbox<T> {
     pub fn send(&self, job: T) -> bool {
+        self.send_with(|| job)
+    }
+
+    pub fn send_with(&self, job: impl FnOnce() -> T) -> bool {
         let mut state = self.0.lock().unwrap();
         if state.closed {
             return false;
         }
-        state.jobs.push_back(job);
+        state.jobs.push_back(job());
         state.wake();
         true
     }

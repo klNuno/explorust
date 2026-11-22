@@ -2,7 +2,7 @@
 //! `TrackPopupMenuEx`, owned by a hidden window that forwards the owner-draw and popup messages to
 //! the handler, and the command invocation shared with the Windows 11 menu.
 
-use super::log;
+use super::{ClipboardRoute, log, route_clipboard};
 use std::cell::RefCell;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
@@ -113,14 +113,19 @@ pub fn track(cm: &IContextMenu, menu: HMENU, x: i32, y: i32) -> u32 {
 }
 
 /// Runs command `id` (ids start at `first`) with the point and the modifier keys, as Explorer does.
-pub fn invoke(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POINT) {
+pub fn invoke(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POINT, route: Option<&ClipboardRoute>) {
     // SAFETY: modifier state of this thread's input.
     let (shift, ctrl) = unsafe { (GetKeyState(VK_SHIFT.0 as i32) < 0, GetKeyState(VK_CONTROL.0 as i32) < 0) };
-    invoke_with(cm, owner, id, first, at, shift, ctrl);
+    invoke_with(cm, owner, id, first, at, shift, ctrl, route);
 }
 
 /// `invoke` with the modifier keys given (the worker thread has no keyboard state of its own).
-pub fn invoke_with(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POINT, shift: bool, ctrl: bool) {
+pub fn invoke_with(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POINT, shift: bool, ctrl: bool, route: Option<&ClipboardRoute>) {
+    let verb = super::read::verb(cm, id - first);
+    if route_clipboard(route, &verb) {
+        log::line(&format!("route id {id} verb '{verb}' to Files"));
+        return;
+    }
     let offset = (id - first) as usize;
     let mut mask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
     if shift {
@@ -139,7 +144,6 @@ pub fn invoke_with(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POIN
         ptInvoke: at,
         ..Default::default()
     };
-    let verb = super::read::verb(cm, id - first);
     let t = std::time::Instant::now();
     CURRENT.with(|c| *c.borrow_mut() = Some(cm.clone()));
     // SAFETY: the info struct outlives the call; the verb is MAKEINTRESOURCE(offset).

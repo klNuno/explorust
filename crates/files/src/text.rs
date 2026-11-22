@@ -18,6 +18,7 @@ pub struct Strings {
     pub select_all: &'static str,
     pub select_none: &'static str,
     pub properties: &'static str,
+    pub clipboard_timeout: &'static str,
 }
 
 pub const EN: Strings = Strings {
@@ -37,6 +38,7 @@ pub const EN: Strings = Strings {
     select_all: "Select all",
     select_none: "Select none",
     properties: "Properties",
+    clipboard_timeout: "The clipboard did not respond. Try pasting again.",
 };
 
 pub const FR: Strings = Strings {
@@ -65,6 +67,7 @@ pub const FR: Strings = Strings {
     select_all: "S\u{e9}lectionner tout",
     select_none: "Ne rien s\u{e9}lectionner",
     properties: "Propri\u{e9}t\u{e9}s",
+    clipboard_timeout: "Le presse-papiers ne répond pas. Réessayez de coller.",
 };
 
 /// Strings for a UI language tag such as `fr-FR`; English for anything else.

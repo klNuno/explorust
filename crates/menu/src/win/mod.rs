@@ -9,9 +9,12 @@ mod tip;
 mod uia;
 mod worker;
 
-use crate::model;
+pub use tip::Tip as TrackingTip;
+
+use crate::{ClipboardVerb, model};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::Common::{ITEMIDLIST, STRRET};
@@ -35,9 +38,18 @@ const CMF_CANRENAME: u32 = 0x10;
 const CMF_EXTENDEDVERBS: u32 = 0x100;
 const SUBCLASS_ID: usize = 0x6D65_6E75;
 
+/// A view owner can capture its selection and destination on the UI thread. The resulting
+/// route may also be invoked by the worker that tracks Show more options.
+pub type ClipboardRoute = Arc<dyn Fn(ClipboardVerb) -> bool + Send + Sync>;
+type ClipboardHandler = fn(HWND, &IShellView, bool) -> Option<ClipboardRoute>;
+
+fn route_clipboard(route: Option<&ClipboardRoute>, verb: &str) -> bool {
+    route.zip(ClipboardVerb::from_canonical(verb)).is_some_and(|(handle, command)| handle(command))
+}
+
 thread_local! {
     /// The hooked views of this thread: SHELLDLL_DefView and its IShellView.
-    static VIEWS: RefCell<Vec<(HWND, IShellView)>> = const { RefCell::new(Vec::new()) };
+    static VIEWS: RefCell<Vec<(HWND, IShellView, Option<ClipboardHandler>)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Shows the context menu of `cm` at a screen point and runs the command picked. `items` is the
@@ -45,7 +57,7 @@ thread_local! {
 /// classic menu explicitly (Shift held).
 pub fn show(owner: HWND, cm: &IContextMenu, x: i32, y: i32, items: bool, classic: bool) {
     let prefer_classic = classic || classic_preferred();
-    show_at(owner, cm, POINT { x, y }, items, prefer_classic, classic, Instant::now());
+    show_at(owner, cm, POINT { x, y }, items, prefer_classic, classic, Instant::now(), None);
 }
 
 fn classic_preferred() -> bool {
@@ -64,7 +76,7 @@ fn classic_preferred() -> bool {
 
 /// The menu of `cm`, filled on this thread (after the first frame when a menu of its kind was
 /// shown before).
-fn show_at(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool, extended: bool, t0: Instant) {
+fn show_at(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool, extended: bool, t0: Instant, route: Option<&ClipboardRoute>) {
     // SAFETY: a menu this thread creates, fills through the handler and destroys.
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else { return };
     let mut flags = if items { CMF_CANRENAME } else { 0 };
@@ -78,7 +90,7 @@ fn show_at(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool
         let id = classic::track(cm, menu, at.x, at.y);
         give_back(owner);
         if id >= FIRST {
-            classic::invoke(cm, owner, id, FIRST, at);
+            classic::invoke(cm, owner, id, FIRST, at, route);
         }
         let _ = unsafe { DestroyMenu(menu) };
         return;
@@ -106,12 +118,12 @@ fn show_at(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool
     let pick = popup::run(req);
     give_back(owner);
     match pick {
-        Some(popup::Pick::Command(id, _)) => classic::invoke(cm, owner, id, FIRST, at),
+        Some(popup::Pick::Command(id, _)) => classic::invoke(cm, owner, id, FIRST, at, route),
         Some(popup::Pick::More) => {
             let id = classic::track(cm, menu, at.x, at.y);
             give_back(owner);
             if id >= FIRST {
-                classic::invoke(cm, owner, id, FIRST, at);
+                classic::invoke(cm, owner, id, FIRST, at, route);
             }
         }
         Some(popup::Pick::Fallback) | None => log::line("dismissed"),
@@ -264,7 +276,7 @@ fn prewarm_view(defview: HWND, view: &IShellView) {
 
 /// The selection's menu built and filled on the worker; the first frame shows the static part.
 /// False when the selection cannot be given to the worker.
-fn show_worker(defview: HWND, view: &IShellView, fv: &IFolderView2, at: POINT, t0: Instant) -> bool {
+fn show_worker(defview: HWND, view: &IShellView, fv: &IFolderView2, at: POINT, t0: Instant, route: Option<&ClipboardRoute>) -> bool {
     let Some((folder, children, key)) = selection(fv, false) else { return false };
     let Some(reply) = popup::reply_window() else { return false };
     let gn = GEN.fetch_add(1, Ordering::Relaxed);
@@ -301,11 +313,13 @@ fn show_worker(defview: HWND, view: &IShellView, fv: &IFolderView2, at: POINT, t
             log::line(&format!("rename through the view: {:?}", r.err().map(|e| e.code())));
         }
         Some(popup::Pick::Command(id, verb)) => {
-            log::line(&format!("pick id {id} [{verb}]: the worker runs it"));
-            worker::send(worker::Job::Invoke { gn, id, owner: defview.0 as isize, at: (at.x, at.y), shift, ctrl });
+            if !route_clipboard(route, &verb) {
+                log::line(&format!("pick id {id} [{verb}]: the worker runs it"));
+                worker::send(worker::Job::Invoke { gn, id, owner: defview.0 as isize, at: (at.x, at.y), shift, ctrl, route: route.cloned() });
+            }
         }
         Some(popup::Pick::More) => {
-            worker::send(worker::Job::Classic { gn, owner: defview.0 as isize, at: (at.x, at.y) });
+            worker::send(worker::Job::Classic { gn, owner: defview.0 as isize, at: (at.x, at.y), route: route.cloned() });
         }
         Some(popup::Pick::Fallback) => {
             log::line("worker fill failed: the view's own menu fills here");
@@ -330,8 +344,16 @@ fn give_back(owner: HWND) {
 /// view's thread; when the view has no window yet, it is tried again on a thread timer. The hook
 /// goes away with the window.
 pub fn hook(view: &IShellView) {
-    if !try_hook(view) {
-        PENDING.with(|p| p.borrow_mut().push((view.clone(), 0)));
+    hook_view(view, None);
+}
+
+pub fn hook_with_clipboard(view: &IShellView, handler: ClipboardHandler) {
+    hook_view(view, Some(handler));
+}
+
+fn hook_view(view: &IShellView, clipboard: Option<ClipboardHandler>) {
+    if !try_hook(view, clipboard) {
+        PENDING.with(|p| p.borrow_mut().push((view.clone(), 0, clipboard)));
         // SAFETY: a thread timer; its callback runs from this thread's message loop.
         unsafe {
             SetTimer(None, 0, 50, Some(retry));
@@ -341,16 +363,16 @@ pub fn hook(view: &IShellView) {
 
 thread_local! {
     /// Views whose window did not exist yet, with the number of tries.
-    static PENDING: RefCell<Vec<(IShellView, u32)>> = const { RefCell::new(Vec::new()) };
+    static PENDING: RefCell<Vec<(IShellView, u32, Option<ClipboardHandler>)>> = const { RefCell::new(Vec::new()) };
 }
 
 unsafe extern "system" fn retry(_: HWND, _: u32, id: usize, _: u32) {
     let left = PENDING.with(|p| {
         let mut p = p.borrow_mut();
-        let views: Vec<(IShellView, u32)> = p.drain(..).collect();
-        for (v, n) in views {
-            if !try_hook(&v) && n < 40 {
-                p.push((v, n + 1));
+        let views: Vec<_> = p.drain(..).collect();
+        for (v, n, clipboard) in views {
+            if !try_hook(&v, clipboard) && n < 40 {
+                p.push((v, n + 1, clipboard));
             } else if n >= 40 {
                 log::line("hook: gave up on a view without a window");
             }
@@ -365,7 +387,7 @@ unsafe extern "system" fn retry(_: HWND, _: u32, id: usize, _: u32) {
     }
 }
 
-fn try_hook(view: &IShellView) -> bool {
+fn try_hook(view: &IShellView, clipboard: Option<ClipboardHandler>) -> bool {
     // SAFETY: the view's own window, subclassed on its thread.
     unsafe {
         let hwnd = match view.GetWindow() {
@@ -377,8 +399,8 @@ fn try_hook(view: &IShellView) -> bool {
         };
         VIEWS.with(|v| {
             let mut v = v.borrow_mut();
-            v.retain(|(h, _)| *h != hwnd);
-            v.push((hwnd, view.clone()));
+            v.retain(|(h, _, _)| *h != hwnd);
+            v.push((hwnd, view.clone(), clipboard));
         });
         let _ = SetWindowSubclass(hwnd, Some(subclass), SUBCLASS_ID, hwnd.0 as usize);
         hook_children(hwnd);
@@ -418,7 +440,7 @@ fn hook_children(defview: HWND) {
 unsafe extern "system" fn subclass(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, data: usize) -> LRESULT {
     let defview = HWND(data as _);
     if msg == prewarm_msg() && h == defview {
-        if let Some(view) = VIEWS.with(|v| v.borrow().iter().find(|(w, _)| *w == defview).map(|(_, s)| s.clone())) {
+        if let Some(view) = VIEWS.with(|v| v.borrow().iter().find(|(w, _, _)| *w == defview).map(|(_, s, _)| s.clone())) {
             prewarm_view(defview, &view);
         }
         return LRESULT(0);
@@ -427,12 +449,12 @@ unsafe extern "system" fn subclass(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _i
         WM_CONTEXTMENU if !from_view(HWND(wp.0 as _)) => {}
         WM_CONTEXTMENU => {
             let t0 = Instant::now();
-            let view = VIEWS.with(|v| v.borrow().iter().find(|(w, _)| *w == defview).map(|(_, s)| s.clone()));
-            if let Some(view) = view {
+            let view = VIEWS.with(|v| v.borrow().iter().find(|(w, _, _)| *w == defview).map(|(_, s, cb)| (s.clone(), *cb)));
+            if let Some((view, clipboard)) = view {
                 let mut buf = [0u16; 64];
                 let n = unsafe { GetClassNameW(h, &mut buf) } as usize;
                 log::line(&format!("WM_CONTEXTMENU on {} at {:#x}", String::from_utf16_lossy(&buf[..n]), lp.0));
-                if on_context(defview, &view, lp, t0) {
+                if on_context(defview, &view, lp, t0, clipboard) {
                     return LRESULT(0);
                 }
             }
@@ -444,7 +466,7 @@ unsafe extern "system" fn subclass(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _i
                 let _ = RemoveWindowSubclass(h, Some(subclass), SUBCLASS_ID);
             }
             if h == defview {
-                VIEWS.with(|v| v.borrow_mut().retain(|(w, _)| *w != h));
+                VIEWS.with(|v| v.borrow_mut().retain(|(w, _, _)| *w != h));
             }
         }
         _ => {}
@@ -454,7 +476,7 @@ unsafe extern "system" fn subclass(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _i
 }
 
 /// Shows the menu for a WM_CONTEXTMENU of a hooked view; false leaves it to the view.
-fn on_context(defview: HWND, view: &IShellView, lp: LPARAM, t0: Instant) -> bool {
+fn on_context(defview: HWND, view: &IShellView, lp: LPARAM, t0: Instant, clipboard: Option<ClipboardHandler>) -> bool {
     // SAFETY: COM calls on the view's thread, window queries on our windows.
     unsafe {
         let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
@@ -478,10 +500,11 @@ fn on_context(defview: HWND, view: &IShellView, lp: LPARAM, t0: Instant) -> bool
         }
         let fv = view.cast::<IFolderView2>().ok();
         let items = fv.as_ref().and_then(|f| f.ItemCount(SVGIO_SELECTION).ok()).unwrap_or(0) > 0;
+        let route = clipboard.and_then(|prepare| prepare(defview, view, items));
         let classic = shift || classic_preferred();
         if items && !classic {
             if let Some(fv) = &fv {
-                if show_worker(defview, view, fv, POINT { x, y }, t0) {
+                if show_worker(defview, view, fv, POINT { x, y }, t0, route.as_ref()) {
                     return true;
                 }
                 log::line("selection not given to the worker: the view's menu fills here");
@@ -496,7 +519,7 @@ fn on_context(defview: HWND, view: &IShellView, lp: LPARAM, t0: Instant) -> bool
         if let Some(s) = &site {
             let _ = s.SetSite(view);
         }
-        show_at(defview, &cm, POINT { x, y }, items, classic, shift, t0);
+        show_at(defview, &cm, POINT { x, y }, items, classic, shift, t0, route.as_ref());
         if let Some(s) = &site {
             let _ = s.SetSite(None);
         }

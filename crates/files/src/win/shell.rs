@@ -2,8 +2,9 @@
 //! bar invokes, and the dark theme of the hosted view (uxtheme's private dark mode entry points,
 //! the ones Explorer itself uses).
 
-use std::ffi::c_void;
-use windows::Win32::Foundation::{E_INVALIDARG, HWND, LPARAM};
+use std::{collections::HashSet, ffi::c_void};
+use std::sync::{Arc, Mutex};
+use windows::Win32::Foundation::{E_ABORT, E_INVALIDARG, HWND, LPARAM};
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IDataObject};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -17,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows_core::{BOOL, HSTRING, PCSTR, PCWSTR, PWSTR, Result, w};
 
 /// An ID list held as its bytes, terminator included: comparable, clonable, no COM memory.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Pidl(pub Vec<u8>);
 
 impl Pidl {
@@ -183,22 +184,34 @@ pub fn data_object(items: &[Pidl]) -> Result<IDataObject> {
     unsafe { SHCreateDataObject(Some(desktop.as_ptr()), Some(&children), None::<&IDataObject>) }
 }
 
-pub fn paste(owner: HWND, folder: &Pidl, source: &super::clipboard::Source) -> Result<()> {
+pub fn paste(owner: HWND, folder: &Pidl, source: &mut super::clipboard::Source) -> Result<()> {
     let children: Vec<_> = source.items.iter().map(Pidl::as_ptr).collect();
     let same_folder = source.items.iter().all(|item| item.parent().as_ref() == Some(folder));
     let folder = folder.item()?;
     let mut flags = FOF_ALLOWUNDO | FOFX_ADDUNDORECORD;
-    if !source.cut && same_folder {
+    if !source.is_cut() && same_folder {
         flags |= FOF_RENAMEONCOLLISION;
     }
     unsafe {
         let items = SHCreateShellItemArrayFromIDLists(&children)?;
         let op = file_operation(owner, flags)?;
-        if source.cut {
-            op.MoveItems(&items, &folder)?;
-        } else {
-            op.CopyItems(&items, &folder)?;
+        if source.is_cut() {
+            let moved = Arc::new(Mutex::new(Vec::new()));
+            let sink: IFileOperationProgressSink = super::move_progress::Progress(moved.clone()).into();
+            let cookie = op.Advise(&sink)?;
+            let result = op.MoveItems(&items, &folder).and_then(|()| complete_operation(&op));
+            let _ = op.Unadvise(cookie);
+            let moved = std::mem::take(&mut *moved.lock().unwrap());
+            let exact: HashSet<_> = moved.iter().collect();
+            // A provider can also report moves of children of a selected folder.
+            let completed: Vec<_> = source.items.iter().filter(|item| {
+                exact.contains(item) || moved.iter().any(|done| ILIsEqual(done.as_ptr(), item.as_ptr()).as_bool())
+            }).cloned().collect();
+            let complete = completed.len() == source.items.len();
+            source.finish_move(completed, complete);
+            return result.and_then(|()| if complete { Ok(()) } else { Err(E_ABORT.into()) });
         }
+        op.CopyItems(&items, &folder)?;
         complete_operation(&op)
     }
 }

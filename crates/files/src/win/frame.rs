@@ -16,11 +16,12 @@ use render::style::{self, Native, Part, WindowStyle};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 use windows::Win32::Graphics::Dwm::*;
-use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, BeginPaint, EndPaint, FillRect, GetStockObject, HBRUSH, HDC, ScreenToClient};
+use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, BeginPaint, ClientToScreen, EndPaint, FillRect, GetStockObject, HBRUSH, HDC, ScreenToClient};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
@@ -42,6 +43,7 @@ const MSG_BROWSE: u32 = 0x8000 + 0x124;
 /// A middle click on the items view selected what it hit: open it in a tab.
 const MSG_MIDDLE: u32 = 0x8000 + 0x125;
 const TIMER_SEARCH: usize = 2;
+const TIMER_CLIPBOARD_NOTICE: usize = 3;
 const SEARCH_DELAY_MS: u32 = 125;
 
 pub struct Frame {
@@ -59,6 +61,7 @@ pub struct Frame {
     search_timer: bool,
     search_worker: Option<search::Worker>,
     operations: Option<operations::Worker>,
+    clipboard_notice: Option<menu::TrackingTip>,
     sharing: Option<share::Registration>,
     share_available: bool,
     details: Option<Pane>,
@@ -116,6 +119,44 @@ fn with<R>(hwnd: HWND, f: impl FnOnce(&mut Frame) -> R) -> Option<R> {
     let rc = find(hwnd)?;
     let mut fr = rc.try_borrow_mut().ok()?;
     Some(f(&mut fr))
+}
+
+fn context_clipboard(defview: HWND, view: &IShellView, items: bool) -> Option<menu::ClipboardRoute> {
+    let hwnd = unsafe { GetAncestor(defview, GA_ROOT) };
+    let selection = if items { shell::selection(view).ok() } else { None };
+    let mut handles_paste = false;
+    let paste = with(hwnd, |frame| {
+        let tab = frame.tab()?;
+        if tab.shell_view().as_ref() != Some(view) {
+            return None;
+        }
+        let folder = if items {
+            let [item] = selection.as_deref()? else { return None };
+            let target = shell::folder_target(&item.item().ok()?)?;
+            shell::fs_path(&target.item().ok()?)?;
+            target
+        } else {
+            tab.paste_folder()?.clone()
+        };
+        handles_paste = true;
+        let id = tab.id;
+        frame.operation_worker().map(|worker| worker.paste_destination(id, folder))
+    }).flatten();
+    Some(Arc::new(move |verb| match verb {
+        menu::ClipboardVerb::Cut | menu::ClipboardVerb::Copy if items => {
+            if let Some(items) = selection.as_ref().filter(|items| !items.is_empty()) {
+                clipboard::publish(items.clone(), verb == menu::ClipboardVerb::Cut);
+            }
+            true
+        }
+        menu::ClipboardVerb::Paste if handles_paste => {
+            if let Some(destination) = &paste {
+                destination.submit();
+            }
+            true
+        }
+        _ => false,
+    }))
 }
 
 fn scale(hwnd: HWND) -> f32 {
@@ -183,6 +224,7 @@ pub fn create(place: &Pidl, x: i32, y: i32) -> windows_core::Result<HWND> {
             search_timer: false,
             search_worker: None,
             operations: None,
+            clipboard_notice: None,
             sharing: None,
             share_available: share::available(),
             details: None,
@@ -345,7 +387,18 @@ pub fn accelerator(msg: &MSG) -> bool {
         return false;
     }
     let root = unsafe { GetAncestor(msg.hwnd, GA_ROOT) };
-    with(root, |f| f.accelerator(msg)).unwrap_or(false)
+    match with(root, |f| f.accelerator(msg)) {
+        Some(Accelerator::Handled) => true,
+        // The view can synchronously open a context menu. Release the frame borrow first.
+        Some(Accelerator::Shell(view)) => (unsafe { view.TranslateAccelerator(msg) }) == S_OK,
+        _ => false,
+    }
+}
+
+enum Accelerator {
+    Ignored,
+    Handled,
+    Shell(IShellView),
 }
 
 fn key_down(vk: VIRTUAL_KEY) -> bool {
@@ -754,11 +807,11 @@ impl Frame {
                 share::open(self.hwnd, view).map(|registration| self.sharing = Some(registration))
             }
             Cmd::Paste => {
-                if t.path.is_none() || !t.query.is_empty() {
-                    return;
-                }
-                if let Some(folder) = t.history.current() {
-                    self.submit_operation(t.id, operations::Action::Paste(folder.clone(), clipboard::snapshot()));
+                if let Some(folder) = t.paste_folder().cloned() {
+                    let id = t.id;
+                    if let Some(worker) = self.operation_worker() {
+                        worker.paste_destination(id, folder).submit();
+                    }
                 }
                 return;
             }
@@ -810,7 +863,7 @@ impl Frame {
         log::line(&format!("command {c:?}: {r:?}"));
     }
 
-    fn accelerator(&mut self, msg: &MSG) -> bool {
+    fn accelerator(&mut self, msg: &MSG) -> Accelerator {
         let vk = VIRTUAL_KEY(msg.wParam.0 as u16);
         let ctrl = key_down(VK_CONTROL);
         let alt = key_down(VK_MENU);
@@ -820,7 +873,7 @@ impl Frame {
         let ours = match vk {
             VK_ESCAPE if !in_edit && self.clear_search() => {
                 self.draw();
-                return true;
+                return Accelerator::Handled;
             }
             VK_LEFT if alt => Some(Hit::Back),
             VK_RIGHT if alt => Some(Hit::Forward),
@@ -838,14 +891,14 @@ impl Frame {
         };
         if let Some(h) = ours {
             self.act(h);
-            return true;
+            return Accelerator::Handled;
         }
         if vk == VK_TAB && ctrl {
             let n = self.tabs.len();
             let next = if key_down(VK_SHIFT) { (self.active + n - 1) % n } else { (self.active + 1) % n };
             self.switch(next);
             self.draw();
-            return true;
+            return Accelerator::Handled;
         }
         if vk == VK_N && ctrl && !key_down(VK_SHIFT) {
             if let Some(cmd) = NEW_WINDOW.with(|c| c.get()) {
@@ -853,24 +906,24 @@ impl Frame {
                     let _ = PostMessageW(Some(cmd), bus::MSG_COMMAND, WPARAM(bus::Command::FilesOpen as usize), LPARAM(0));
                 }
             }
-            return true;
+            return Accelerator::Handled;
         }
-        let Some(view) = items else { return false };
+        let Some(view) = items else { return Accelerator::Ignored };
         if !alt && !key_down(VK_SHIFT) {
             let command = match (ctrl, vk) {
                 (true, VK_X) => Some(Cmd::Cut),
                 (true, VK_C) => Some(Cmd::Copy),
-                (true, VK_V) if self.tab().is_some_and(|t| t.path.is_some() && t.query.is_empty()) => Some(Cmd::Paste),
+                (true, VK_V) if self.tab().and_then(Tab::paste_folder).is_some() => Some(Cmd::Paste),
                 // A synthetic results folder needs the completion to remove the deleted row.
                 (false, VK_DELETE) if self.tab().and_then(Tab::index_results_id).is_some() => Some(Cmd::Delete),
                 _ => None,
             };
             if let Some(command) = command {
                 self.act(Hit::Cmd(command));
-                return true;
+                return Accelerator::Handled;
             }
         }
-        (unsafe { view.TranslateAccelerator(msg) }) == S_OK
+        Accelerator::Shell(view)
     }
 
     /// Keys while the address or search box has the focus.
@@ -926,15 +979,19 @@ impl Frame {
     }
 
     fn submit_operation(&mut self, tab: usize, action: operations::Action) {
+        if let Some(worker) = self.operation_worker() {
+            worker.submit(tab, action);
+        }
+    }
+
+    fn operation_worker(&mut self) -> Option<&operations::Worker> {
         if self.operations.is_none() {
             match operations::Worker::new(self.hwnd) {
                 Ok(worker) => self.operations = Some(worker),
                 Err(error) => log::line(&format!("Files operation worker failed: {error}")),
             }
         }
-        if let Some(worker) = &self.operations {
-            worker.submit(tab, action);
-        }
+        self.operations.as_ref()
     }
 
     fn operation_results(&mut self, worker_id: usize) {
@@ -960,6 +1017,23 @@ impl Frame {
                         t.remove_index_results(results, &items);
                     }
                 }
+                operations::Response::ClipboardTimedOut => self.show_clipboard_notice(),
+            }
+        }
+    }
+
+    fn show_clipboard_notice(&mut self) {
+        let hwnd = self.hwnd;
+        if self.clipboard_notice.is_none() {
+            self.clipboard_notice = menu::TrackingTip::new(hwnd);
+        }
+        let k = self.scale();
+        let Some(tip) = self.clipboard_notice.as_mut() else { return };
+        let mut position = POINT { x: client(hwnd).right / 2, y: (L::CHROME_H * k) as i32 };
+        unsafe {
+            let _ = ClientToScreen(hwnd, &mut position);
+            if SetTimer(Some(hwnd), TIMER_CLIPBOARD_NOTICE, 5000, None) != 0 {
+                tip.show(self.s.clipboard_timeout, position.x, position.y);
             }
         }
     }
@@ -1166,7 +1240,7 @@ impl Frame {
             shell::dark_children(root);
         }
         if let Some(view) = browser.shell_view() {
-            menu::hook(&view);
+            menu::hook_with_clipboard(&view, context_clipboard);
             if tab.folder_browser(id) {
                 tab::watch_folder_layout(&view, id);
             }
@@ -1479,6 +1553,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             operations::MSG_OPERATION => {
                 with(hwnd, |f| f.operation_results(wp.0));
+                LRESULT(0)
+            }
+            WM_TIMER if wp.0 == TIMER_CLIPBOARD_NOTICE => {
+                let _ = KillTimer(Some(hwnd), TIMER_CLIPBOARD_NOTICE);
+                with(hwnd, |f| {
+                    if let Some(tip) = &mut f.clipboard_notice {
+                        tip.hide();
+                    }
+                });
                 LRESULT(0)
             }
             WM_CLOSE => {

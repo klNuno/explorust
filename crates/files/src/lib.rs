@@ -15,6 +15,8 @@
 //! its own, creates its windows (its command window has the class `bus::class_of(Owner::Files)`),
 //! runs its message loop and returns on `bus::Command::Shutdown` or `WM_QUIT`.
 
+#[cfg(any(test, target_os = "windows"))]
+mod cut;
 pub mod edit;
 pub mod handler;
 pub mod handover;

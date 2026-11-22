@@ -18,4 +18,34 @@ pub use model::CommandItem;
 mod win;
 
 #[cfg(target_os = "windows")]
-pub use win::{hook, prewarm, show, track_commands};
+pub use win::{ClipboardRoute, TrackingTip, hook, hook_with_clipboard, prewarm, show, track_commands};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardVerb {
+    Cut,
+    Copy,
+    Paste,
+}
+
+impl ClipboardVerb {
+    pub fn from_canonical(verb: &str) -> Option<Self> {
+        [("cut", Self::Cut), ("copy", Self::Copy), ("paste", Self::Paste)]
+            .into_iter()
+            .find_map(|(name, command)| name.eq_ignore_ascii_case(verb).then_some(command))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClipboardVerb;
+
+    #[test]
+    fn only_canonical_file_clipboard_verbs_are_routed() {
+        assert_eq!(ClipboardVerb::from_canonical("cut"), Some(ClipboardVerb::Cut));
+        assert_eq!(ClipboardVerb::from_canonical("COPY"), Some(ClipboardVerb::Copy));
+        assert_eq!(ClipboardVerb::from_canonical("Paste"), Some(ClipboardVerb::Paste));
+        for native in ["", "pastelink", "copyaspath", "Copy as path", "sendto"] {
+            assert_eq!(ClipboardVerb::from_canonical(native), None);
+        }
+    }
+}

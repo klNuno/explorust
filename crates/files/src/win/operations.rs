@@ -2,19 +2,19 @@
 //! the boundary so a provider cannot block by calling back through the view's COM apartment.
 
 use super::{clipboard, inbox::Inbox, log, shell::{self, Pidl}};
-use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}, mpsc};
-use windows::Win32::Foundation::{E_ABORT, HWND, LPARAM, WPARAM};
+use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+use windows::Win32::Foundation::{ERROR_TIMEOUT, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::UI::Shell::SHMultiFileProperties;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows_core::Result;
+use windows_core::{Result, w};
 
 pub const MSG_OPERATION: u32 = WM_APP + 0x12B;
 
 pub enum Action {
     Address { text: String, request: usize },
     Delete { items: Vec<Pidl>, results: Option<usize> },
-    Paste(Pidl, mpsc::Receiver<Result<clipboard::Source>>),
+    Paste(Pidl, clipboard::Pending),
     NewFolder(Pidl, &'static str),
     Properties(Vec<Pidl>),
 }
@@ -23,6 +23,7 @@ pub enum Response {
     Address { tab: usize, request: usize, destination: Result<Option<Pidl>> },
     Refresh { tab: usize, folder: Pidl },
     Deleted { tab: usize, results: usize, items: Vec<Pidl> },
+    ClipboardTimedOut,
 }
 
 struct Job {
@@ -36,16 +37,35 @@ pub struct Worker {
     output: Arc<Mutex<Option<Vec<Response>>>>,
 }
 
+pub struct PasteDestination {
+    tab: usize,
+    folder: Pidl,
+    input: Arc<Inbox<Option<Job>>>,
+}
+
+impl PasteDestination {
+    pub fn submit(&self) {
+        if !self.input.send_with(|| Some(Job {
+            tab: self.tab,
+            action: Action::Paste(self.folder.clone(), clipboard::snapshot()),
+        })) {
+            log::line("Files paste destination closed before submission");
+        }
+    }
+}
+
 impl Worker {
     pub fn new(hwnd: HWND) -> std::io::Result<Self> {
         let input = Arc::new(Inbox::default());
         static NEXT_WORKER: AtomicUsize = AtomicUsize::new(1);
         let id = NEXT_WORKER.fetch_add(1, Ordering::Relaxed);
         let output = Arc::new(Mutex::new(Some(Vec::new())));
+        let mut bounds = RECT::default();
+        let _ = unsafe { GetWindowRect(hwnd, &mut bounds) };
         let hwnd = hwnd.0 as isize;
         let jobs = input.clone();
         let replies = output.clone();
-        std::thread::Builder::new().name("files-operations".into()).spawn(move || run(hwnd, id, jobs, replies))?;
+        std::thread::Builder::new().name("files-operations".into()).spawn(move || run(hwnd, bounds, id, jobs, replies))?;
         Ok(Self { id, input, output })
     }
 
@@ -58,6 +78,10 @@ impl Worker {
     pub fn take(&self) -> Vec<Response> {
         self.output.lock().unwrap().as_mut().map(std::mem::take).unwrap_or_default()
     }
+
+    pub fn paste_destination(&self, tab: usize, folder: Pidl) -> PasteDestination {
+        PasteDestination { tab, folder, input: self.input.clone() }
+    }
 }
 
 impl Drop for Worker {
@@ -69,21 +93,48 @@ impl Drop for Worker {
     }
 }
 
-fn run(owner: isize, id: usize, input: Arc<Inbox<Option<Job>>>, output: Arc<Mutex<Option<Vec<Response>>>>) {
+struct DialogOwner(HWND);
+
+impl DialogOwner {
+    fn new(bounds: RECT) -> Result<Self> {
+        // Independent, hidden top-level window on the operation STA. Using the frame as an
+        // owner would also destroy this window on close, before accepted work has drained.
+        unsafe { CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, w!("STATIC"), w!(""), WS_POPUP,
+            bounds.left, bounds.top, 0, 0, None, None, None, None).map(Self) }
+    }
+}
+
+impl Drop for DialogOwner {
+    fn drop(&mut self) {
+        let _ = unsafe { DestroyWindow(self.0) };
+    }
+}
+
+fn run(frame: isize, bounds: RECT, id: usize, input: Arc<Inbox<Option<Job>>>, output: Arc<Mutex<Option<Vec<Response>>>>) {
     let receiver = input.attach();
     if let Err(error) = unsafe { OleInitialize(None) } {
         log::line(&format!("Files operation OLE initialization failed: {error}"));
         return;
     }
-    let owner = HWND(owner as _);
+    let frame = HWND(frame as _);
+    let owner = match DialogOwner::new(bounds) {
+        Ok(owner) => {
+            log::line(&format!("Files operation dialog owner for frame {:#x}: {:#x}", frame.0 as usize, owner.0.0 as usize));
+            Some(owner)
+        }
+        Err(error) => {
+            log::line(&format!("Files operation dialog owner failed: {error}"));
+            None
+        }
+    };
+    let operation_owner = owner.as_ref().map_or(HWND::default(), |owner| owner.0);
     let mut msg = MSG::default();
     'pump: loop {
         while let Some(job) = receiver.next() {
             let Some(job) = job else { break 'pump };
-            let operation_owner = if output.lock().unwrap().is_some() { owner } else { HWND::default() };
             if let Some(response) = perform(operation_owner, job) && let Some(responses) = output.lock().unwrap().as_mut() {
                 responses.push(response);
-                let _ = unsafe { PostMessageW(Some(owner), MSG_OPERATION, WPARAM(id), LPARAM(0)) };
+                let _ = unsafe { PostMessageW(Some(frame), MSG_OPERATION, WPARAM(id), LPARAM(0)) };
             }
         }
         unsafe {
@@ -94,7 +145,23 @@ fn run(owner: isize, id: usize, input: Arc<Inbox<Option<Job>>>, output: Arc<Mute
             DispatchMessageW(&msg);
         }
     }
+    drop(owner);
     unsafe { OleUninitialize() };
+}
+
+fn with_dialog_owner<T>(owner: HWND, operation: impl FnOnce() -> T) -> T {
+    let foreground = unsafe { GetForegroundWindow() };
+    let result = operation();
+    // The copy engine can explicitly hand focus to its owner after closing a prompt.
+    // Restore the previous window only when the hidden owner actually has focus.
+    unsafe {
+        if !owner.is_invalid() && foreground != owner && GetForegroundWindow() == owner
+            && IsWindowVisible(foreground).as_bool()
+        {
+            let _ = SetForegroundWindow(foreground);
+        }
+    }
+    result
 }
 
 fn perform(owner: HWND, job: Job) -> Option<Response> {
@@ -114,17 +181,26 @@ fn perform(owner: HWND, job: Job) -> Option<Response> {
             return Some(Response::Address { tab, request, destination });
         }
         Action::Delete { items, results } => {
-            let result = shell::delete_items(owner, &items);
+            let result = with_dialog_owner(owner, || shell::delete_items(owner, &items));
             log::line(&format!("command Delete: {result:?} (operation STA)"));
             return results.filter(|_| result.is_ok()).map(|results| Response::Deleted { tab, results, items });
         }
         Action::Paste(folder, source) => {
-            let result = source.recv().unwrap_or_else(|_| Err(E_ABORT.into()))
-                .and_then(|source| shell::paste(owner, &folder, &source));
+            let result = match source.wait() {
+                Ok(mut source) => with_dialog_owner(owner, || shell::paste(owner, &folder, &mut source)),
+                Err(error) if error.code() == ERROR_TIMEOUT.to_hresult() => {
+                    log::line("command Paste: clipboard snapshot timed out (operation STA)");
+                    return Some(Response::ClipboardTimedOut);
+                }
+                Err(error) => Err(error),
+            };
             ("Paste", result, Some(folder))
         }
         Action::NewFolder(folder, name) => {
-            ("New", folder.item().and_then(|item| shell::new_folder(owner, &item, name)), Some(folder))
+            let result = with_dialog_owner(owner, || {
+                folder.item().and_then(|item| shell::new_folder(owner, &item, name))
+            });
+            ("New", result, Some(folder))
         }
         Action::Properties(items) => {
             let result = shell::data_object(&items).and_then(|data| unsafe { SHMultiFileProperties(&data, 0) });
@@ -164,12 +240,14 @@ mod tests {
             OleUninitialize();
             (source.unwrap(), target.unwrap())
         };
-        let worker = Worker::new(HWND::default()).unwrap();
-        let (release, pending) = mpsc::channel();
+        let frame = DialogOwner::new(RECT::default()).unwrap();
+        let worker = Worker::new(frame.0).unwrap();
+        let (release, pending) = clipboard::Pending::fixture();
         worker.submit(1, Action::Paste(target.clone(), pending));
         worker.submit(1, Action::NewFolder(target, "queued folder"));
         drop(worker);
-        release.send(Ok(clipboard::Source { items: vec![source], cut: true })).unwrap();
+        drop(frame);
+        release.send(Ok(clipboard::Source::test_cut(vec![source]))).unwrap();
 
         let moved = target_path.join("move.txt");
         let created = target_path.join("queued folder");

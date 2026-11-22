@@ -9,6 +9,7 @@ mod gfx;
 mod inbox;
 mod log;
 mod menus;
+mod move_progress;
 mod operations;
 mod search;
 mod share;
