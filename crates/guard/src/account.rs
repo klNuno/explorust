@@ -12,25 +12,34 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{PCWSTR, PWSTR};
 
-/// The token's user, as raw `TOKEN_USER` bytes.
-fn token_user() -> Option<Vec<u8>> {
-    // SAFETY: the token handle is closed; the buffer has the size the first call asks for.
+/// Aligned storage for TOKEN_USER and the SID it points to.
+fn token_user(token: HANDLE) -> Option<Vec<usize>> {
+    // SAFETY: the buffer has at least the size the first call asks for.
     unsafe {
-        let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
         let mut len = 0u32;
         let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
-        let mut buf = vec![0u8; len as usize];
-        let r = GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len);
-        let _ = CloseHandle(token);
-        r.ok()?;
+        let mut buf = vec![0usize; (len as usize).div_ceil(size_of::<usize>())];
+        GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len).ok()?;
         Some(buf)
     }
 }
 
+fn with_own_token<T>(read: impl FnOnce(HANDLE) -> Option<T>) -> Option<T> {
+    let mut token = HANDLE::default();
+    // SAFETY: the output is valid and the synchronous reader borrows the open handle.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
+    let result = read(token);
+    let _ = unsafe { CloseHandle(token) };
+    result
+}
+
 /// `S-1-5-21-...` of the account this process runs as.
 pub fn own_sid() -> Option<String> {
-    let buf = token_user()?;
+    with_own_token(token_sid)
+}
+
+pub fn token_sid(token: HANDLE) -> Option<String> {
+    let buf = token_user(token)?;
     // SAFETY: the buffer holds a TOKEN_USER whose SID points inside it; the string is freed.
     unsafe {
         let user = &*(buf.as_ptr() as *const TOKEN_USER);
@@ -44,7 +53,7 @@ pub fn own_sid() -> Option<String> {
 
 /// `DOMAIN\name` of the account this process runs as.
 fn own_account() -> Option<String> {
-    let buf = token_user()?;
+    let buf = with_own_token(token_user)?;
     // SAFETY: the SID points inside `buf`; both name buffers have the sizes given.
     unsafe {
         let user = &*(buf.as_ptr() as *const TOKEN_USER);
