@@ -50,6 +50,8 @@ pub struct Table {
     meta: Vec<u64>,
     live: usize,
     dead: usize,
+    /// The initial build grows geometrically until the table is trimmed for publication.
+    compact_growth: bool,
     /// Records of the folders named in PRUNE_NAMES (their contents are not kept).
     prune_roots: Vec<u32>,
     /// Scoped coverage starts only after the initial scan, journal catch-up and alias discovery.
@@ -115,11 +117,15 @@ fn word_start(prev: u8) -> bool {
 
 /// The default Vec growth can double every arena at once on the first journal insert after
 /// `shrink`. Give large arrays headroom for future writes without committing another table.
-fn reserve_append<T>(vec: &mut Vec<T>, count: usize) {
+fn reserve_append<T>(vec: &mut Vec<T>, count: usize, compact: bool) {
     let required = vec.len() + count;
     if required > vec.capacity() {
-        let headroom = (vec.capacity() / 16).max(4096 / size_of::<T>());
-        vec.reserve_exact((vec.capacity() + headroom).max(required) - vec.len());
+        if compact {
+            let headroom = (vec.capacity() / 16).max(4096 / size_of::<T>());
+            vec.reserve_exact((vec.capacity() + headroom).max(required) - vec.len());
+        } else {
+            vec.reserve(count);
+        }
     }
 }
 
@@ -214,6 +220,7 @@ impl Table {
     }
 
     pub fn shrink(&mut self) {
+        self.compact_growth = true;
         self.slots.shrink_to_fit();
         self.case.shrink_to_fit();
         self.fold.shrink_to_fit();
@@ -282,7 +289,7 @@ impl Table {
         let r = rec as usize;
         if r >= self.slots.len() {
             let count = r + 1 - self.slots.len();
-            reserve_append(&mut self.slots, count);
+            reserve_append(&mut self.slots, count, self.compact_growth);
             self.slots.resize(r + 1, FREE);
         }
         if self.pruned_parent(parent) {
@@ -318,18 +325,18 @@ impl Table {
             self.live -= 1;
         }
         let idx = self.starts.len() as u32;
-        reserve_append(&mut self.starts, 1);
-        reserve_append(&mut self.recs, 1);
-        reserve_append(&mut self.meta, 1);
+        reserve_append(&mut self.starts, 1, self.compact_growth);
+        reserve_append(&mut self.recs, 1, self.compact_growth);
+        reserve_append(&mut self.meta, 1, self.compact_growth);
         self.starts.push(self.fold.len() as u32);
         self.recs.push(rec);
         self.meta.push(write_time(modified, previous) | if under { META_NOISY } else { 0 });
         let base = self.fold.len();
         let count = name.len() + 1;
-        reserve_append(&mut self.fold, count);
+        reserve_append(&mut self.fold, count, self.compact_growth);
         let case_len = (base + count).div_ceil(8);
         let extra_case = case_len - self.case.len();
-        reserve_append(&mut self.case, extra_case);
+        reserve_append(&mut self.case, extra_case, self.compact_growth);
         self.case.resize(case_len, 0);
         fold::push_folded(name, &mut self.fold, |i| {
             let at = base + i;
