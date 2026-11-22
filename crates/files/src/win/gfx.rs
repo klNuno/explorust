@@ -92,9 +92,10 @@ impl Canvas {
     pub fn new(sh: Rc<Shared>, hwnd: HWND, w: u32, h: u32, dpi: f32) -> Result<Canvas> {
         let mut root = Self::layer(sh, w, h, dpi)?;
         unsafe {
-            let target = root.sh.dcomp.CreateTargetForHwnd(hwnd, true)?;
-            target.SetRoot(&root.visual)?;
-            root.sh.dcomp.Commit()?;
+            let dev = &root.sh.device;
+            let target = dev.check(root.sh.dcomp.CreateTargetForHwnd(hwnd, true))?;
+            dev.check(target.SetRoot(&root.visual))?;
+            dev.check(root.sh.dcomp.Commit())?;
             root._target = Some(target);
         }
         Ok(root)
@@ -102,22 +103,22 @@ impl Canvas {
 
     pub fn add_layer(&self, w: u32, h: u32, dpi: f32) -> Result<Canvas> {
         let layer = Self::layer(self.sh.clone(), w, h, dpi)?;
-        unsafe { self.visual.AddVisual(&layer.visual, true, None::<&IDCompositionVisual>)?; }
+        self.sh.device.check(unsafe { self.visual.AddVisual(&layer.visual, true, None::<&IDCompositionVisual>) })?;
         Ok(layer)
     }
 
     pub fn remove_layer(&self, layer: &Canvas) -> Result<()> {
         unsafe {
-            self.visual.RemoveVisual(&layer.visual)?;
-            self.sh.dcomp.Commit()
+            self.sh.device.check(self.visual.RemoveVisual(&layer.visual))?;
+            self.sh.device.check(self.sh.dcomp.Commit())
         }
     }
 
     pub fn set_origin(&self, x: i32, y: i32) -> Result<()> {
         unsafe {
-            self.visual.SetOffsetX2(x as f32)?;
-            self.visual.SetOffsetY2(y as f32)?;
-            self.sh.dcomp.Commit()
+            self.sh.device.check(self.visual.SetOffsetX2(x as f32))?;
+            self.sh.device.check(self.visual.SetOffsetY2(y as f32))?;
+            self.sh.device.check(self.sh.dcomp.Commit())
         }
     }
 
@@ -126,7 +127,7 @@ impl Canvas {
             let swap = sh.device.create_swap_chain(w, h, 2)?;
             let ctx = sh.device.create_context()?;
             ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            let visual = sh.dcomp.CreateVisual()?;
+            let visual = sh.device.check(sh.dcomp.CreateVisual())?;
             swap.attach(&visual)?;
             let c = Canvas { sh, ctx, swap, _target: None, visual, dpi };
             c.bind()?;

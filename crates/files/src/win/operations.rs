@@ -47,6 +47,10 @@ struct Drain {
 static DRAIN: Mutex<Drain> = Mutex::new(Drain { sealed: false, pending: 0 });
 static DRAINED: Condvar = Condvar::new();
 
+// Clipboard tests submit mutations to the same process-wide queue that the drain test seals.
+#[cfg(test)]
+pub(super) static FILE_OPERATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Lives from acceptance through execution, even when the submitting frame closes.
 struct Mutation;
 
@@ -310,6 +314,7 @@ mod tests {
 
     #[test]
     fn reload_waits_for_accepted_paste_and_new_folder_after_window_closes() {
+        let _lock = FILE_OPERATION_TEST_LOCK.lock().unwrap_or_else(|lock| lock.into_inner());
         let dir = std::env::temp_dir().join(format!("explorust-files-drain-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let fixture = Fixture(dir);

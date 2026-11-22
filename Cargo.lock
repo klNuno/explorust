@@ -620,6 +620,7 @@ name = "fsindex"
 version = "0.1.0"
 dependencies = [
  "memchr",
+ "parking_lot",
  "windows",
  "windows-core",
 ]

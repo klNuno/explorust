@@ -9,6 +9,7 @@ use crate::fold;
 use memchr::memmem;
 use std::cmp::Reverse;
 use std::collections::HashSet;
+use std::ops::Range;
 
 pub const SEP: u8 = b'\n';
 /// The root directory's MFT record number on NTFS.
@@ -20,6 +21,7 @@ const NOISY: u32 = 1 << 30;
 /// table by `settle` after the MFT load (records come in record order, children before parents).
 const UNDER: u32 = 1 << 29;
 const IDX: u32 = (1 << 29) - 1;
+const COMPACTION_SLICE: usize = 16_384;
 
 #[derive(Clone, Copy)]
 struct Slot {
@@ -40,6 +42,13 @@ const META_NOISY: u64 = 1 << 63;
 /// Folder names whose contents rank after everything else (Windows Search leaves them out).
 const NOISY_NAMES: [&str; 9] = ["windows", "appdata", "$recycle.bin", "winsxs", "node_modules", ".git", "programdata", "system volume information", "target"];
 
+/// The compacted prefix ends at `kept` and `bytes`. The original suffix starts at `next`.
+struct Compaction {
+    kept: usize,
+    next: usize,
+    bytes: usize,
+}
+
 #[derive(Default)]
 pub struct Table {
     slots: Vec<Slot>,
@@ -50,6 +59,7 @@ pub struct Table {
     meta: Vec<u64>,
     live: usize,
     dead: usize,
+    compaction: Option<Compaction>,
     /// The initial build grows geometrically until the table is trimmed for publication.
     compact_growth: bool,
     /// Records of the folders named in PRUNE_NAMES (their contents are not kept).
@@ -231,8 +241,19 @@ impl Table {
 
     fn name_range(&self, i: usize) -> (usize, usize) {
         let s = self.starts[i] as usize;
-        let e = self.starts.get(i + 1).map_or(self.fold.len(), |&n| n as usize) - 1;
-        (s, e)
+        let end = match &self.compaction {
+            Some(cursor) if i + 1 == cursor.kept => cursor.bytes,
+            _ => self.starts.get(i + 1).map_or(self.fold.len(), |&n| n as usize),
+        };
+        (s, end - 1)
+    }
+
+    fn name_indices(&self) -> [Range<usize>; 2] {
+        let len = self.starts.len();
+        match &self.compaction {
+            Some(cursor) => [0..cursor.kept, cursor.next..len],
+            None => [0..len, len..len],
+        }
     }
 
     fn changed(&self, at: usize) -> bool {
@@ -345,7 +366,6 @@ impl Table {
         self.fold.push(SEP);
         self.slots[r] = Slot { parent, name: idx | flags };
         self.live += 1;
-        self.compact_if_needed();
     }
 
     pub fn remove(&mut self, rec: u32) {
@@ -359,30 +379,41 @@ impl Table {
         *s = FREE;
         self.dead += 1;
         self.live -= 1;
-        self.compact_if_needed();
     }
 
-    fn compact_if_needed(&mut self) {
+    /// Move one batch of names under the journal's write lock. Returns whether work remains.
+    pub fn compact_pending_slice(&mut self) -> bool {
         // A busy journal can rename files indefinitely without issuing any deletes. Reclaim
         // the old names in either case, after enough edits to amortize scanning the arena.
-        if self.dead >= 200_000 && self.dead > self.live / 8 {
-            self.compact();
+        if self.compaction.is_none() && (self.dead < 200_000 || self.dead <= self.live / 8) {
+            return false;
+        }
+        self.compact_slice(COMPACTION_SLICE)
+    }
+
+    /// Compact and trim the arenas during the initial scan, before publishing the table.
+    pub fn compact(&mut self) {
+        if self.dead != 0 || self.compaction.is_some() {
+            self.compact_slice(usize::MAX);
+            self.shrink();
         }
     }
 
-    /// Rewrites the arenas in place without the names of deleted or renamed records.
-    pub fn compact(&mut self) {
-        if self.dead == 0 {
-            return;
-        }
-        let mut kept = 0;
-        let mut base = usize::from(self.fold.first() == Some(&SEP));
-        for i in 0..self.starts.len() {
+    fn compact_slice(&mut self, names: usize) -> bool {
+        let mut cursor = self.compaction.take().unwrap_or(Compaction {
+            kept: 0,
+            next: 0,
+            bytes: usize::from(self.fold.first() == Some(&SEP)),
+        });
+        let end = cursor.next.saturating_add(names).min(self.starts.len());
+        for i in cursor.next..end {
             let rec = self.recs[i];
             if rec == NONE {
+                self.dead -= 1;
                 continue;
             }
             let (a, b) = self.name_range(i);
+            let base = cursor.bytes;
             if base != a {
                 // The write cursor trails the read cursor, so later case bits remain intact.
                 // Copy the separator's zero bit as well, for the next name appended there.
@@ -395,13 +426,21 @@ impl Table {
                 self.fold.copy_within(a..=b, base);
             }
             let slot = &mut self.slots[rec as usize];
-            slot.name = (slot.name & !IDX) | kept as u32;
-            self.starts[kept] = base as u32;
-            self.recs[kept] = rec;
-            self.meta[kept] = self.meta[i];
-            base += b + 1 - a;
-            kept += 1;
+            slot.name = (slot.name & !IDX) | cursor.kept as u32;
+            self.starts[cursor.kept] = base as u32;
+            self.recs[cursor.kept] = rec;
+            self.meta[cursor.kept] = self.meta[i];
+            cursor.bytes += b + 1 - a;
+            cursor.kept += 1;
         }
+        if end < self.starts.len() {
+            cursor.next = end;
+            self.compaction = Some(cursor);
+            return true;
+        }
+        // Keep capacity for future churn. Reallocating live arrays can move an entire arena
+        // under the volume lock, even when shrinking.
+        let Compaction { kept, bytes: base, .. } = cursor;
         self.fold.truncate(base);
         self.case.truncate(base.div_ceil(8));
         if base % 8 != 0 && let Some(last) = self.case.last_mut() {
@@ -410,8 +449,7 @@ impl Table {
         self.starts.truncate(kept);
         self.recs.truncate(kept);
         self.meta.truncate(kept);
-        self.dead = 0;
-        self.shrink();
+        false
     }
 
     /// Sets the inherited noisy bit of every record from its folders and drops the names inside
@@ -514,19 +552,15 @@ impl Table {
 
     /// The index of the name holding offset `pos`, searching forward from name `from` (matches
     /// come in order, mostly close together): gallop, then binary search.
-    fn seek(&self, from: usize, pos: usize) -> usize {
-        let n = self.starts.len();
-        if n == 0 {
-            return 0;
-        }
-        let (mut lo, mut step) = (from.min(n - 1), 1usize);
+    fn seek(&self, from: usize, end: usize, pos: usize) -> usize {
+        let (mut lo, mut step) = (from, 1usize);
         let mut hi = lo;
-        while hi < n && self.starts[hi] as usize <= pos {
+        while hi < end && self.starts[hi] as usize <= pos {
             lo = hi;
             hi += step;
             step *= 2;
         }
-        let hi = hi.min(n);
+        let hi = hi.min(end);
         lo + self.starts[lo..hi].partition_point(|&s| s as usize <= pos).saturating_sub(1)
     }
 
@@ -548,7 +582,7 @@ impl Table {
         } else {
             let leaf = path.rsplit_once('\\')?.1;
             let folded = fold::fold(leaf);
-            let mut matching = self.starts.iter().enumerate().filter_map(|(i, _)| {
+            let mut matching = self.name_indices().into_iter().flatten().filter_map(|i| {
                 let rec = self.recs[i];
                 if rec == NONE || !self.is_dir(rec) {
                     return None;
@@ -598,31 +632,39 @@ impl Table {
         let mut top = Top::new(max);
         // Name prefixes: one pass over the name starts, cheaper than memmem when most names match.
         let (q0, n) = (q[0], q.len());
-        for (i, &st) in self.starts.iter().enumerate() {
-            let st = st as usize;
-            if self.fold[st] == q0 && self.fold.get(st..st + n) == Some(q) && self.recs[i] != NONE
-                && scope.is_none_or(|ancestor| self.descends_from(self.recs[i], ancestor)) {
-                top.offer(meta_key(self.meta[i], 0), i);
+        let indices = self.name_indices();
+        for names in &indices {
+            for (i, &st) in (names.start..).zip(&self.starts[names.clone()]) {
+                let st = st as usize;
+                if self.fold[st] == q0 && self.fold.get(st..st + n) == Some(q) && self.recs[i] != NONE
+                    && scope.is_none_or(|ancestor| self.descends_from(self.recs[i], ancestor)) {
+                    top.offer(meta_key(self.meta[i], 0), i);
+                }
             }
         }
         // A word or inner match ranks after every clean name prefix: skip when those fill the list.
         // Past INNER_CAP inner matches the rest is left out (one-letter queries on a big volume).
         if !top.full_below((1, Reverse(u64::MAX))) {
             let finder = memmem::Finder::new(q);
-            let (mut at, mut i, mut seen) = (0, 0, 0usize);
-            while let Some(p) = finder.find(&self.fold[at..]) {
-                let m = at + p;
-                i = self.seek(i, m);
-                let (s, e) = self.name_range(i);
-                at = e + 1;
-                if m == s || self.recs[i] == NONE || scope.is_some_and(|ancestor| !self.descends_from(self.recs[i], ancestor)) {
-                    continue;
-                }
-                let rank = if word_start(self.fold[m - 1]) { 1 } else { 2 };
-                top.offer(meta_key(self.meta[i], rank), i);
-                seen += 1;
-                if scope.is_none() && seen >= INNER_CAP {
-                    break;
+            let mut seen = 0usize;
+            'arenas: for names in indices.into_iter().filter(|range| !range.is_empty()) {
+                let mut i = names.start;
+                let mut at = self.starts[i] as usize;
+                let end = self.name_range(names.end - 1).1 + 1;
+                while let Some(p) = finder.find(&self.fold[at..end]) {
+                    let m = at + p;
+                    i = self.seek(i, names.end, m);
+                    let (s, e) = self.name_range(i);
+                    at = e + 1;
+                    if m == s || self.recs[i] == NONE || scope.is_some_and(|ancestor| !self.descends_from(self.recs[i], ancestor)) {
+                        continue;
+                    }
+                    let rank = if word_start(self.fold[m - 1]) { 1 } else { 2 };
+                    top.offer(meta_key(self.meta[i], rank), i);
+                    seen += 1;
+                    if scope.is_none() && seen >= INNER_CAP {
+                        break 'arenas;
+                    }
                 }
             }
         }
@@ -977,10 +1019,53 @@ mod tests {
             let name = if i % 2 == 0 { "renamed.txt" } else { "original.txt" };
             t.upsert(16, ROOT, name, false, false, i64::from(i));
         }
-        assert!(t.bytes() < 32 * 1024);
+        assert!(t.compact_pending_slice(), "the journal must release the lock before finishing the pass");
+        while t.compact_pending_slice() {}
+        assert_eq!(t.starts.len(), 1);
+        let retained_bytes = t.bytes();
+        for i in 0..200_010 {
+            let name = if i % 2 == 0 { "renamed.txt" } else { "original.txt" };
+            t.upsert(16, ROOT, name, false, false, i64::from(i));
+        }
+        while t.compact_pending_slice() {}
+        assert_eq!(t.starts.len(), 1);
+        assert_eq!(t.bytes(), retained_bytes);
         assert_eq!(t.name(16).as_deref(), Some("original.txt"));
         assert_eq!(t.query("original", 1)[0].modified(), 200_009);
         assert!(t.query("renamed", 1).is_empty());
+    }
+
+    #[test]
+    fn searches_and_edits_can_interleave_with_compaction_slices() {
+        let mut t = Table::new();
+        t.upsert(30, ROOT, "Stale folder", true, false, 1);
+        t.upsert(31, ROOT, "Projects", true, false, 2);
+        t.upsert(32, 31, "ÉTÉ final.txt", false, false, 3);
+        t.upsert(33, 31, "old final.txt", false, false, 4);
+        t.upsert(34, 31, "final Plan.txt", false, false, 5);
+        t.upsert(35, 31, "unfinished.txt", false, false, 6);
+        t.journal_current = true;
+        t.initial_links_complete = true;
+        t.remove(30);
+        t.remove(33);
+        let expected = t.query("final", 10);
+        assert!(t.compact_slice(4));
+        assert_eq!(t.query("final", 10), expected);
+        assert_eq!(t.query_scope("final", 10, "D:\\", "D:\\Projects").unwrap(), expected);
+        assert!(t.query("stale", 10).is_empty());
+        assert_eq!(t.path(32, "D:\\").as_deref(), Some("D:\\Projects\\ÉTÉ final.txt"));
+        assert!(t.set_modified(34, 20));
+        t.upsert(32, 31, "Projet final.txt", false, false, 10);
+        t.remove(35);
+        let expected = t.query("final", 10);
+        assert_eq!(expected.iter().map(|f| (f.rec, f.modified())).collect::<Vec<_>>(), [(34, 20), (32, 10)]);
+        assert!(!t.compact_slice(3));
+        assert_eq!(t.query("final", 10), expected);
+        assert_eq!(t.dead, 1, "the rename left a dead name in the compacted prefix");
+        t.compact();
+        assert_eq!(t.query("final", 10), expected);
+        assert_eq!(t.name(32).as_deref(), Some("Projet final.txt"));
+        assert_eq!(t.dead, 0);
     }
 
     #[test]

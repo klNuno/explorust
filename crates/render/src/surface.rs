@@ -43,11 +43,11 @@ impl Surface {
             swap.bind(&ctx, 96.0)?;
             ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let dcomp = dev.create_composition_device()?;
-            let dtarget = dcomp.CreateTargetForHwnd(hwnd, true)?;
-            let visual = dcomp.CreateVisual()?;
+            let dtarget = dev.check(dcomp.CreateTargetForHwnd(hwnd, true))?;
+            let visual = dev.check(dcomp.CreateVisual())?;
             swap.attach(&visual)?;
-            dtarget.SetRoot(&visual)?;
-            dcomp.Commit()?;
+            dev.check(dtarget.SetRoot(&visual))?;
+            dev.check(dcomp.Commit())?;
             Ok(Self { ctx, factory, swap, size: Cell::new((width.max(1), height.max(1))), _dcomp: dcomp, _target: dtarget, _visual: visual })
         }
     }
@@ -101,7 +101,7 @@ impl Surface {
     /// Open animation of the content: slides in from `from_y` pixels with a cubic ease-out over
     /// `slide_s` seconds and fades in over `fade_s`, run by DirectComposition (no timers).
     pub fn slide_in(&self, from_y: f32, slide_s: f32, fade_s: f32) -> Result<()> {
-        unsafe {
+        self.swap.check((|| unsafe {
             let t = slide_s.max(0.001);
             // y(t) = from_y * (1 - t/T)^3 expanded into cubic coefficients.
             let slide = self._dcomp.CreateAnimation()?;
@@ -116,7 +116,7 @@ impl Surface {
             group.SetOpacity(&fade)?;
             self._visual.SetEffect(&group)?;
             self._dcomp.Commit()
-        }
+        })())
     }
 
     pub fn brush(&self, c: D2D1_COLOR_F) -> Result<ID2D1SolidColorBrush> {

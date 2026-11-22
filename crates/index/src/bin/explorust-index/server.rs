@@ -6,6 +6,7 @@ use crate::{log, metadata, pipe, volume};
 use fsindex::fold;
 use fsindex::proto::{Hit, Reply};
 use fsindex::table::{SortKey, Table};
+use parking_lot::RwLock as VolumeLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
@@ -13,7 +14,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, Set
 
 pub struct Vol {
     pub root: String,
-    pub table: Arc<RwLock<Table>>,
+    pub table: Arc<VolumeLock<Table>>,
 }
 
 fn memory() -> (f64, f64) {
@@ -78,7 +79,7 @@ fn links_later(letter: char, handle: volume::Volume, frns: Vec<u64>, vol: Arc<Vo
         let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
         let t0 = Instant::now();
         let (looked, added, failed) = volume::add_links(handle.handle(), &frns, &vol.table, id);
-        let mut table = vol.table.write().unwrap_or_else(|p| p.into_inner());
+        let mut table = vol.table.write();
         if table.id() != id {
             return;
         }
@@ -103,7 +104,7 @@ fn answer(vols: &[Arc<Vol>], q: &str, max: u16, scope: Option<&str>) -> (Reply, 
         if scope.is_some_and(|path| !path.get(..3).is_some_and(|drive| drive.eq_ignore_ascii_case(&v.root))) {
             continue;
         }
-        let tb = v.table.read().unwrap_or_else(|p| p.into_inner());
+        let tb = v.table.read();
         names += tb.len();
         let found = if let Some(path) = scope {
             let Some(found) = tb.query_scope(&fq, max as usize, &v.root, path) else { break };
@@ -130,7 +131,7 @@ static VOLS: RwLock<Vec<(char, Arc<Vol>)>> = RwLock::new(Vec::new());
 static LOADED: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
 
 fn add(c: char) -> Arc<Vol> {
-    let v = Arc::new(Vol { root: format!("{c}:\\"), table: Arc::new(RwLock::new(Table::new())) });
+    let v = Arc::new(Vol { root: format!("{c}:\\"), table: Arc::new(VolumeLock::new(Table::new())) });
     let (tx, _rx) = std::sync::mpsc::channel();
     let tx = LOADED.lock().ok().and_then(|l| l.clone()).unwrap_or(tx);
     let v2 = v.clone();
@@ -170,7 +171,7 @@ pub fn run(ready: Option<&dyn Fn()>) {
             let _ = rx.recv();
         }
         let (private, ws) = memory();
-        let names: usize = VOLS.read().map(|v| v.iter().map(|(_, v)| v.table.read().map(|t| t.len()).unwrap_or(0)).sum()).unwrap_or(0);
+        let names: usize = VOLS.read().map(|v| v.iter().map(|(_, v)| v.table.read().len()).sum()).unwrap_or(0);
         log::line(&format!("index: ready, {names} names on {n} volumes in {:.0} ms, process private {private:.1} MB, working set {ws:.1} MB", t0.elapsed().as_secs_f64() * 1000.0));
         // Later arrivals log their own MFT read line.
         loop {
