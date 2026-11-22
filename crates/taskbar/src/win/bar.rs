@@ -13,7 +13,7 @@ use crate::settings::{self as S, Settings};
 use super::thumbs::ThumbFlyout;
 use crate::jump;
 use crate::right::Hit;
-use super::tasks;
+use super::{task_lookup, tasks};
 use super::workarea::WorkArea;
 use super::log;
 use crate::geom::{self as G, Row};
@@ -101,6 +101,7 @@ struct Bar {
     model: Model,
     pins: Vec<Pin<PinData>>,
     pin_inbox: pin_worker::Inbox,
+    task_lookup: task_lookup::Lookup,
     /// Exe path and original-case app id of each task window.
     exes: HashMap<isize, String>,
     ids: HashMap<String, String>,
@@ -281,6 +282,8 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         let taskband = Taskband::publish(hwnd, hwnd, shellhook);
         let hooked = RegisterShellHookWindow(hwnd).as_bool();
         let taskman = set_taskman(hwnd);
+        let mut task_lookup = task_lookup::Lookup::start(hwnd)
+            .map_err(|e| windows_core::Error::new(E_FAIL, format!("task identity worker: {e}")))?;
         let mut hooks = Vec::new();
         for (a, b) in [
             (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
@@ -296,26 +299,21 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         }
         let t0 = Instant::now();
         let mut model = Model::default();
-        let mut exes = HashMap::new();
-        let mut ids = HashMap::new();
         let mut all = tasks::top_level();
         all.reverse(); // bottom of the z-order first: roughly the oldest windows first
-        for h in all {
-            if let Some(t) = tasks::task_of(h) {
-                model.upsert(h.0 as isize, &t.key);
-                exes.insert(h.0 as isize, t.exe);
-                ids.insert(t.key, t.id);
-            }
+        let mut queued = 0;
+        for window in all.into_iter().filter_map(tasks::candidate) {
+            task_lookup.request(window);
+            queued += 1;
         }
         let fg = GetForegroundWindow();
         model.set_active((!fg.is_invalid()).then_some(fg.0 as isize));
         let dpi = GetDpiForWindow(hwnd);
         log::line(&format!(
-            "started: monitor {}x{} dpi {dpi} bar {h_px} px, shell hook {hooked}, taskman {taskman}, {} win hooks, {} windows in {} ms",
+            "started: monitor {}x{} dpi {dpi} bar {h_px} px, shell hook {hooked}, taskman {taskman}, {} win hooks, {queued} window lookups queued in {} ms",
             width,
             monitor.bottom - monitor.top,
             hooks.len(),
-            model.wins.len(),
             t0.elapsed().as_millis()
         ));
         let pin_inbox = pin_worker::Inbox::default();
@@ -330,8 +328,9 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             model,
             pins: Vec::new(),
             pin_inbox: pin_inbox.clone(),
-            exes,
-            ids,
+            task_lookup,
+            exes: HashMap::new(),
+            ids: HashMap::new(),
             groups: Vec::new(),
             hover: None,
             pressed: None,
@@ -359,10 +358,6 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         with_bar(|b| {
             b.rebuild();
             b.paint();
-            b.log_groups();
-            for &h in b.model.wins.iter().map(|w| &w.hwnd) {
-                b.taskband.button_created(h);
-            }
         });
         log::line("initial taskbar paint returned; starting pin resolution");
         pin_worker::start(hwnd, (G::ICON * dpi as f32 / 96.0).round() as i32, &pin_inbox);
@@ -530,29 +525,53 @@ impl Bar {
         }
     }
 
-    /// Re-reads one window: adds, re-keys or drops its button.
+    /// Queues an identity read for an eligible window and drops vanished windows immediately.
     fn refresh(&mut self, h: HWND) {
-        let id = h.0 as isize;
-        let changed = match tasks::task_of(h) {
-            Some(t) => {
-                self.exes.insert(id, t.exe);
-                self.ids.insert(t.key.clone(), t.id);
-                let new = !self.model.contains(id);
-                let c = self.model.upsert(id, &t.key);
-                if new {
-                    log::line(&format!("window {id:#x} {} added", t.key));
-                    self.taskband.button_created(id);
-                }
-                c
-            }
-            None => {
-                self.exes.remove(&id);
-                self.taskband.forget(id);
-                self.model.remove(id)
-            }
-        };
-        if changed {
+        if let Some(window) = tasks::candidate(h) {
+            self.task_lookup.request(window);
+        } else {
+            self.remove_task(h.0 as isize);
+        }
+    }
+
+    fn remove_task(&mut self, id: isize) {
+        self.task_lookup.forget(id);
+        self.exes.remove(&id);
+        let band_changed = self.taskband.forget(id);
+        if self.model.remove(id) || band_changed {
             self.dirty();
+        }
+    }
+
+    fn receive_tasks(&mut self) {
+        while let Some(result) = self.task_lookup.receive() {
+            let id = result.window.handle;
+            let hwnd = HWND(id as _);
+            if tasks::candidate(hwnd) != Some(result.window) {
+                self.remove_task(id);
+                self.refresh(hwnd);
+                continue;
+            }
+            if let Some(task) = result.task {
+                self.exes.insert(id, task.exe);
+                self.ids.insert(task.key.clone(), task.id);
+                let new = !self.model.contains(id);
+                if self.model.upsert(id, &task.key) {
+                    self.dirty();
+                }
+                if new {
+                    log::line(&format!("window {id:#x} {} added", task.key));
+                    self.taskband.button_created(id);
+                    if result.flash && self.model.set_flash(id, true) {
+                        self.dirty();
+                    }
+                }
+            } else {
+                self.remove_task(id);
+            }
+            if result.again {
+                self.task_lookup.request(result.window);
+            }
         }
     }
 
@@ -563,6 +582,7 @@ impl Bar {
         let a = (!h.is_invalid()).then_some(h.0 as isize);
         if a.is_some_and(|a| !self.model.contains(a)) {
             self.refresh(h);
+            self.task_lookup.set_flash(h.0 as isize, false);
         }
         if self.model.set_active(a) {
             self.dirty();
@@ -631,6 +651,9 @@ impl Bar {
             // The pointer may still be down over a slot that now shows a different app.
             self.pressed = None;
             self.rebuild();
+            for (i, g) in self.groups.iter().enumerate() {
+                log::line(&format!("button {} {} pin={:?} windows={}", i + 1, g.key, g.pin, g.wins.len()));
+            }
         }
         if let Some(scene) = self.scene.as_mut() {
             for pin in self.groups.iter().filter_map(|group| group.pin).map(|p| &self.pins[p]) {
@@ -656,12 +679,6 @@ impl Bar {
             if let Some(scene) = self.scene.as_mut() {
                 scene.set_icon(&g.key, img);
             }
-        }
-    }
-
-    fn log_groups(&self) {
-        for (i, g) in self.groups.iter().enumerate() {
-            log::line(&format!("button {} {} pin={:?} windows={}", i + 1, g.key, g.pin, g.wins.len()));
         }
     }
 
@@ -898,7 +915,10 @@ impl Bar {
                     self.effects.push(Effect::Launch(pin.launch.clone()));
                 } else if !g.key.contains('\\') {
                     let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
-                    self.effects.push(Effect::Launch(Launch::Aumid(id)));
+                    let exe = g.wins.iter().filter_map(|h| self.exes.get(h))
+                        .find_map(|path| crate::model::relaunch_exe(path))
+                        .map(str::to_owned);
+                    self.effects.push(Effect::Launch(Launch::Aumid { id, exe }));
                 } else if let Some(exe) = g.wins.first().and_then(|h| self.exes.get(h)) {
                     self.effects.push(Effect::Launch(Launch::Path(exe.clone())));
                 }
@@ -957,13 +977,7 @@ impl Bar {
             HSHELL_WINDOWDESTROYED => {
                 let a = self.side.prune();
                 self.asks(a);
-                self.exes.remove(&(lp.0));
-                if self.taskband.forget(lp.0) {
-                    self.dirty();
-                }
-                if self.model.remove(lp.0) {
-                    self.dirty();
-                }
+                self.remove_task(lp.0);
             }
             HSHELL_WINDOWACTIVATED => self.set_active(h),
             HSHELL_GETMINRECT => return self.min_rect(lp),
@@ -972,6 +986,7 @@ impl Bar {
                 HSHELL_FLASH => {
                     if !self.model.contains(lp.0) {
                         self.refresh(h);
+                        self.task_lookup.set_flash(lp.0, true);
                     }
                     if self.model.set_flash(lp.0, true) {
                         self.dirty();
@@ -1434,6 +1449,10 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         }),
         pin_worker::MESSAGE => with_bar(|b| {
             b.receive_pins();
+            LRESULT(0)
+        }),
+        task_lookup::MESSAGE => with_bar(|b| {
+            b.receive_tasks();
             LRESULT(0)
         }),
         WM_APP_EVENT => with_bar(|b| {

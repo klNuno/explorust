@@ -1,7 +1,7 @@
 //! Which windows get a task button, and the app identity they group on: the AUMID of the
-//! window's property store, then the one of its process (for a UWP frame, the process of its
-//! CoreWindow), then the exe path.
+//! window's property store, then the explicit or packaged AUMID of its process, then the exe path.
 
+use super::app_resolver::Resolver;
 use shelldata::items;
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -16,6 +16,14 @@ pub struct Task {
     /// The app id as Windows gave it (case kept, for launching through AppsFolder).
     pub id: String,
     pub exe: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    pub handle: isize,
+    pid: u32,
+    app_frame: bool,
+    core_pid: Option<u32>,
 }
 
 pub fn class_name(hwnd: HWND) -> String {
@@ -34,7 +42,7 @@ fn pid_of(hwnd: HWND) -> u32 {
 
 /// The windows that belong on a taskbar: visible, top-level, not cloaked, not a tool window,
 /// unowned or WS_EX_APPWINDOW, plus UWP frames once they hold their app. None otherwise.
-pub fn task_of(hwnd: HWND) -> Option<Task> {
+pub fn candidate(hwnd: HWND) -> Option<Window> {
     // SAFETY: style and state reads on a window handle (a stale one only fails the reads).
     unsafe {
         if hwnd.is_invalid() || !IsWindowVisible(hwnd).as_bool() || GetAncestor(hwnd, GA_ROOT) != hwnd {
@@ -63,27 +71,39 @@ pub fn task_of(hwnd: HWND) -> Option<Task> {
         return None;
     }
     let pid = pid_of(hwnd);
-    if pid == std::process::id() {
+    if pid == 0 || pid == std::process::id() {
         return None;
     }
-    let exe = items::process_path(pid).unwrap_or_default();
-    let exe_l = exe.to_lowercase();
-    if exe_l.ends_with("\\explorust.exe") || exe_l.ends_with("\\explorust-guard.exe") {
-        return None;
-    }
-    let key = if class == "ApplicationFrameWindow" {
+    let app_frame = class == "ApplicationFrameWindow";
+    let core_pid = if app_frame {
         // A frame shows its app's CoreWindow; with none it is an empty or suspended frame.
         // SAFETY: a child lookup by class.
-        let core = unsafe { FindWindowExW(Some(hwnd), None, w!("Windows.UI.Core.CoreWindow"), None) }.ok();
-        let core_aumid = core.filter(|c| !c.is_invalid()).and_then(|c| items::process_app_id(pid_of(c)));
-        items::window_app_id(hwnd).or(core_aumid)?
+        unsafe { FindWindowExW(Some(hwnd), None, w!("Windows.UI.Core.CoreWindow"), None) }
+            .ok().map(pid_of).filter(|&pid| pid != 0)
     } else {
-        items::window_app_id(hwnd).or_else(|| items::process_app_id(pid)).unwrap_or_else(|| exe.clone())
+        None
     };
-    if key.is_empty() {
-        return None;
+    Some(Window { handle: hwnd.0 as isize, pid, app_frame, core_pid })
+}
+
+impl Window {
+    pub fn resolve(self, resolver: Option<&Resolver>) -> Option<Task> {
+        let hwnd = HWND(self.handle as _);
+        let exe = items::process_path(self.pid).unwrap_or_default();
+        let exe_l = exe.to_lowercase();
+        if exe_l.ends_with("\\explorust.exe") || exe_l.ends_with("\\explorust-guard.exe") {
+            return None;
+        }
+        let app_pid = if self.app_frame { self.core_pid } else { Some(self.pid) };
+        let id = items::window_app_id(hwnd).or_else(|| {
+            let pid = app_pid?;
+            resolver.and_then(|r| r.explicit_id(pid, (!self.app_frame).then_some(hwnd)))
+                .or_else(|| items::process_app_id(pid))
+        });
+        // An empty UWP frame should never get a button for ApplicationFrameHost.exe.
+        let id = id.or_else(|| (!self.app_frame && !exe.is_empty()).then(|| exe.clone()))?;
+        Some(Task { key: id.to_lowercase(), id, exe })
     }
-    Some(Task { key: key.to_lowercase(), id: key, exe })
 }
 
 /// Every top-level window, in z-order.

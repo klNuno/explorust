@@ -17,8 +17,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub enum Launch {
     /// A pin's absolute PIDL (AppsFolder item or shortcut).
     Pidl(Vec<u8>),
-    /// An AUMID, started through its `shell:AppsFolder` item.
-    Aumid(String),
+    /// An AUMID, with the running application's executable as a fallback.
+    Aumid { id: String, exe: Option<String> },
     /// An exe path.
     Path(String),
     /// An exe path with a fixed command-line argument.
@@ -43,16 +43,22 @@ unsafe fn run_launch(what: &Launch) -> bool {
     unsafe {
         match what {
             Launch::Pidl(p) => exec_idlist(p.as_ptr() as _),
-            Launch::Aumid(id) => {
-                let Some(item) = shelldata::items::apps_folder_item(id) else { return false };
-                let Ok(pidl) = SHGetIDListFromObject(&item) else { return false };
-                let ok = exec_idlist(pidl as _);
-                CoTaskMemFree(Some(pidl as _));
-                ok
-            }
+            Launch::Aumid { id, exe } => exec_aumid(id)
+                || exe.as_deref().is_some_and(|path| winx::open(path, None, None)),
             Launch::Path(path) => winx::open(path, None, None),
             Launch::Command(path, arg) => winx::open(path, None, Some(arg)),
         }
+    }
+}
+
+unsafe fn exec_aumid(id: &str) -> bool {
+    let Some(item) = shelldata::items::apps_folder_item(id) else { return false };
+    // SAFETY: the returned PIDL is valid until freed with the COM allocator.
+    unsafe {
+        let Ok(pidl) = SHGetIDListFromObject(&item) else { return false };
+        let ok = exec_idlist(pidl as _);
+        CoTaskMemFree(Some(pidl as _));
+        ok
     }
 }
 

@@ -2,6 +2,7 @@
 
 mod actions;
 mod appbars;
+mod app_resolver;
 mod bar;
 mod context;
 mod jumplist;
@@ -14,6 +15,7 @@ mod side;
 mod status;
 mod settings;
 mod taskband;
+mod task_lookup;
 mod tasks;
 mod thumbs;
 mod trayhost;
