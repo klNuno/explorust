@@ -4,6 +4,7 @@
 //! are queued as effects and run once the state is released.
 
 use super::actions::{self, Launch};
+use super::pin_worker::{self, PinData, Update};
 use super::scene::{RightView, Scene, Slot};
 use super::side::{self, Asks, Ctx, Side};
 use super::{context, jumplist, menu, popup, settings, trayhost, winx};
@@ -17,12 +18,12 @@ use super::workarea::WorkArea;
 use super::log;
 use crate::geom::{self as G, Row};
 use crate::model::{Action, Group, Model};
+use crate::pins::{self, Pin};
 use crate::theme::Theme;
 use render::style::{self, Material, Native, Part, WindowStyle};
-use shelldata::items::{self, PinItem};
+use shelldata::items;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
@@ -49,7 +50,6 @@ const WM_APP_EVENT: u32 = WM_APP + 2;
 const WM_APP_STATUS: u32 = WM_APP + 3;
 /// The flyout lost the activation: close it outside its own message.
 const WM_APP_CLOSE_FLYOUT: u32 = WM_APP + 4;
-const WM_APP_PINS: u32 = WM_APP + 5;
 const WM_COPYGLOBALDATA: u32 = 0x0049;
 const TIMER_ANIM: usize = 1;
 const TIMER_CLOCK: usize = 2;
@@ -99,8 +99,8 @@ struct Bar {
     theme: Theme,
     scene: Option<Scene>,
     model: Model,
-    pins: Vec<Pin>,
-    loaded_pins: Arc<Mutex<Option<Vec<Pin>>>>,
+    pins: Vec<Pin<PinData>>,
+    pin_inbox: pin_worker::Inbox,
     /// Exe path and original-case app id of each task window.
     exes: HashMap<isize, String>,
     ids: HashMap<String, String>,
@@ -130,49 +130,6 @@ struct Bar {
     slide_at: Instant,
     /// Start of the indeterminate progress animation.
     progress_t0: Instant,
-}
-
-struct Pin {
-    key: String,
-    name: String,
-    pidl: Vec<u8>,
-    icon: Option<shelldata::Image>,
-}
-
-impl Pin {
-    fn from_item(item: PinItem, px: i32) -> Self {
-        let icon = shelldata::icons::icon_for_item(&item.item, px).or_else(|| {
-            if item.key.contains('\\') {
-                shelldata::icons::icon_for_path(&item.key, px)
-            } else {
-                items::apps_folder_item(&item.key).and_then(|app| shelldata::icons::icon_for_item(&app, px))
-            }
-        });
-        Self {
-            icon,
-            key: item.key,
-            name: item.name,
-            pidl: item.pidl,
-        }
-    }
-}
-
-fn load_pins(hwnd: HWND, px: i32, result: Arc<Mutex<Option<Vec<Pin>>>>) {
-    let hwnd = hwnd.0 as isize;
-    if let Err(error) = std::thread::Builder::new().name("taskbar-pins".into()).spawn(move || {
-        if let Err(error) = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() } {
-            log::line(&format!("pins COM initialization failed: {error}"));
-            return;
-        }
-        let start = Instant::now();
-        let pins: Vec<_> = items::resolved_taskbar_pins().into_iter().map(|p| Pin::from_item(p, px)).collect();
-        unsafe { CoUninitialize() };
-        log::line(&format!("resolved {} pins on the worker in {} ms", pins.len(), start.elapsed().as_millis()));
-        *result.lock().unwrap() = Some(pins);
-        let _ = unsafe { PostMessageW(Some(HWND(hwnd as _)), WM_APP_PINS, WPARAM(0), LPARAM(0)) };
-    }) {
-        log::line(&format!("pins worker could not start: {error}"));
-    }
 }
 
 pub fn run() {
@@ -361,7 +318,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             model.wins.len(),
             t0.elapsed().as_millis()
         ));
-        let loaded_pins = Arc::new(Mutex::new(None));
+        let pin_inbox = pin_worker::Inbox::default();
         let bar = Bar {
             hwnd,
             cmd,
@@ -372,7 +329,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             scene: Some(scene),
             model,
             pins: Vec::new(),
-            loaded_pins: loaded_pins.clone(),
+            pin_inbox: pin_inbox.clone(),
             exes,
             ids,
             groups: Vec::new(),
@@ -408,7 +365,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             }
         });
         log::line("initial taskbar paint returned; starting pin resolution");
-        load_pins(hwnd, (G::ICON * dpi as f32 / 96.0).round() as i32, loaded_pins);
+        pin_worker::start(hwnd, (G::ICON * dpi as f32 / 96.0).round() as i32, &pin_inbox);
         SetTimer(Some(hwnd), TIMER_CLOCK, shelldata::clock::ms_to_next_minute() as u32, None);
         // Running apps add their icons again.
         trayhost::broadcast_created();
@@ -525,11 +482,11 @@ fn run_effect(e: Effect) {
             }
         }
         Effect::JumpList(i) => {
-            let Some((owner, x, y, nodes, recent)) = with_bar(|b| b.jump_list(i)).flatten() else { return };
+            let Some((owner, x, y, key, nodes, recent)) = with_bar(|b| b.jump_list(i)).flatten() else { return };
             let id = menu::track(owner, x, y, &nodes, true);
             log::line(&format!("jump list {i}: picked {id}"));
             if let Some(p) = jump::pick(id) {
-                let _ = with_bar(|b| b.jump_pick(i, p, &recent));
+                let _ = with_bar(|b| b.jump_pick(&key, p, &recent));
             }
         }
         Effect::Context(kind, x, y) => {
@@ -623,6 +580,53 @@ impl Bar {
         self.load_icons();
     }
 
+    fn receive_pins(&mut self) {
+        let updates = std::mem::take(&mut *self.pin_inbox.lock().unwrap());
+        if updates.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        let mut icons = Vec::new();
+        for update in updates {
+            match update {
+                Update::Slots(count) => {
+                    self.pins.splice(..0, pins::placeholders(count));
+                    changed = true;
+                }
+                Update::Resolved(slot, item) => {
+                    if let Some((key, pin)) = &item {
+                        log::line(&format!("pin slot {slot}: {} = {key}", pin.name));
+                    }
+                    changed |= pins::resolve(&mut self.pins, slot, item);
+                }
+                Update::Icon(slot, icon) => {
+                    if let Some(item) = self.pins.iter_mut().find(|pin| pin.source == Some(slot))
+                        .and_then(|pin| pin.item.as_mut()) {
+                        item.icon = Some(icon);
+                        icons.push(slot);
+                    }
+                }
+            }
+        }
+        if changed {
+            let mut keys = HashSet::new();
+            self.pins.retain(|p| keys.insert(p.key.clone()));
+            self.model.pins = self.pins.iter().map(|p| p.key.clone()).collect();
+            // The pointer may still be down over a slot that now shows a different app.
+            self.pressed = None;
+            self.rebuild();
+        }
+        if let Some(scene) = self.scene.as_mut() {
+            for pin in self.groups.iter().filter_map(|group| group.pin).map(|p| &self.pins[p]) {
+                if (changed || pin.source.is_some_and(|slot| icons.contains(&slot)))
+                    && let Some(icon) = pin.item.as_ref().and_then(|item| item.icon.clone()) {
+                    scene.set_icon(&pin.key, Some(icon));
+                }
+            }
+        }
+        self.paint();
+    }
+
     fn load_icons(&mut self) {
         let Some(scene) = self.scene.as_ref() else { return };
         let px = scene.icon_px();
@@ -630,7 +634,9 @@ impl Bar {
         for g in &missing {
             let t = Instant::now();
             let img = self.group_image(g, px);
-            log::line(&format!("icon {} {}: {} ms", g.key, if img.is_some() { "loaded" } else { "missing" }, t.elapsed().as_millis()));
+            if g.pin.is_none() {
+                log::line(&format!("icon {} {}: {} ms", g.key, if img.is_some() { "loaded" } else { "missing" }, t.elapsed().as_millis()));
+            }
             if let Some(scene) = self.scene.as_mut() {
                 scene.set_icon(&g.key, img);
             }
@@ -692,7 +698,7 @@ impl Bar {
         self.layout_right();
         let Some(scene) = self.scene.as_ref() else { return };
         let mut slots = Vec::with_capacity(self.groups.len() + 1);
-        slots.push(Slot { key: None, running: false, active: false, flashing: false, hover: self.hover_v[0], press: self.press_v[0], focused: self.focus == Some(0), progress: None, overlay: None });
+        slots.push(Slot { key: None, pinned: false, running: false, active: false, flashing: false, hover: self.hover_v[0], press: self.press_v[0], focused: self.focus == Some(0), progress: None, overlay: None });
         let phase = self.progress_t0.elapsed().as_secs_f32();
         for (i, g) in self.groups.iter().enumerate() {
             let progress = g.wins.iter().find_map(|w| self.taskband.progress.get(w).filter(|p| p.shown()).copied());
@@ -701,6 +707,7 @@ impl Bar {
                 progress: progress.map(|p| (p, phase)),
                 overlay,
                 key: Some(&g.key),
+                pinned: g.pin.is_some(),
                 running: !g.wins.is_empty(),
                 active: self.model.is_active(g),
                 flashing: g.flashing,
@@ -855,6 +862,9 @@ impl Bar {
             return;
         }
         let Some(g) = self.groups.get(i - 1).cloned() else { return };
+        if g.pin.is_some_and(|p| self.pins[p].item.is_none()) {
+            return;
+        }
         let action = self.model.click(&g, new_instance);
         log::line(&format!("click {} {}: {action:?}", i, g.key));
         match action {
@@ -866,7 +876,9 @@ impl Bar {
                     // Starting explorer.exe would make it the shell: File Explorer is our Files part.
                     self.effects.push(Effect::Post(bus::Command::FilesOpen));
                 } else if let Some(p) = g.pin {
-                    self.effects.push(Effect::Launch(Launch::Pidl(self.pins[p].pidl.clone())));
+                    if let Some(item) = &self.pins[p].item {
+                        self.effects.push(Effect::Launch(Launch::Pidl(item.pidl.clone())));
+                    }
                 } else if !g.key.contains('\\') {
                     let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
                     self.effects.push(Effect::Launch(Launch::Aumid(id)));
@@ -991,7 +1003,7 @@ impl Bar {
     /// The icon of a group: its pin, its AppsFolder entry, then its exe.
     fn group_image(&self, g: &Group, px: i32) -> Option<shelldata::Image> {
         if let Some(p) = g.pin {
-            return self.pins[p].icon.clone();
+            return self.pins[p].item.as_ref()?.icon.clone();
         }
         let mut img = None;
         if !g.key.contains('\\') {
@@ -1109,17 +1121,21 @@ impl Bar {
         }
     }
 
-    /// Jump list of slot `i`: (owner, anchor, menu, recent paths).
+    /// Jump list of slot `i`: (owner, anchor, app key, menu, recent paths).
     #[allow(clippy::type_complexity)]
-    fn jump_list(&mut self, i: usize) -> Option<(HWND, i32, i32, Vec<menu::Node>, Vec<String>)> {
+    fn jump_list(&mut self, i: usize) -> Option<(HWND, i32, i32, String, Vec<menu::Node>, Vec<String>)> {
         self.close_thumbs();
         let g = self.groups.get(i - 1)?.clone();
+        let pinned = match g.pin {
+            Some(p) => Some(self.pins[p].item.as_ref()?),
+            None => None,
+        };
         let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
         let exe = g.wins.first().and_then(|h| self.exes.get(h)).cloned().unwrap_or_else(|| g.key.clone());
         let t = Instant::now();
         let recent = if g.key.contains('\\') { Vec::new() } else { jumplist::recent(&id, 10) };
-        let app = match g.pin {
-            Some(p) if !self.pins[p].name.is_empty() => self.pins[p].name.clone(),
+        let app = match pinned {
+            Some(pin) if !pin.name.is_empty() => pin.name.clone(),
             _ => jumplist::app_name(&id, &exe),
         };
         let input = jump::Input {
@@ -1153,11 +1169,13 @@ impl Bar {
         let k = self.scale();
         let wr = self.window_rect();
         let x = wr.left + (self.row().cx(i) * k).round() as i32;
-        Some((self.hwnd, x, wr.top, nodes, recent.into_iter().map(|r| r.1).collect()))
+        Some((self.hwnd, x, wr.top, g.key, nodes, recent.into_iter().map(|r| r.1).collect()))
     }
 
-    fn jump_pick(&mut self, i: usize, p: jump::Pick, recent: &[String]) {
-        let Some(g) = self.groups.get(i - 1).cloned() else { return };
+    fn jump_pick(&mut self, key: &str, p: jump::Pick, recent: &[String]) {
+        let Some(index) = self.groups.iter().position(|g| g.key == key) else { return };
+        let g = self.groups[index].clone();
+        let i = index + 1;
         log::line(&format!("jump list {} {}: {p:?}", i, g.key));
         match p {
             jump::Pick::Launch => self.activate_slot(i, true),
@@ -1176,7 +1194,12 @@ impl Bar {
                     let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
                     let exe = g.wins.first().and_then(|h| self.exes.get(h)).cloned().unwrap_or_default();
                     if let Some(item) = jumplist::pin_item(&g.key, &id, &exe) {
-                        self.pins.push(Pin::from_item(item, (G::ICON * self.scale()).round() as i32));
+                        let icon = pin_worker::image(&item, (G::ICON * self.scale()).round() as i32);
+                        self.pins.push(Pin {
+                            source: None,
+                            key: g.key.clone(),
+                            item: Some(PinData { name: item.name, pidl: item.pidl, icon }),
+                        });
                         self.model.pins.push(g.key.clone());
                         log::line(&format!("pinned {} (this session; Taskband not written)", g.key));
                     }
@@ -1391,25 +1414,8 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             b.paint();
             LRESULT(0)
         }),
-        WM_APP_PINS => with_bar(|b| {
-            let loaded = b.loaded_pins.lock().unwrap().take();
-            if let Some(mut pins) = loaded {
-                for pin in &pins {
-                    log::line(&format!("pin {} = {}", pin.name, pin.key));
-                    if let Some(scene) = b.scene.as_mut() && let Some(icon) = &pin.icon {
-                        scene.set_icon(&pin.key, Some(icon.clone()));
-                    }
-                }
-                for pin in b.pins.drain(..) {
-                    if !pins.iter().any(|p| p.key == pin.key) {
-                        pins.push(pin);
-                    }
-                }
-                b.model.pins = pins.iter().map(|p| p.key.clone()).collect();
-                b.pins = pins;
-                b.rebuild();
-                b.paint();
-            }
+        pin_worker::MESSAGE => with_bar(|b| {
+            b.receive_pins();
             LRESULT(0)
         }),
         WM_APP_EVENT => with_bar(|b| {

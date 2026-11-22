@@ -31,8 +31,7 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
             let v = volume::Volume::open(letter)?;
             let j = v.journal()?;
             let t0 = Instant::now();
-            let volume::Mft { mut names, sequences, pruned } = v.load(j.NextUsn)?;
-            names.initial_links_complete = pruned.is_empty();
+            let volume::Mft { names, sequences, pruned } = v.load(j.NextUsn)?;
             let id = names.id();
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             let (n, bytes) = (names.len(), names.bytes());
@@ -84,7 +83,6 @@ fn links_later(letter: char, handle: volume::Volume, frns: Vec<u64>, vol: Arc<Vo
             return;
         }
         table.shrink();
-        table.initial_links_complete = true;
         let (bytes, names) = (table.bytes(), table.len());
         drop(table);
         log::line(&format!(

@@ -12,6 +12,8 @@ pub mod appbar;
 pub mod geom;
 pub mod jump;
 pub mod model;
+#[cfg(any(target_os = "windows", test))]
+mod pins;
 pub mod right;
 pub mod settings;
 pub mod taskband;

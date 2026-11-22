@@ -105,15 +105,12 @@ fn refresh() {
     state.styles = styles;
 }
 
-fn watch() {
-    let Ok(path) = path() else { return };
-    let Some(dir) = path.parent() else { return };
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    // Watch changes by name. The shell frequently writes logs in the same directory.
+fn open_directory() -> Option<HANDLE> {
+    let path = path().ok()?;
+    let dir = path.parent()?;
+    std::fs::create_dir_all(dir).ok()?;
     unsafe {
-        let Ok(directory) = CreateFileW(
+        CreateFileW(
             &HSTRING::from(dir.as_os_str()),
             FILE_LIST_DIRECTORY.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -121,14 +118,22 @@ fn watch() {
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
             None,
-        ) else {
-            return;
-        };
+        ).ok()
+    }
+}
+
+fn watch() {
+    let Some(directory) = open_directory() else {
+        refresh();
+        return;
+    };
+    // Watch changes by name. The shell frequently writes logs in the same directory.
+    unsafe {
         let mut buffer = [0u32; 4096];
         let mut needs_refresh = true;
         loop {
             let mut request = OVERLAPPED::default();
-            if ReadDirectoryChangesW(
+            let subscribed = ReadDirectoryChangesW(
                 directory,
                 buffer.as_mut_ptr().cast(),
                 size_of_val(&buffer) as u32,
@@ -137,13 +142,12 @@ fn watch() {
                 None,
                 Some(&mut request),
                 None,
-            )
-            .is_err()
-            {
-                break;
-            }
+            );
             if needs_refresh {
                 refresh();
+            }
+            if subscribed.is_err() {
+                break;
             }
             let mut size = 0;
             if GetOverlappedResult(directory, &request, &mut size, true).is_err() {

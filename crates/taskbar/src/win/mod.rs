@@ -7,6 +7,7 @@ mod context;
 mod jumplist;
 mod log;
 mod menu;
+mod pin_worker;
 mod popup;
 mod scene;
 mod side;

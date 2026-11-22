@@ -4,13 +4,16 @@
 use crate::hydration::{BATCH, Hydration};
 use crate::log;
 use crate::volume::{Volume, file_by_id, full_reference, ioctl};
+use fsindex::usn::{ATTR_DIRECTORY, MASK48};
+use std::collections::HashSet;
 use std::os::windows::io::AsRawHandle;
 use std::time::Instant;
 use windows::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_NO_MORE_FILES, HANDLE};
 use windows::Win32::Storage::FileSystem::{FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx};
 use windows::Win32::System::Ioctl::{
-    FILE_LAYOUT_ENTRY, FILE_LAYOUT_INFO_ENTRY_0, FSCTL_QUERY_FILE_LAYOUT, QUERY_FILE_LAYOUT_INCLUDE_EXTRA_INFO,
-    QUERY_FILE_LAYOUT_INPUT, QUERY_FILE_LAYOUT_OUTPUT, QUERY_FILE_LAYOUT_RESTART,
+    FILE_LAYOUT_ENTRY, FILE_LAYOUT_INFO_ENTRY_0, FILE_LAYOUT_NAME_ENTRY, FILE_LAYOUT_NAME_ENTRY_DOS,
+    FILE_LAYOUT_NAME_ENTRY_PRIMARY, FSCTL_QUERY_FILE_LAYOUT, QUERY_FILE_LAYOUT_INCLUDE_EXTRA_INFO,
+    QUERY_FILE_LAYOUT_INCLUDE_NAMES, QUERY_FILE_LAYOUT_INPUT, QUERY_FILE_LAYOUT_OUTPUT, QUERY_FILE_LAYOUT_RESTART,
 };
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
 use windows_core::HSTRING;
@@ -47,8 +50,14 @@ fn hydrate(volume: Volume, sequences: &[u16], hydration: &Hydration) {
     let letter = volume.letter;
     let handle = volume.handle();
     let mut modified = 0;
-    if let Err(e) = file_layout(handle, sequences, hydration, &mut modified) {
-        log::line(&format!("{letter}: file layout unavailable ({e}), reading remaining last write times by ID"));
+    match file_layout(handle, sequences, hydration, &mut modified) {
+        Ok(parents) => {
+            let count = parents.len();
+            if hydration.finish_links(parents) {
+                log::line(&format!("{letter}: scoped search checked hard links, {count} alias directories need Windows Search"));
+            }
+        }
+        Err(e) => log::line(&format!("{letter}: file layout unavailable ({e}), scoped coverage unavailable; reading remaining last write times by ID")),
     }
 
     let mut dates = Vec::with_capacity(BATCH);
@@ -68,21 +77,26 @@ fn hydrate(volume: Volume, sequences: &[u16], hydration: &Hydration) {
     log::line(&format!("{letter}: last write times hydrated for {modified} names in {} ms", clock.elapsed().as_millis()));
 }
 
-fn file_layout(volume: HANDLE, sequences: &[u16], hydration: &Hydration, modified: &mut usize) -> windows_core::Result<()> {
-    let mut input = QUERY_FILE_LAYOUT_INPUT { Flags: QUERY_FILE_LAYOUT_INCLUDE_EXTRA_INFO | QUERY_FILE_LAYOUT_RESTART, ..Default::default() };
+fn file_layout(volume: HANDLE, sequences: &[u16], hydration: &Hydration, modified: &mut usize) -> windows_core::Result<HashSet<u32>> {
+    let mut input = QUERY_FILE_LAYOUT_INPUT {
+        Flags: QUERY_FILE_LAYOUT_INCLUDE_EXTRA_INFO | QUERY_FILE_LAYOUT_INCLUDE_NAMES | QUERY_FILE_LAYOUT_RESTART,
+        ..Default::default()
+    };
     let mut buffer = vec![0u8; 1 << 20];
     let mut dates = Vec::new();
+    let mut parents = Vec::new();
+    let mut alias_parents = HashSet::new();
     while hydration.is_current() {
         let got = match ioctl(volume, FSCTL_QUERY_FILE_LAYOUT, &input, &mut buffer) {
             Ok(n) => n,
-            Err(e) if [ERROR_HANDLE_EOF.to_hresult(), ERROR_NO_MORE_FILES.to_hresult()].contains(&e.code()) => return Ok(()),
+            Err(e) if [ERROR_HANDLE_EOF.to_hresult(), ERROR_NO_MORE_FILES.to_hresult()].contains(&e.code()) => break,
             Err(e) => return Err(e),
         };
         input.Flags &= !QUERY_FILE_LAYOUT_RESTART;
         let bytes = buffer.get(..got).ok_or_else(invalid_layout)?;
         let output = header::<QUERY_FILE_LAYOUT_OUTPUT>(bytes, 0).ok_or_else(invalid_layout)?;
         if output.FileEntryCount == 0 {
-            return Ok(());
+            break;
         }
         let mut offset = output.FirstFileOffset as usize;
         if offset < size_of::<QUERY_FILE_LAYOUT_OUTPUT>() {
@@ -92,7 +106,7 @@ fn file_layout(volume: HANDLE, sequences: &[u16], hydration: &Hydration, modifie
         for i in 0..output.FileEntryCount {
             let entry = header::<FILE_LAYOUT_ENTRY>(bytes, offset).ok_or_else(invalid_layout)?;
             let frn = entry.FileReferenceNumber;
-            let rec = frn & fsindex::usn::MASK48;
+            let rec = frn & MASK48;
             if entry.ExtraInfoOffset != 0 && sequences.get(rec as usize) == Some(&((frn >> 48) as u16)) {
                 let at = offset + entry.ExtraInfoOffset as usize;
                 let info = header::<FILE_LAYOUT_INFO_ENTRY_0>(bytes, at).ok_or_else(invalid_layout)?;
@@ -101,14 +115,52 @@ fn file_layout(volume: HANDLE, sequences: &[u16], hydration: &Hydration, modifie
             if i + 1 < output.FileEntryCount && entry.NextFileOffset < size_of::<FILE_LAYOUT_ENTRY>() as u32 {
                 return Err(invalid_layout());
             }
+            if entry.FileAttributes & ATTR_DIRECTORY == 0 && rec >= 16 {
+                let end = if entry.NextFileOffset == 0 { bytes.len() } else { offset + entry.NextFileOffset as usize };
+                let entry_bytes = bytes.get(offset..end).ok_or_else(invalid_layout)?;
+                if !layout_parents(entry_bytes, entry.FirstNameOffset as usize, &mut parents) {
+                    return Err(invalid_layout());
+                }
+                if parents.len() > 1 {
+                    alias_parents.extend(parents.iter().copied());
+                }
+            }
             offset += entry.NextFileOffset as usize;
         }
         for batch in dates.chunks(BATCH) {
-            let Some(n) = hydration.apply(batch) else { return Ok(()) };
+            let Some(n) = hydration.apply(batch) else { break };
             *modified += n;
         }
     }
-    Ok(())
+    Ok(alias_parents)
+}
+
+fn layout_parents(bytes: &[u8], mut offset: usize, parents: &mut Vec<u32>) -> bool {
+    const NAME: usize = std::mem::offset_of!(FILE_LAYOUT_NAME_ENTRY, FileName);
+    parents.clear();
+    while offset != 0 {
+        let Some(prefix) = bytes.get(offset..offset + NAME) else { return false };
+        let next = u32::from_le_bytes(prefix[..4].try_into().unwrap()) as usize;
+        let flags = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
+        let parent = u64::from_le_bytes(prefix[8..16].try_into().unwrap()) & MASK48;
+        let length = u32::from_le_bytes(prefix[16..20].try_into().unwrap()) as usize;
+        if length == 0 || length % 2 != 0 || offset + NAME + length > bytes.len() {
+            return false;
+        }
+        // A DOS-only 8.3 directory entry is the alternate spelling of a long name.
+        if flags & FILE_LAYOUT_NAME_ENTRY_DOS == 0 || flags & FILE_LAYOUT_NAME_ENTRY_PRIMARY != 0 {
+            let Ok(parent) = u32::try_from(parent) else { return false };
+            parents.push(parent);
+        }
+        if next == 0 {
+            break;
+        }
+        if next < NAME + length {
+            return false;
+        }
+        offset += next;
+    }
+    true
 }
 
 fn header<T: Copy>(bytes: &[u8], offset: usize) -> Option<T> {

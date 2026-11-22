@@ -17,6 +17,9 @@ const V2_REQUEST: u16 = 1 << 15;
 const V2_REPLY: u32 = 1 << 31;
 const SCOPED_REQUEST: u16 = 1 << 14;
 const COVERED_REPLY: u32 = 1 << 30;
+// Older scoped services see a scope that cannot match a drive letter and reply uncovered.
+// Keep accepting plain drive paths from their clients, with the same reply layout.
+const ALIAS_AWARE_SCOPE: &str = "aliases:";
 const MAX_HITS: u16 = 200;
 const MAX_QUERY_BYTES: usize = 1024;
 
@@ -47,10 +50,11 @@ pub fn write_request(w: &mut impl Write, q: &str, max: u16, version: Version) ->
 pub fn write_scoped_request(w: &mut impl Write, q: &str, max: u16, scope: &str) -> io::Result<()> {
     // Keeping one old-format frame lets a V1/V2 service consume this request and reply normally.
     // Only new services interpret the scope marker and may mark a response as covered.
-    if scope.is_empty() || scope.len() + q.len() + 1 > MAX_QUERY_BYTES || scope.contains('\0') || q.contains('\0') {
+    if scope.is_empty() || ALIAS_AWARE_SCOPE.len() + scope.len() + q.len() + 1 > MAX_QUERY_BYTES || scope.contains('\0') || q.contains('\0') {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid search scope or query"));
     }
-    let mut payload = scope.as_bytes().to_vec();
+    let mut payload = ALIAS_AWARE_SCOPE.as_bytes().to_vec();
+    payload.extend_from_slice(scope.as_bytes());
     payload.push(0);
     payload.extend_from_slice(q.as_bytes());
     write_frame(w, &payload, max.min(MAX_HITS) | V2_REQUEST | SCOPED_REQUEST)
@@ -87,7 +91,7 @@ pub fn read_request(r: &mut impl Read) -> io::Result<Request> {
     let scope = if version == Version::V2 && max & SCOPED_REQUEST != 0 {
         let (scope, scoped_query) = query.split_once('\0').filter(|(s, _)| !s.is_empty())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing search scope"))?;
-        let scope = scope.to_owned();
+        let scope = scope.strip_prefix(ALIAS_AWARE_SCOPE).unwrap_or(scope).to_owned();
         query = scoped_query.to_owned();
         Some(scope)
     } else {
@@ -195,16 +199,29 @@ mod tests {
         let mut bytes = Vec::new();
         write_scoped_request(&mut bytes, "report", 20, r"D:\Work").unwrap();
         let legacy_len = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
-        assert_eq!(&bytes[4..4 + legacy_len], b"D:\\Work\0report");
+        assert_eq!(&bytes[4..4 + legacy_len], b"aliases:D:\\Work\0report");
         let request = read_request(&mut bytes.as_slice()).unwrap();
         assert_eq!(request.scope.as_deref(), Some(r"D:\Work"));
         assert_eq!(request.query, "report");
         assert_eq!(request.max, 20);
+        bytes.clear();
+        write_frame(&mut bytes, b"D:\\Work\0report", 20 | V2_REQUEST | SCOPED_REQUEST).unwrap();
+        assert_eq!(read_request(&mut bytes.as_slice()).unwrap().scope.as_deref(), Some(r"D:\Work"));
         let reply = Reply { names: 500, ..Reply::default() };
         for (version, covered, expected) in [(Version::V1, false, false), (Version::V2, false, false), (Version::V2, true, true)] {
             bytes.clear();
             write_reply_with_coverage(&mut bytes, &reply, version, covered).unwrap();
             assert_eq!(read_reply_with_coverage(&mut bytes.as_slice()).unwrap(), (reply.clone(), expected));
         }
+    }
+
+    #[test]
+    fn new_scope_is_not_a_drive_path_to_an_older_scoped_service() {
+        let mut bytes = Vec::new();
+        write_scoped_request(&mut bytes, "report", 20, r"D:\Work").unwrap();
+        let old_scope = std::str::from_utf8(&bytes[4..]).unwrap().split_once('\0').unwrap().0;
+        assert!(!old_scope.get(..3).is_some_and(|root| root.eq_ignore_ascii_case(r"D:\")));
+        let request = read_request(&mut bytes.as_slice()).unwrap();
+        assert_eq!(request.scope.as_deref(), Some(r"D:\Work"));
     }
 }

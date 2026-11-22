@@ -13,12 +13,14 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, ID2D1Bitmap1, ID2D1Brush, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS, IDWriteTextFormat};
+use windows::Win32::UI::WindowsAndMessaging::{IDI_APPLICATION, LoadIconW};
 use windows_core::{Interface, Result};
 use windows_numerics::Matrix3x2;
 
 /// One slot as drawn: slot 0 is Start (`key` None).
 pub struct Slot<'a> {
     pub key: Option<&'a str>,
+    pub pinned: bool,
     pub running: bool,
     pub active: bool,
     pub flashing: bool,
@@ -50,6 +52,7 @@ pub struct Scene {
     glyph_fmt: IDWriteTextFormat,
     chevron_fmt: IDWriteTextFormat,
     start: ID2D1Bitmap1,
+    fallback: Option<ID2D1Bitmap1>,
     icons: HashMap<String, Option<ID2D1Bitmap1>>,
     tray: HashMap<isize, Option<ID2D1Bitmap1>>,
     /// Overlay badges by window.
@@ -67,7 +70,11 @@ impl Scene {
         let chevron_fmt = text.format("Segoe Fluent Icons", G::CHEVRON_PX, DWRITE_FONT_WEIGHT_NORMAL, Align::Center)?;
         let logo = start_image(theme.light, (G::START_SQ * scale).round() as u32);
         let start = surface.bitmap(logo.width, logo.height, &logo.to_premultiplied_bgra())?;
-        Ok(Scene { surface, text, clock_fmt, glyph_fmt, chevron_fmt, start, icons: HashMap::new(), tray: HashMap::new(), overlays: HashMap::new(), scale, width: w_px as f32 / scale })
+        // The system's shared generic application icon doesn't call a shell provider.
+        let fallback = unsafe { LoadIconW(None, IDI_APPLICATION) }.ok()
+            .and_then(|icon| super::trayhost::icon_image(icon.0 as isize, (G::ICON * scale).round() as i32))
+            .and_then(|img| surface.bitmap(img.width, img.height, &img.to_premultiplied_bgra()).ok());
+        Ok(Scene { surface, text, clock_fmt, glyph_fmt, chevron_fmt, start, fallback, icons: HashMap::new(), tray: HashMap::new(), overlays: HashMap::new(), scale, width: w_px as f32 / scale })
     }
 
     pub fn icon_px(&self) -> i32 {
@@ -268,7 +275,8 @@ impl Scene {
                         let top = G::START_TOP + (G::START_SQ * 2.0 + 1.0 - side) / 2.0;
                         Some((&self.start, rect(x.round(), top, side, side)))
                     }
-                    Some(key) => self.icons.get(key).and_then(|o| o.as_ref()).map(|bmp| {
+                    Some(key) => self.icons.get(key).and_then(|o| o.as_ref())
+                        .or_else(|| self.fallback.as_ref().filter(|_| b.pinned)).map(|bmp| {
                         let side = G::ICON * shrink;
                         let top = G::ICON_TOP + (G::ICON - side) / 2.0;
                         (bmp, rect(cx - side / 2.0, top, side, side))

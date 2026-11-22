@@ -138,18 +138,23 @@ fn hard_links(volume: HANDLE, frn: u64, buf: &mut Vec<u8>) -> Option<LinkInfo> {
     }
     // FILE_LINKS_INFORMATION: BytesNeeded u32, EntriesReturned u32, then entries of
     // NextEntryOffset u32, (pad) ParentFileId i64 at 8, FileNameLength u32 at 16, FileName at 20.
+    let buf = buf.get(..iosb[1])?;
     let u32_at = |o: usize| buf.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let n = u32_at(4)? as usize;
+    if n == 0 || n > (buf.len() - 8) / 20 {
+        return None;
+    }
     let (mut o, mut out) = (8usize, Vec::with_capacity(n));
-    for _ in 0..n {
+    for i in 0..n {
         let next = u32_at(o)? as usize;
         let parent = u64::from_le_bytes(buf.get(o + 8..o + 16)?.try_into().ok()?) & usn::MASK48;
         let len = u32_at(o + 16)? as usize;
-        let units: Vec<u16> = buf.get(o + 20..o + 20 + len * 2)?.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
-        out.push((parent.min(u32::MAX as u64) as u32, String::from_utf16_lossy(&units)));
-        if next == 0 {
-            break;
+        let size = 20 + len * 2;
+        if len == 0 || (i + 1 < n && next < size) {
+            return None;
         }
+        let units: Vec<u16> = buf.get(o + 20..o + size)?.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        out.push((u32::try_from(parent).ok()?, String::from_utf16_lossy(&units)));
         o += next;
     }
     Some(LinkInfo { names: out, modified: metadata::last_write(h).unwrap_or(0) })
@@ -224,20 +229,21 @@ fn apply(t: &mut Table, r: &Record, modified: i64) {
         return;
     }
     t.touch(r.rec as u32);
+    let dir = r.attrs & usn::ATTR_DIRECTORY != 0;
     if r.reason & usn::REASON_FILE_DELETE != 0 {
         t.remove(r.rec as u32);
+        return;
     } else if r.reason & usn::REASON_RENAME_OLD_NAME != 0 {
         // A close record can carry both the old-name reason and data changes.
         t.set_modified(r.rec as u32, modified);
     } else {
-        let dir = r.attrs & usn::ATTR_DIRECTORY != 0;
         let noisy = r.attrs & (usn::ATTR_HIDDEN | usn::ATTR_SYSTEM) != 0;
         let parent = r.parent.min(u32::MAX as u64) as u32;
         t.upsert(r.rec as u32, parent, &r.name, dir, noisy, modified);
-        // A kept name may be gone: renamed into a pruned tree, or one of its hard links removed.
-        if !dir && (r.reason & usn::REASON_HARD_LINK_CHANGE != 0 || (r.reason & usn::REASON_RENAME_NEW_NAME != 0 && t.pruned_parent(parent))) {
-            t.recheck_links(r.rec as u32);
-        }
+    }
+    // A rename or hard-link change can move an alias into a previously covered scope.
+    if !dir && r.reason & (usn::REASON_HARD_LINK_CHANGE | usn::REASON_RENAME_NEW_NAME) != 0 {
+        t.recheck_links(r.rec as u32);
     }
 }
 
@@ -352,23 +358,25 @@ impl Volume {
             let frn = full_reference(rec, r.seq);
             let deleted = r.reason & usn::REASON_FILE_DELETE != 0;
             let renamed_outside = r.reason & usn::REASON_RENAME_NEW_NAME != 0
-                && r.reason & usn::REASON_HARD_LINK_CHANGE == 0
+                && r.reason & (usn::REASON_RENAME_OLD_NAME | usn::REASON_HARD_LINK_CHANGE) == 0
                 && !t.pruned_parent(r.parent.min(u32::MAX as u64) as u32);
-            if deleted || renamed_outside || retries.get(&rec).is_some_and(|job| job.frn != frn) {
+            if deleted || renamed_outside || r.reason & usn::REASON_FILE_CREATE != 0 || retries.get(&rec).is_some_and(|job| job.frn != frn) {
                 retries.remove(&rec);
+                t.finish_link_lookup(rec);
             }
             apply(&mut t, r, dates.get(&frn).copied().unwrap_or(0));
-            let current = refs.entry(rec).or_insert((frn, true));
+            let current = refs.entry(rec).or_insert((frn, Some(true)));
             // A lookup queued earlier in this batch must not invalidate a later, known name.
-            if deleted || renamed_outside {
-                *current = (frn, false);
+            if deleted {
+                *current = (frn, None);
             } else if current.0 != frn || r.reason & (usn::REASON_FILE_CREATE | usn::REASON_HARD_LINK_CHANGE | usn::REASON_RENAME_NEW_NAME) != 0 {
-                *current = (frn, true);
+                *current = (frn, Some(!renamed_outside));
             }
         }
         for rec in t.take_pruned_files() {
-            if let Some(&(frn, true)) = refs.get(&rec) && t.state(rec) != RecState::Free {
-                retries.entry(rec).or_insert_with(|| LinkRetry::new(frn, now));
+            if let Some(&(frn, Some(repair_name))) = refs.get(&rec) && t.state(rec) != RecState::Free {
+                t.require_link_lookup(rec);
+                retries.entry(rec).or_insert_with(|| LinkRetry::new(frn, now, repair_name));
             }
         }
         records.len() as u64
@@ -384,15 +392,25 @@ impl Volume {
             if let Some(info) = hard_links(self.h, job.frn, buf) {
                 let mut t = table.write().unwrap_or_else(|p| p.into_inner());
                 t.touch(rec);
-                set_link(&mut t, rec, info);
+                if info.names.len() > 1 {
+                    t.mark_alias_parents(info.names.iter().map(|&(parent, _)| parent));
+                }
+                if job.repair_name {
+                    set_link(&mut t, rec, info);
+                } else {
+                    t.set_modified(rec, info.modified);
+                }
+                t.finish_link_lookup(rec);
             } else if let Some(next) = job.after_failure(Instant::now()) {
                 retries.insert(rec, next);
             } else {
                 let mut t = table.write().unwrap_or_else(|p| p.into_inner());
                 t.touch(rec);
-                t.prune(rec);
+                if job.repair_name {
+                    t.prune(rec);
+                }
                 drop(t);
-                log::line(&format!("{}: hard link retry exhausted: record {rec}, alias invalidated", self.letter));
+                log::line(&format!("{}: hard link retry exhausted: record {rec}, scoped coverage unavailable", self.letter));
             }
         }
     }
@@ -462,7 +480,7 @@ mod tests {
         let table = RwLock::new(table);
         let now = Instant::now();
         // This reference is beyond NTFS's supported record range and cannot be opened.
-        let mut retries = HashMap::from([(rec, LinkRetry::new(u64::MAX, now))]);
+        let mut retries = HashMap::from([(rec, LinkRetry::new(u64::MAX, now, true))]);
         let mut buf = vec![0; 8 << 10];
 
         volume.retry_links(&table, &mut retries, &mut buf);

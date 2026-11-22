@@ -8,6 +8,7 @@
 use crate::fold;
 use memchr::memmem;
 use std::cmp::Reverse;
+use std::collections::HashSet;
 
 pub const SEP: u8 = b'\n';
 /// The root directory's MFT record number on NTFS.
@@ -54,6 +55,11 @@ pub struct Table {
     /// Scoped coverage starts only after the initial scan, journal catch-up and alias discovery.
     pub journal_current: bool,
     pub initial_links_complete: bool,
+    /// Parents seen with an alias this single-name table cannot guarantee. Keep them through
+    /// the current scan so an old observation still routes the scope to Windows Search.
+    alias_parents: HashSet<u32>,
+    /// A journal change may have introduced a name in any directory until its links are read.
+    pending_links: HashSet<u32>,
     /// Files pruned since the last `take_pruned_files`: a hard link of theirs may sit outside
     /// the pruned tree (System32 binaries are links into WinSxS), looked up by the service.
     pruned_files: Vec<u32>,
@@ -134,8 +140,6 @@ impl Table {
         }
     }
 
-    /// A rename into a pruned tree or a hard link change of a file that has a kept name: that
-    /// name may be gone, so the file goes to the next links lookup (`take_pruned_files`).
     /// A links lookup begins (`true`) or ends on this table; the touched set lives while one runs.
     pub fn watch_touches(&mut self, on: bool) {
         if on {
@@ -166,10 +170,24 @@ impl Table {
         self.touched.get(&rec).is_some_and(|&n| n > since)
     }
 
+    /// A rename or hard-link change can invalidate the kept name or expose a new alias.
     pub fn recheck_links(&mut self, rec: u32) {
-        if self.slots.get(rec as usize).is_some_and(|s| s.name != NONE && s.name & DIR == 0) && !self.pruned_files.contains(&rec) {
+        if self.slots.get(rec as usize).is_some_and(|s| s.parent == NONE || s.name != NONE && s.name & DIR == 0)
+            && !self.pruned_files.contains(&rec) {
             self.pruned_files.push(rec);
         }
+    }
+
+    pub fn require_link_lookup(&mut self, rec: u32) {
+        self.pending_links.insert(rec);
+    }
+
+    pub fn finish_link_lookup(&mut self, rec: u32) {
+        self.pending_links.remove(&rec);
+    }
+
+    pub fn mark_alias_parents(&mut self, parents: impl IntoIterator<Item = u32>) {
+        self.alias_parents.extend(parents);
     }
 
     pub fn len(&self) -> usize {
@@ -489,7 +507,7 @@ impl Table {
     /// Query only the descendants of a known scope. A prune root or any ancestor of one has
     /// incomplete coverage. Resolve folder names to record IDs before ranking any matches.
     pub fn query_scope(&self, q: &str, max: usize, root: &str, path: &str) -> Option<Vec<Found>> {
-        if !self.journal_current || !self.initial_links_complete {
+        if !self.journal_current || !self.initial_links_complete || !self.pending_links.is_empty() {
             return None;
         }
         let path = path.trim_end_matches('\\');
@@ -519,6 +537,9 @@ impl Table {
         if self.prune_roots.iter().any(|&rec| {
             self.is_dir(rec) && (rec == scope || self.descends_from(rec, scope) || self.descends_from(scope, rec))
         }) {
+            return None;
+        }
+        if self.alias_parents.iter().any(|&parent| parent == scope || self.descends_from(parent, scope)) {
             return None;
         }
         Some(self.query_where(q, max, Some(scope)))
@@ -623,6 +644,28 @@ mod scope_tests {
         table.journal_current = true;
         table.initial_links_complete = true;
         assert!(table.query_scope("report", 1, "D:\\", "D:\\Projects").is_none());
+    }
+
+    #[test]
+    fn scopes_with_alternate_names_or_unresolved_link_changes_are_uncovered() {
+        let mut table = Table::new();
+        table.upsert(20, ROOT, "Work", true, false, 0);
+        table.upsert(21, 20, "First", true, false, 0);
+        table.upsert(22, ROOT, "Second", true, false, 0);
+        table.upsert(23, ROOT, "Other", true, false, 0);
+        table.upsert(30, 21, "first.txt", false, false, 0);
+        table.upsert(30, 22, "second.txt", false, false, 0);
+        table.journal_current = true;
+        table.initial_links_complete = true;
+
+        table.require_link_lookup(30);
+        assert!(table.query_scope("first", 10, "D:\\", "D:\\Other").is_none());
+        table.mark_alias_parents([21, 22]);
+        table.finish_link_lookup(30);
+        for scope in ["D:\\Work", "D:\\Work\\First", "D:\\Second"] {
+            assert!(table.query_scope("first", 10, "D:\\", scope).is_none(), "{scope}");
+        }
+        assert!(table.query_scope("first", 10, "D:\\", "D:\\Other").unwrap().is_empty());
     }
 }
 

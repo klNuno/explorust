@@ -45,6 +45,17 @@ impl Hydration {
         Some(applied)
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn finish_links(&self, alias_parents: impl IntoIterator<Item = u32>) -> bool {
+        let mut table = self.table.write().unwrap_or_else(|p| p.into_inner());
+        if table.id() != self.generation {
+            return false;
+        }
+        table.mark_alias_parents(alias_parents);
+        table.initial_links_complete = true;
+        true
+    }
+
     fn missing(&self, table: &Table, rec: u32) -> bool {
         // A touched record may now refer to a different file, even if its date is still unknown.
         table.needs_modified(rec) && !table.touched_since(rec, self.revision)

@@ -61,8 +61,12 @@ pub fn resolved_taskbar_pins_from_blob(blob: &[u8]) -> Vec<PinItem> {
         .collect()
 }
 
-fn resolve_pin(mut pidl: Vec<u8>) -> Option<PinItem> {
-    // SAFETY: pin_pidls supplies validated ITEMIDLIST buffers.
+/// Resolves one validated Taskband PIDL without extracting its icon.
+pub fn resolve_pin(mut pidl: Vec<u8>) -> Option<PinItem> {
+    if !crate::taskband::valid_pidl(&pidl) {
+        return None;
+    }
+    // SAFETY: `pidl` has been validated as a zero-terminated ITEMIDLIST.
     let mut item: IShellItem2 = unsafe { SHCreateItemFromIDList(pidl.as_ptr().cast()) }.ok()?;
     // An AppsFolder PIDL has no filesystem path and stays in its original namespace.
     // The parsing-name fallback catches a stale filesystem PIDL even if SIGDN_FILESYSPATH fails.

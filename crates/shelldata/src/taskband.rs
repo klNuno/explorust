@@ -19,7 +19,7 @@ pub fn pin_pidls(blob: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// Whether `p` is a chain of SHITEMIDs ending with the 2-byte zero terminator.
-fn valid_pidl(p: &[u8]) -> bool {
+pub(crate) fn valid_pidl(p: &[u8]) -> bool {
     let mut q = 0usize;
     while q + 2 <= p.len() {
         let cb = u16::from_le_bytes([p[q], p[q + 1]]) as usize;
