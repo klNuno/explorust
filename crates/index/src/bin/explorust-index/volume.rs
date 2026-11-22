@@ -1,6 +1,6 @@
 //! One NTFS volume: its handle, the USN journal, the MFT enumeration and the journal follower.
 
-use crate::retry::LinkRetry;
+use crate::retry::{self, LinkRetry};
 use crate::{log, metadata};
 use fsindex::table::{RecState, Table};
 use fsindex::usn::{self, Record};
@@ -357,39 +357,37 @@ impl Volume {
             let rec = r.rec as u32;
             let frn = full_reference(rec, r.seq);
             let deleted = r.reason & usn::REASON_FILE_DELETE != 0;
-            let renamed_outside = r.reason & usn::REASON_RENAME_NEW_NAME != 0
-                && r.reason & (usn::REASON_RENAME_OLD_NAME | usn::REASON_HARD_LINK_CHANGE) == 0
-                && !t.pruned_parent(r.parent.min(u32::MAX as u64) as u32);
-            if deleted || renamed_outside || r.reason & usn::REASON_FILE_CREATE != 0 || retries.get(&rec).is_some_and(|job| job.frn != frn) {
+            let repair_name = r.reason & usn::REASON_HARD_LINK_CHANGE != 0
+                || t.pruned_parent(r.parent.min(u32::MAX as u64) as u32)
+                || r.reason & (usn::REASON_RENAME_NEW_NAME | usn::REASON_RENAME_OLD_NAME)
+                    == (usn::REASON_RENAME_NEW_NAME | usn::REASON_RENAME_OLD_NAME);
+            if deleted || retries.get(&rec).is_some_and(|job| job.frn != frn) {
                 retries.remove(&rec);
                 t.finish_link_lookup(rec);
             }
             apply(&mut t, r, dates.get(&frn).copied().unwrap_or(0));
-            let current = refs.entry(rec).or_insert((frn, Some(true)));
-            // A lookup queued earlier in this batch must not invalidate a later, known name.
             if deleted {
-                *current = (frn, None);
-            } else if current.0 != frn || r.reason & (usn::REASON_FILE_CREATE | usn::REASON_HARD_LINK_CHANGE | usn::REASON_RENAME_NEW_NAME) != 0 {
-                *current = (frn, Some(!renamed_outside));
+                refs.remove(&rec);
+            } else {
+                let current = refs.entry(rec).or_insert((frn, false));
+                // A rename giving us a new name can still follow a hard-link change in this batch.
+                *current = (frn, repair_name || (current.0 == frn && current.1));
             }
         }
         for rec in t.take_pruned_files() {
-            if let Some(&(frn, Some(repair_name))) = refs.get(&rec) && t.state(rec) != RecState::Free {
+            if let Some(&(frn, repair_name)) = refs.get(&rec) && t.state(rec) != RecState::Free {
                 t.require_link_lookup(rec);
-                retries.entry(rec).or_insert_with(|| LinkRetry::new(frn, now, repair_name));
+                retry::queue(retries, rec, frn, now, repair_name);
             }
         }
         records.len() as u64
     }
 
-    fn retry_links(&self, table: &RwLock<Table>, retries: &mut HashMap<u32, LinkRetry>, buf: &mut Vec<u8>) {
+    fn retry_links(&self, table: &RwLock<Table>, retries: &mut HashMap<u32, LinkRetry>, mut lookup: impl FnMut(u64) -> Option<LinkInfo>) {
         let now = Instant::now();
         let due: Vec<_> = retries.extract_if(|_, job| job.due <= now).collect();
         for (rec, job) in due {
-            if job.attempts != 0 {
-                log::line(&format!("{}: hard link retry timer: record {rec}, attempt {}", self.letter, job.attempts + 1));
-            }
-            if let Some(info) = hard_links(self.h, job.frn, buf) {
+            if let Some(info) = lookup(job.frn) {
                 let mut t = table.write().unwrap_or_else(|p| p.into_inner());
                 t.touch(rec);
                 if info.names.len() > 1 {
@@ -401,16 +399,20 @@ impl Volume {
                     t.set_modified(rec, info.modified);
                 }
                 t.finish_link_lookup(rec);
-            } else if let Some(next) = job.after_failure(Instant::now()) {
-                retries.insert(rec, next);
-            } else {
-                let mut t = table.write().unwrap_or_else(|p| p.into_inner());
-                t.touch(rec);
-                if job.repair_name {
-                    t.prune(rec);
+                if job.recovering() {
+                    log::line(&format!("{}: hard link lookup recovered: record {rec}", self.letter));
                 }
-                drop(t);
-                log::line(&format!("{}: hard link retry exhausted: record {rec}, scoped coverage unavailable", self.letter));
+            } else {
+                let next = job.after_failure(Instant::now());
+                if next.recovering() && !job.recovering() {
+                    if job.repair_name {
+                        let mut t = table.write().unwrap_or_else(|p| p.into_inner());
+                        t.touch(rec);
+                        t.prune(rec);
+                    }
+                    log::line(&format!("{}: hard link lookup backing off: record {rec}, scoped coverage unavailable", self.letter));
+                }
+                retries.insert(rec, next);
             }
         }
     }
@@ -452,10 +454,11 @@ impl Volume {
                 caught_up = true;
             }
             if !retries.is_empty() {
-                self.retry_links(table, &mut retries, &mut links_buf);
+                self.retry_links(table, &mut retries, |frn| hard_links(self.h, frn, &mut links_buf));
             }
             if got <= 8 && let Some(deadline) = retries.values().map(|r| r.due).min() {
-                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                // Keep following unrelated journal changes while a long retry is pending.
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(retry::RETRY_INTERVAL));
             }
             if since.elapsed().as_secs() >= 600 {
                 log::line(&format!("{}: {changes} journal records in the last {} s, {} names", self.letter, since.elapsed().as_secs(), table.read().map(|t| t.len()).unwrap_or(0)));
@@ -470,28 +473,112 @@ impl Volume {
 mod tests {
     use super::*;
     use fsindex::table::ROOT;
+    use std::fs::{self, File, OpenOptions};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::PathBuf;
+    use windows::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+
+    struct Fixture(PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn file_reference(file: &File) -> u64 {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info).unwrap() };
+        u64::from(info.nFileIndexHigh) << 32 | u64::from(info.nFileIndexLow)
+    }
+
+    fn event(frn: u64, parent: u32, reason: u32, name: &str) -> Vec<u8> {
+        let mut bytes = usn::encode(frn & usn::MASK48, parent.into(), 100, reason, 0, name);
+        bytes[8..16].copy_from_slice(&frn.to_le_bytes());
+        bytes
+    }
 
     #[test]
-    fn retry_timer_invalidates_an_unresolvable_alias() {
+    fn hard_link_change_repairs_the_name_after_a_failed_rename_lookup() {
         let volume = Volume::open('C').expect("open NTFS test volume as administrator");
-        let mut table = Table::new();
-        let rec = 72;
-        table.upsert(rec, ROOT, "obsolete.txt", false, false, 0);
-        let table = RwLock::new(table);
-        let now = Instant::now();
-        // This reference is beyond NTFS's supported record range and cannot be opened.
-        let mut retries = HashMap::from([(rec, LinkRetry::new(u64::MAX, now, true))]);
-        let mut buf = vec![0; 8 << 10];
+        let dir = std::env::temp_dir().join(format!("explorust-link-repair-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let fixture = Fixture(dir);
+        let first = fixture.0.join("First");
+        let second = fixture.0.join("Second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let dir_reference = |path| file_reference(&OpenOptions::new().read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0).open(path).unwrap()) as u32;
+        let (first_id, second_id) = (dir_reference(&first), dir_reference(&second));
+        let before = first.join("before.txt");
+        let removed = first.join("removed.txt");
+        let survivor = second.join("survivor.txt");
+        fs::write(&before, "the same NTFS record").unwrap();
+        fs::hard_link(&before, &survivor).unwrap();
+        let frn = file_reference(&File::open(&before).unwrap());
+        let rec = u32::try_from(frn & usn::MASK48).unwrap();
 
-        volume.retry_links(&table, &mut retries, &mut buf);
-        assert_eq!(table.read().unwrap().name(rec).as_deref(), Some("obsolete.txt"));
-        for attempt in 1..=2 {
-            let retry = retries.get(&rec).expect("a retry is scheduled even without a journal record");
-            assert_eq!(retry.attempts, attempt);
-            std::thread::sleep(retry.due.saturating_duration_since(Instant::now()));
-            volume.retry_links(&table, &mut retries, &mut buf);
-        }
+        let mut names = Table::new();
+        names.upsert(first_id, ROOT, "First", true, false, 0);
+        names.upsert(second_id, ROOT, "Second", true, false, 0);
+        names.upsert(rec, first_id, "before.txt", false, false, 0);
+        names.journal_current = true;
+        names.initial_links_complete = true;
+        let table = RwLock::new(names);
+        let mut retries = HashMap::new();
+
+        fs::rename(&before, &removed).unwrap();
+        let rename = event(frn, first_id, usn::REASON_RENAME_NEW_NAME, "removed.txt");
+        volume.changes(&rename, &table, &mut retries);
+        assert!(!retries[&rec].repair_name);
+        volume.retry_links(&table, &mut retries, |_| None);
+        fs::remove_file(&removed).unwrap();
+        let deletion = event(frn, first_id, usn::REASON_HARD_LINK_CHANGE, "removed.txt");
+        volume.changes(&deletion, &table, &mut retries);
+        let mut buffer = vec![0; 8 << 10];
+        volume.retry_links(&table, &mut retries, |frn| hard_links(volume.h, frn, &mut buffer));
+
         assert!(retries.is_empty());
+        let names = table.read().unwrap();
+        let hits = names.query_scope("survivor", 10, "C:\\", "C:\\Second").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(names.path(hits[0].rec, "C:\\").as_deref(), Some("C:\\Second\\survivor.txt"));
+        assert!(names.query("removed", 10).is_empty());
+        println!("The native NTFS lookup returned the surviving alias after removal of the indexed link");
+    }
+
+    #[test]
+    fn a_slow_retry_restores_scoped_coverage_without_another_journal_record() {
+        let volume = Volume::open('C').expect("open NTFS test volume as administrator");
+        let mut names = Table::new();
+        let rec = 72;
+        names.upsert(71, ROOT, "Other", true, false, 0);
+        names.upsert(73, 71, "unrelated.txt", false, false, 0);
+        names.upsert(rec, ROOT, "obsolete.txt", false, false, 0);
+        names.journal_current = true;
+        names.initial_links_complete = true;
+        let table = RwLock::new(names);
+        let mut retries = HashMap::new();
+        let change = usn::encode(u64::from(rec), ROOT.into(), 100, usn::REASON_HARD_LINK_CHANGE, 0, "obsolete.txt");
+        volume.changes(&change, &table, &mut retries);
+
+        for _ in 0..3 {
+            retries.get_mut(&rec).unwrap().due = Instant::now();
+            volume.retry_links(&table, &mut retries, |_| None);
+        }
+        assert!(retries[&rec].recovering());
         assert_eq!(table.read().unwrap().state(rec), RecState::Pruned);
+        assert!(table.read().unwrap().query_scope("unrelated", 10, "C:\\", "C:\\Other").is_none());
+
+        retries.get_mut(&rec).unwrap().due = Instant::now();
+        volume.retry_links(&table, &mut retries, |_| Some(LinkInfo {
+            names: vec![(ROOT, "survivor.txt".into())],
+            modified: 1,
+        }));
+        assert!(retries.is_empty());
+        let names = table.read().unwrap();
+        assert_eq!(names.query_scope("unrelated", 10, "C:\\", "C:\\Other").unwrap().len(), 1);
+        assert_eq!(names.name(rec).as_deref(), Some("survivor.txt"));
     }
 }
