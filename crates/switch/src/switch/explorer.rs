@@ -200,7 +200,7 @@ pub fn post_exit(
     pid: u32,
     arm: impl FnOnce() -> Result<(), String>,
 ) -> Result<bool, String> {
-    if taskbar::explorer_window() != Some((tray, pid)) {
+    if taskbar::explorer_window_for(pid) != Some(tray) {
         return Err("Explorer's taskbar changed while preparing to switch".into());
     }
     // Separate folders can take seconds to close. Check again at the posting boundary.

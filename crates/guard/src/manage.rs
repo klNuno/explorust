@@ -7,7 +7,6 @@
 use crate::{account, apps, desktop_recovery, folders, install, log, package, proc, reg};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use windows::Win32::System::Threading::INFINITE;
 
 /// Exit codes shared by `--install`, `--setup` and `--uninstall`.
 pub const FAILED: u32 = 1;
@@ -147,9 +146,12 @@ pub fn restore_session() -> (Result<String, String>, Result<String, String>) {
         let cancel = proc::Event::named(crate::switch_events::CANCEL_FOR_RESTORE)?;
         cancel.signal()?;
         say("restore: requested Windows desktop and waiting for pending handoffs");
-        let setup = install::lock_for(INFINITE)?;
-        let recovery = install::recovery_lock_for(INFINITE)?;
-        Ok((cancel, setup, recovery))
+        let locks = crate::policy::lock_for_restore(
+            install::switch_lock_for,
+            install::lock_for,
+            install::recovery_lock_for,
+        )?;
+        Ok((cancel, locks))
     };
     let _locks = match lock() {
         Ok(lock) => lock,
@@ -176,7 +178,8 @@ pub fn remove_package() {
 /// Brings explorer's taskbar back now and says so only once it answers. A running guard does it
 /// (it ends explorust and keeps explorer up); with no guard and no taskbar, explorer starts here.
 pub fn bring_back_explorer() -> Result<String, String> {
-    let result = desktop_recovery::restore_desktop(&install::dir().join("explorust.exe"), None);
+    let result = desktop_recovery::restore_desktop(&install::dir().join("explorust.exe"), None)
+        .map(|desktop| desktop.description);
     match &result {
         Ok(status) | Err(status) => say(&format!("restore: {status}")),
     }

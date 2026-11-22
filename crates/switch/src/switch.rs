@@ -146,7 +146,7 @@ fn switch(
     exe: &Path,
     cancel: &ui::Cancel,
 ) -> Result<Outcome, String> {
-    let lock = install::lock()?;
+    let locks = (install::switch_lock_for(0)?, install::lock()?);
     let expected = format!("\"{}\"", guard.display());
     if !reg::shell().is_some_and(|value| value.eq_ignore_ascii_case(&expected)) || !exe.is_file() {
         return Err("explorust is not installed as this user's sign-in shell".into());
@@ -202,8 +202,8 @@ fn switch(
                     return Err("the switch stopped while preparing Explorer".into());
                 }
                 log::line(&format!("switch: {e}; restoring Windows directly"));
-                let late_folders = watcher.recover(exe, tray, &explorer_process)?;
-                drop(lock);
+                let late_folders = watcher.recover(exe, &explorer_process)?;
+                drop(locks);
                 if let Some(folders) = late_folders {
                     watcher::restore_late_folders(&explorer_process, &folders)?;
                 }
@@ -327,6 +327,14 @@ fn release_previous_guard(previous: Option<PreviousGuard>) -> Result<(), String>
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+fn release_retiring_guard(explorer: u32, guard: &Path) -> Result<(), String> {
+    let previous = match previous_guard(explorer, guard)? {
+        Some(PreviousGuard::WatchingHandoff) => Some(PreviousGuard::Release(Event::open_for_signal(RELEASE_EXPLORER)?)),
+        other => other,
+    };
+    release_previous_guard(previous)
 }
 
 fn wait_for_verdict(exe: &Path, supervisor: &Child) -> Result<(), String> {

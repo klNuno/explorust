@@ -217,6 +217,10 @@ pub fn lock_for(timeout_ms: u32) -> Result<Lock, String> {
     named_lock(r"Global\explorust-setup", timeout_ms, "another explorust install or uninstall is running")
 }
 
+pub fn switch_lock_for(timeout_ms: u32) -> Result<Lock, String> {
+    named_lock(crate::switch_events::SWITCH_MUTEX, timeout_ms, "another switch is running in this session")
+}
+
 pub fn recovery_lock_for(timeout_ms: u32) -> Result<Lock, String> {
     try_recovery_lock_for(timeout_ms)?
         .ok_or_else(|| "the independent desktop recovery is still running".into())

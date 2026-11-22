@@ -99,23 +99,34 @@ impl ExitState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OriginalTray {
+    #[default]
+    Missing,
+    Present,
+    Answering(usize),
+}
+
+#[derive(Clone, Copy, Default)]
 pub struct DesktopFacts {
     pub exit: ExitState,
     pub original_alive: bool,
-    pub original_tray: Probe,
+    pub original_tray: OriginalTray,
+    pub tray_gone_grace_elapsed: bool,
     pub file_operations: bool,
     pub explorer_ready: Option<u32>,
     pub supervisor_available: bool,
-    pub shell_owner: Option<u32>,
+    pub shell_window_owner: Option<u32>,
+    pub shell_tray_owner: Option<u32>,
     pub adoption_elapsed: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DesktopAction {
     WaitForOriginal,
-    RepostExit,
-    Ready(u32),
+    RepostExit(usize),
+    StopRetiringExplorer,
+    Ready { pid: u32, retiring: bool },
     RequestFallback,
     WaitForAdoption,
     StopOrphan(u32),
@@ -125,26 +136,30 @@ pub enum DesktopAction {
 /// Decide from this observation only. Each caller probes again after waiting or taking action.
 pub fn recover_desktop(facts: DesktopFacts) -> DesktopAction {
     let retiring = facts.exit.pending() && facts.original_alive;
-    if retiring && facts.original_tray != Probe::Missing {
+    if retiring && facts.original_tray != OriginalTray::Missing {
         // Sent probes can be answered ahead of queued exit requests. Resolve uncertainty by
-        // posting to the same tray once, never by accepting its answer as proof of rollback.
-        return if facts.exit == ExitState::Uncertain
-            && facts.original_tray == Probe::Answered
+        // posting to the current tray of that PID, which can have recreated its window.
+        if let OriginalTray::Answering(window) = facts.original_tray
+            && facts.exit == ExitState::Uncertain
             && !facts.file_operations
         {
-            DesktopAction::RepostExit
-        } else {
-            DesktopAction::WaitForOriginal
-        };
+            return DesktopAction::RepostExit(window);
+        }
+        return DesktopAction::WaitForOriginal;
     }
     if let Some(pid) = facts.explorer_ready {
-        return DesktopAction::Ready(pid);
+        return DesktopAction::Ready { pid, retiring };
+    }
+    if retiring && facts.exit == ExitState::Posted && facts.tray_gone_grace_elapsed && !facts.file_operations {
+        // A new Explorer can wait for the old shell to relinquish ownership even after its
+        // tray disappears. Only intervene when we know the retiring process got the exit post.
+        return DesktopAction::StopRetiringExplorer;
     }
     // A supervisor of the retiring Explorer can still be waiting for its process to end.
     if !retiring && facts.supervisor_available {
         return DesktopAction::RequestFallback;
     }
-    if let Some(pid) = facts.shell_owner {
+    if let Some(pid) = facts.shell_window_owner.or(facts.shell_tray_owner) {
         return if facts.adoption_elapsed {
             DesktopAction::StopOrphan(pid)
         } else {
@@ -152,6 +167,16 @@ pub fn recover_desktop(facts: DesktopFacts) -> DesktopAction {
         };
     }
     DesktopAction::Restore
+}
+
+/// Wait as long as this session's handoff needs, while bounding contention across sessions.
+pub fn lock_for_restore<T, E>(
+    switch: impl FnOnce(u32) -> Result<T, E>,
+    setup: impl FnOnce(u32) -> Result<T, E>,
+    recovery: impl FnOnce(u32) -> Result<T, E>,
+) -> Result<(T, T, T), E> {
+    const INFINITE: u32 = u32::MAX;
+    Ok((switch(INFINITE)?, setup(300_000)?, recovery(INFINITE)?))
 }
 
 /// The timing decision for an Explorer launch when the desktop still needs recovery.
@@ -229,20 +254,22 @@ mod tests {
     fn desktop_recovery_uses_the_same_observations_for_each_restorer() {
         for exit in [ExitState::Unsent, ExitState::Uncertain, ExitState::Posted] {
             for original_alive in [false, true] {
-                for original_tray in [Probe::Missing, Probe::NoAnswer, Probe::Answered] {
+                for original_tray in [OriginalTray::Missing, OriginalTray::Present, OriginalTray::Answering(9)] {
                     for file_operations in [false, true] {
-                        let facts = DesktopFacts {
-                            exit, original_alive, original_tray, file_operations,
-                            explorer_ready: None, supervisor_available: false,
-                            shell_owner: None, adoption_elapsed: false,
-                        };
-                        let action = recover_desktop(facts);
-                        let expected = match (exit, original_alive, original_tray, file_operations) {
-                            (ExitState::Uncertain, true, Probe::Answered, false) => DesktopAction::RepostExit,
-                            (ExitState::Uncertain | ExitState::Posted, true, Probe::Answered | Probe::NoAnswer, _) => DesktopAction::WaitForOriginal,
-                            _ => DesktopAction::Restore,
-                        };
-                        assert_eq!(action, expected, "{exit:?} {original_alive} {original_tray:?} {file_operations}");
+                        for tray_gone_grace_elapsed in [false, true] {
+                            let facts = DesktopFacts {
+                                exit, original_alive, original_tray, file_operations,
+                                tray_gone_grace_elapsed, ..DesktopFacts::default()
+                            };
+                            let action = recover_desktop(facts);
+                            let expected = match (exit, original_alive, original_tray, file_operations, tray_gone_grace_elapsed) {
+                                (ExitState::Uncertain, true, OriginalTray::Answering(window), false, _) => DesktopAction::RepostExit(window),
+                                (ExitState::Uncertain | ExitState::Posted, true, OriginalTray::Answering(_) | OriginalTray::Present, _, _) => DesktopAction::WaitForOriginal,
+                                (ExitState::Posted, true, OriginalTray::Missing, false, true) => DesktopAction::StopRetiringExplorer,
+                                _ => DesktopAction::Restore,
+                            };
+                            assert_eq!(action, expected, "{exit:?} {original_alive} {original_tray:?} {file_operations} {tray_gone_grace_elapsed}");
+                        }
                     }
                 }
             }
@@ -250,17 +277,28 @@ mod tests {
     }
 
     #[test]
-    fn ready_replacement_does_not_have_to_wait_for_the_old_process_to_exit() {
+    fn an_uncertain_post_uses_the_recreated_tray_of_the_same_process() {
+        let mut facts = DesktopFacts {
+            exit: ExitState::Uncertain, original_alive: true,
+            original_tray: OriginalTray::Answering(70), ..DesktopFacts::default()
+        };
+        assert_eq!(recover_desktop(facts), DesktopAction::RepostExit(70));
+
+        facts.original_tray = OriginalTray::Answering(71);
+        assert_eq!(recover_desktop(facts), DesktopAction::RepostExit(71));
+    }
+
+    #[test]
+    fn ready_replacement_can_release_a_still_retiring_desktop_and_its_guard() {
         for original_alive in [false, true] {
             let mut facts = DesktopFacts {
-                exit: ExitState::Posted, original_alive, original_tray: Probe::Missing,
-                file_operations: false, explorer_ready: Some(42), supervisor_available: true,
-                shell_owner: None, adoption_elapsed: false,
+                exit: ExitState::Posted, original_alive, tray_gone_grace_elapsed: true,
+                explorer_ready: Some(42), supervisor_available: true, ..DesktopFacts::default()
             };
-            assert_eq!(recover_desktop(facts), DesktopAction::Ready(42));
+            assert_eq!(recover_desktop(facts), DesktopAction::Ready { pid: 42, retiring: original_alive });
             facts.explorer_ready = None;
             assert_eq!(recover_desktop(facts), if original_alive {
-                DesktopAction::Restore
+                DesktopAction::StopRetiringExplorer
             } else {
                 DesktopAction::RequestFallback
             });
@@ -268,21 +306,40 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_can_disappear_after_fallback_was_requested() {
-        for supervisor_available in [false, true] {
-            for adoption_elapsed in [false, true] {
-                let facts = DesktopFacts {
-                    exit: ExitState::Unsent, original_alive: false, original_tray: Probe::Missing,
-                    file_operations: false, explorer_ready: None, supervisor_available,
-                    shell_owner: Some(42), adoption_elapsed,
-                };
-                assert_eq!(recover_desktop(facts), match (supervisor_available, adoption_elapsed) {
-                    (true, _) => DesktopAction::RequestFallback,
-                    (false, false) => DesktopAction::WaitForAdoption,
-                    (false, true) => DesktopAction::StopOrphan(42),
-                });
+    fn supervisor_can_disappear_with_a_shell_window_or_a_tray() {
+        for owners in [(Some(42), None), (None, Some(42)), (Some(42), Some(42))] {
+            for supervisor_available in [false, true] {
+                for adoption_elapsed in [false, true] {
+                    let facts = DesktopFacts {
+                        supervisor_available, adoption_elapsed,
+                        shell_window_owner: owners.0, shell_tray_owner: owners.1,
+                        ..DesktopFacts::default()
+                    };
+                    assert_eq!(recover_desktop(facts), match (supervisor_available, adoption_elapsed) {
+                        (true, _) => DesktopAction::RequestFallback,
+                        (false, false) => DesktopAction::WaitForAdoption,
+                        (false, true) => DesktopAction::StopOrphan(42),
+                    });
+                }
             }
         }
+    }
+
+    #[test]
+    fn only_session_local_locks_can_wait_indefinitely() {
+        let waits = lock_for_restore(
+            |ms| Ok::<_, ()>(("session switch", ms)),
+            |ms| Ok(("machine setup", ms)),
+            |ms| Ok(("session recovery", ms)),
+        );
+        assert_eq!(waits, Ok((("session switch", u32::MAX), ("machine setup", 300_000), ("session recovery", u32::MAX))));
+
+        let cross_session_contention = lock_for_restore(
+            |_| Ok(()),
+            |_| Err("busy"),
+            |_| panic!("cannot wait for recovery without the setup lock"),
+        );
+        assert_eq!(cross_session_contention, Err("busy"));
     }
 
     #[test]

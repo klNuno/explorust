@@ -198,10 +198,10 @@ impl Watcher {
         self.committed
     }
 
-    pub fn recover(&mut self, exe: &Path, tray: HWND, original: &Child) -> Result<Option<Vec<Folder>>, String> {
+    pub fn recover(&mut self, exe: &Path, original: &Child) -> Result<Option<Vec<Folder>>, String> {
         let _lock = install::recovery_lock_for(INFINITE)?;
         let folders = read_snapshot(self.stamp).unwrap_or_else(|_| std::mem::take(&mut self.folders));
-        let track = recover(self.stamp, &self.signals, exe, tray, original, &folders)?;
+        let track = recover(self.stamp, &self.signals, exe, original, &folders)?;
         Ok(track.then_some(folders))
     }
 }
@@ -364,7 +364,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
     }
     signals.rollback.signal()?;
     let owner_lost = owner_process.ended();
-    let track = recover(stamp, &signals, &installed.join("explorust.exe"), tray, &retiring, &folders)?;
+    let track = recover(stamp, &signals, &installed.join("explorust.exe"), &retiring, &folders)?;
     drop(exiting);
     drop(recovery);
     if track {
@@ -476,7 +476,6 @@ fn recover(
     stamp: u64,
     signals: &Signals,
     exe: &Path,
-    tray: HWND,
     original: &Child,
     folders: &[Folder],
 ) -> Result<bool, String> {
@@ -489,10 +488,11 @@ fn recover(
     if state.pending() {
         exiting.signal()?;
     }
-    let mut repost = || {
+    let mut repost = |window| {
         if original.ended() {
             return Ok(false);
         }
+        let tray = HWND(window as *mut _);
         if explorer::post_exit(tray, original.pid, || exiting.signal())? {
             log::line(&format!("switch: resolved the unconfirmed Exit Explorer for pid {}", original.pid));
             signals.exiting.signal()?;
@@ -501,14 +501,20 @@ fn recover(
             Ok(false)
         }
     };
-    let status = restore_desktop(exe, Some(ExplorerExit {
+    let restored = restore_desktop(exe, Some(ExplorerExit {
         state,
         process: original,
         file_operations: explorer::file_operations,
         repost: &mut repost,
     }))?;
-    log::line(&format!("switch: restored Windows: {status}"));
-    let track = signals.desktop_exit().pending() && !original.ended();
+    log::line(&format!("switch: restored Windows: {}", restored.description));
+    let track = restored.original_retiring && !original.ended();
+    if track {
+        let guard = exe.with_file_name("explorust-guard.exe");
+        if let Err(error) = super::release_retiring_guard(original.pid, &guard) {
+            log::line(&format!("switch: could not release the retiring Explorer supervisor: {error}"));
+        }
+    }
     if !track && original.ended() {
         explorer::restore_desktop_folders(folders, original.pid);
     }

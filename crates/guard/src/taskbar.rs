@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL,
+    FindWindowExW, GetShellWindow, GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL,
 };
 use windows::core::{PWSTR, w};
 
@@ -32,7 +32,7 @@ fn trays() -> Vec<(HWND, u32)> {
     out
 }
 
-fn answers(h: HWND, within: Duration) -> bool {
+pub fn answers(h: HWND, within: Duration) -> bool {
     let mut out = 0usize;
     // SAFETY: a bounded send of a message every window accepts.
     let r = unsafe { SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, within.as_millis() as u32, Some(&mut out)) };
@@ -81,6 +81,10 @@ pub fn explorer_window() -> Option<(HWND, u32)> {
     trays().into_iter().find(|(_, pid)| is_explorer(*pid))
 }
 
+pub fn explorer_window_for(pid: u32) -> Option<HWND> {
+    tray_for(pid).filter(|_| is_explorer(pid))
+}
+
 pub fn is_explorer(pid: u32) -> bool {
     image_path(pid).is_some_and(|path| path.eq_ignore_ascii_case(&crate::supervise::explorer_path().to_string_lossy()))
 }
@@ -93,8 +97,22 @@ pub fn explorust(exe: &Path) -> Option<u32> {
     })
 }
 
+/// An installed explorust that has registered its desktop can own it before it shows a tray.
+pub fn explorust_shell_window(exe: &Path) -> Option<u32> {
+    let mut pid = 0;
+    // SAFETY: only query the PID of the desktop window Windows currently publishes.
+    unsafe { GetWindowThreadProcessId(GetShellWindow(), Some(&mut pid)) };
+    image_path(pid)
+        .filter(|path| path.eq_ignore_ascii_case(&exe.to_string_lossy()))
+        .map(|_| pid)
+}
+
+pub fn tray_for(pid: u32) -> Option<HWND> {
+    trays().into_iter().find_map(|(window, owner)| (owner == pid).then_some(window))
+}
+
 pub fn owns_tray(pid: u32) -> bool {
-    trays().into_iter().any(|(_, owner)| owner == pid)
+    tray_for(pid).is_some()
 }
 
 /// True when some taskbar window exists, whoever owns it.
