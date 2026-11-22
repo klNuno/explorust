@@ -1,16 +1,26 @@
 use super::*;
-use crate::win::operations::{Action, Worker};
+use crate::win::{
+    inbox::Inbox,
+    operations::{Action, PasteTarget, Response, Worker},
+};
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
     thread,
+    time::{Duration, Instant},
 };
-use windows::Win32::Foundation::{E_NOTIMPL, HWND};
-use windows::Win32::System::Com::{IAdviseSink, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA};
+use windows::Win32::Foundation::E_NOTIMPL;
+use windows::Win32::System::Com::{
+    FORMATETC, IAdviseSink, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM,
+};
+use windows::Win32::System::Ole::{OleGetClipboard, OleInitialize, OleUninitialize};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+};
 use windows_core::{BOOL, HRESULT, Ref, implement};
 
-static CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CLIPBOARD: Mutex<()> = Mutex::new(());
 
 struct Fixture(PathBuf);
 
@@ -37,7 +47,11 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        unsafe { OleUninitialize() };
+        release();
+        unsafe {
+            let _ = OleSetClipboard(None::<&IDataObject>);
+            OleUninitialize();
+        }
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -49,14 +63,79 @@ fn parse(path: &Path) -> Pidl {
 fn until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     let end = Instant::now() + timeout;
     loop {
+        let mut msg = MSG::default();
+        unsafe {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.hwnd.is_invalid() && msg.message == MSG_RETIRE {
+                    retire(msg.wParam.0 != 0);
+                } else {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
         if predicate() {
             return true;
         }
         if Instant::now() >= end {
             return false;
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn submit(worker: &Worker, folder: Pidl) {
+    worker.submit(
+        1,
+        Action::Paste(PasteTarget::Folder(folder), snapshot_here()),
+    );
+}
+
+#[test]
+fn a_native_move_consumes_the_cut_even_when_the_source_path_is_recreated() {
+    let _clipboard = CLIPBOARD.lock().unwrap_or_else(|lock| lock.into_inner());
+    let fixture = Fixture::new("native-cut");
+    let item = fixture.file("native-move.txt");
+    let destination = fixture.folder("destination");
+    publish_here(vec![item], true);
+    assert!(
+        can_paste(),
+        "Cut did not publish file formats before returning"
+    );
+    let data = unsafe { OleGetClipboard().unwrap() };
+    let original = fixture.0.join("native-move.txt");
+    fs::rename(&original, fixture.0.join("moved-by-native.txt")).unwrap();
+    data::set_effect(&data, CFSTR_PERFORMEDDROPEFFECT, DROPEFFECT_NONE).unwrap();
+    data::set_effect(&data, CFSTR_PASTESUCCEEDED, DROPEFFECT_MOVE).unwrap();
+    fs::write(&original, "replacement").unwrap();
+    assert_eq!(
+        fs::read_to_string(&original).as_deref().ok(),
+        Some("replacement")
+    );
+    assert!(
+        !can_paste(),
+        "Paste stayed enabled while clipboard retirement was pending"
+    );
+
+    let worker = Worker::new(HWND::default()).unwrap();
+    submit(&worker, destination.clone());
+    worker.submit(1, Action::NewFolder(destination, "after paste"));
+    assert!(until(Duration::from_secs(5), || fixture
+        .0
+        .join("destination/after paste")
+        .is_dir()));
+    assert_eq!(
+        fs::read_to_string(original).as_deref().ok(),
+        Some("replacement")
+    );
+    assert!(!fixture.0.join("destination/native-move.txt").exists());
+    assert!(
+        !can_paste(),
+        "the consumed cut still advertises file formats"
+    );
+    println!(
+        "Native paste consumed the cut, disabled Paste and left the recreated source untouched"
+    );
 }
 
 #[test]
@@ -68,25 +147,22 @@ fn a_cut_can_only_be_reserved_by_one_destination_at_a_time() {
     let loser = fixture.folder("loser");
     let first = Worker::new(HWND::default()).unwrap();
     let second = Worker::new(HWND::default()).unwrap();
-    publish(vec![item], true);
-    let reserved = snapshot().wait().unwrap();
-    let competing = snapshot().wait();
-    assert!(competing.is_err(), "two destinations reserved the same cut");
-    drop(reserved);
-    assert!(until(Duration::from_secs(5), crate::win::menus::file_clipboard));
-    let queued_before_retirement = unsafe { GetClipboardSequenceNumber() };
+    publish_here(vec![item], true);
 
-    let move_into =
-        |worker: &Worker, folder: &Pidl| worker.paste_destination(1, folder.clone()).submit();
-    move_into(&first, &winner);
-    move_into(&second, &loser);
+    let reserved = snapshot_here().wait().unwrap();
+    assert!(
+        snapshot_here().wait().is_err(),
+        "two destinations reserved the same cut"
+    );
+    drop(reserved);
+    assert!(can_paste(), "Cut is available immediately");
+
+    submit(&first, winner);
+    submit(&second, loser.clone());
     let left = fixture.0.join("winner/move-only-once.txt");
-    assert!(until(Duration::from_secs(5), || left.is_file()));
-    assert!(until(Duration::from_secs(5), || {
-        !crate::win::menus::file_clipboard()
-    }));
+    assert!(until(Duration::from_secs(5), || left.is_file() && !can_paste()));
     fs::write(fixture.0.join("move-only-once.txt"), "replacement").unwrap();
-    move_into(&second, &loser);
+    submit(&second, loser.clone());
     second.submit(1, Action::NewFolder(loser, "after paste"));
     assert!(until(Duration::from_secs(5), || fixture
         .0
@@ -97,110 +173,174 @@ fn a_cut_can_only_be_reserved_by_one_destination_at_a_time() {
         fs::read_to_string(fixture.0.join("move-only-once.txt")).unwrap(),
         "replacement"
     );
-    let next = fixture.file("copied-after-cut.txt");
-    send(Command::Publish(Arc::new(Publication {
-        previous_sequence: queued_before_retirement,
-        items: vec![next.clone()],
-        cut: None,
-    })));
-    assert_eq!(snapshot().wait().unwrap().items, [next]);
-    assert!(until(Duration::from_secs(5), crate::win::menus::file_clipboard));
     println!(
-        "Rapid pastes moved the original to winner only, cleared the clipboard, preserved the replacement and kept a newer copy"
+        "Rapid pastes moved the original to one destination and left the replacement untouched"
     );
 }
 
 #[test]
-fn a_blocked_provider_does_not_hold_local_pastes_or_destination_mutations() {
+fn a_newer_native_copy_is_not_replaced_by_retiring_an_older_cut() {
+    let _clipboard = CLIPBOARD.lock().unwrap_or_else(|lock| lock.into_inner());
+    let fixture = Fixture::new("native-copy-wins");
+    let old = fixture.file("old-cut.txt");
+    let next = fixture.file("native-copy.txt");
+    publish_here(vec![old.clone()], true);
+    let prior = unsafe { OleGetClipboard().unwrap() };
+    let mut producer = None;
+    publish_with(vec![old], true, |items, cut| {
+        let data = data::selection(items, cut)?;
+        producer = Some(ClipboardOwner::new(move || {
+            data::selection(&[next], false).unwrap()
+        }));
+        Ok(data)
+    });
+    let _producer = producer.unwrap();
+    assert!(
+        local(|_| ()).is_none(),
+        "the old object is still considered current"
+    );
+    data::set_effect(&prior, CFSTR_PERFORMEDDROPEFFECT, DROPEFFECT_NONE).unwrap();
+    data::set_effect(&prior, CFSTR_PASTESUCCEEDED, DROPEFFECT_MOVE).unwrap();
+    drop(prior);
+
+    let pending = snapshot_here();
+    let (resolved, result) = mpsc::channel();
+    thread::spawn(move || {
+        unsafe { OleInitialize(None).unwrap() };
+        let _ = resolved.send(pending.wait());
+        unsafe { OleUninitialize() };
+    });
+    let mut source = None;
+    assert!(until(Duration::from_secs(5), || {
+        source = result.try_recv().ok();
+        source.is_some()
+    }));
+    let source = source.unwrap().unwrap();
+    assert!(!source.is_cut());
+    let paths: Vec<_> = source.items.iter().map(Pidl::display).collect();
+    assert!(matches!(paths.as_slice(), [path] if path.ends_with(r"\native-copy.txt")), "{paths:?}");
+    assert!(can_paste(), "retiring the old cut cleared a newer source");
+    println!("A native copy during Cut preparation remained on the clipboard and supplied the paste selection");
+}
+
+#[test]
+fn repeated_pastes_from_a_held_provider_do_not_block_the_next_clipboard_owner() {
     let _clipboard = CLIPBOARD.lock().unwrap_or_else(|lock| lock.into_inner());
     let fixture = Fixture::new("clipboard-delay");
     let foreign = fixture.file("foreign-render.txt");
-    let local = fixture.file("local-cut.txt");
+    let next = fixture.file("healthy-native.txt");
     let blocked = fixture.folder("blocked");
     let ready = fixture.folder("ready");
-    let (provider, started) = BlockedProvider::new(foreign);
+    let (started, observed) = mpsc::channel();
+    let provider = ClipboardOwner::new(move || {
+        DelayedData {
+            inner: shell::data_object(&[foreign]).unwrap(),
+            started,
+            held: AtomicBool::new(false),
+        }
+        .into()
+    });
     let delayed = Worker::new(HWND::default()).unwrap();
     let other = Worker::new(HWND::default()).unwrap();
-    delayed.paste_destination(1, blocked.clone()).submit();
+    let first = foreign::capture();
+    let mut remaining = (0..3).map(|_| foreign::capture()).collect::<Vec<_>>();
+    for pending in remaining.drain(..) {
+        assert!(foreign::same_read(&first, &pending));
+        delayed.submit(
+            1,
+            Action::Paste(
+                PasteTarget::Folder(blocked.clone()),
+                Pending::Foreign(pending),
+            ),
+        );
+    }
+    delayed.submit(
+        1,
+        Action::Paste(
+            PasteTarget::Folder(blocked.clone()),
+            Pending::Foreign(first),
+        ),
+    );
     delayed.submit(1, Action::NewFolder(blocked, "after timeout"));
-    started
+    observed
         .recv_timeout(Duration::from_secs(3))
         .expect("foreign GetData was not called");
-    publish(vec![local], true);
-    other.paste_destination(1, ready).submit();
+
+    let healthy = data::selection(&[next], false).unwrap();
+    let switched = Instant::now();
+    unsafe { OleSetClipboard(&healthy).unwrap() };
+    submit(&other, ready);
     assert!(
-        until(Duration::from_secs(5), || fixture
+        until(Duration::from_secs(4), || fixture
             .0
-            .join("ready/local-cut.txt")
+            .join("ready/healthy-native.txt")
             .is_file()),
-        "local Cut and Paste did not finish while the provider was blocked"
+        "a healthy external owner did not paste while the previous provider was held"
+    );
+    assert!(
+        switched.elapsed() < Duration::from_secs(8),
+        "the healthy producer waited for the held provider"
     );
     assert!(
         until(Duration::from_secs(4), || fixture
             .0
             .join("blocked/after timeout")
             .is_dir()),
-        "New Folder did not drain after the snapshot deadline"
+        "accepted destination work did not continue after timeout"
     );
-    assert!(delayed.take().into_iter().any(|response| matches!(
-        response,
-        crate::win::operations::Response::ClipboardTimedOut
-    )));
+    assert_eq!(
+        delayed
+            .take()
+            .iter()
+            .filter(|response| matches!(response, Response::ClipboardTimedOut))
+            .count(),
+        4
+    );
     drop(provider);
-    assert!(until(Duration::from_secs(3), || READERS
-        .load(Ordering::Relaxed)
-        == 0));
     assert!(
         !fixture.0.join("blocked/foreign-render.txt").exists(),
-        "late snapshot was applied"
+        "a late response was applied"
     );
     println!(
-        "Local cut arrived while GetData was held, New Folder drained on timeout, and the late clipboard reply was ignored"
+        "Four pastes shared one held reader, the next native source pasted, and the destination queue drained"
     );
 }
 
-struct BlockedProvider {
+struct ClipboardOwner {
     stop: Arc<Inbox<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
-impl BlockedProvider {
-    fn new(item: Pidl) -> (Self, mpsc::Receiver<()>) {
+impl ClipboardOwner {
+    fn new(create: impl FnOnce() -> IDataObject + Send + 'static) -> Self {
         let (ready, wait) = mpsc::channel();
-        let (started, observed) = mpsc::channel();
         let stop = Arc::new(Inbox::default());
         let input = stop.clone();
         let thread = thread::spawn(move || {
             unsafe { OleInitialize(None).unwrap() };
             let receiver = input.attach();
-            let inner = shell::data_object(&[item]).unwrap();
-            let object: IDataObject = DelayedData {
-                inner,
-                started,
-                held: AtomicBool::new(false),
-            }
-            .into();
+            let object = create();
             unsafe { OleSetClipboard(&object).unwrap() };
             ready.send(()).unwrap();
-            pump(|| receiver.next());
+            let mut msg = MSG::default();
+            unsafe {
+                while receiver.next().is_none() && GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
             if unsafe { OleIsCurrentClipboard(object.as_raw()) == S_OK } {
                 let _ = unsafe { OleSetClipboard(None::<&IDataObject>) };
             }
             drop(object);
             unsafe { OleUninitialize() };
         });
-        wait.recv_timeout(Duration::from_secs(5)).unwrap();
-        (
-            Self {
-                stop,
-                thread: Some(thread),
-            },
-            observed,
-        )
+        assert!(until(Duration::from_secs(8), || wait.try_recv().is_ok()));
+        Self { stop, thread: Some(thread) }
     }
 }
 
-impl Drop for BlockedProvider {
+impl Drop for ClipboardOwner {
     fn drop(&mut self) {
         self.stop.send(());
         let thread = self.thread.take().unwrap();

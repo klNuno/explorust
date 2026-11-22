@@ -4,18 +4,19 @@
 
 use std::{collections::HashSet, ffi::c_void};
 use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::{E_ABORT, E_INVALIDARG, HWND, LPARAM};
+use windows::Win32::Foundation::{E_ABORT, E_INVALIDARG, HWND, LPARAM, POINTL};
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IDataObject};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::System::SystemServices::{SFGAO_BROWSABLE, SFGAO_FOLDER, SFGAO_LINK};
+use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropTarget};
+use windows::Win32::System::SystemServices::{MK_CONTROL, MK_SHIFT, SFGAO_BROWSABLE, SFGAO_FOLDER, SFGAO_LINK};
 use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, GetClassNameW, SW_SHOWNORMAL, SendMessageW, WM_THEMECHANGED,
 };
-use windows_core::{BOOL, HSTRING, PCSTR, PCWSTR, PWSTR, Result, w};
+use windows_core::{BOOL, HSTRING, Interface, PCSTR, PCWSTR, PWSTR, Result, w};
 
 /// An ID list held as its bytes, terminator included: comparable, clonable, no COM memory.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -185,9 +186,13 @@ pub fn data_object(items: &[Pidl]) -> Result<IDataObject> {
 }
 
 pub fn paste(owner: HWND, folder: &Pidl, source: &mut super::clipboard::Source) -> Result<()> {
+    let destination = folder.item()?;
+    if source.items.is_empty() || fs_path(&destination).is_none() {
+        let shell_folder: IShellFolder = unsafe { destination.BindToHandler(None, &BHID_SFObject)? };
+        return native_paste(unsafe { shell_folder.CreateViewObject(owner)? }, source);
+    }
     let children: Vec<_> = source.items.iter().map(Pidl::as_ptr).collect();
     let same_folder = source.items.iter().all(|item| item.parent().as_ref() == Some(folder));
-    let folder = folder.item()?;
     let mut flags = FOF_ALLOWUNDO | FOFX_ADDUNDORECORD;
     if !source.is_cut() && same_folder {
         flags |= FOF_RENAMEONCOLLISION;
@@ -199,7 +204,7 @@ pub fn paste(owner: HWND, folder: &Pidl, source: &mut super::clipboard::Source) 
             let moved = Arc::new(Mutex::new(Vec::new()));
             let sink: IFileOperationProgressSink = super::move_progress::Progress(moved.clone()).into();
             let cookie = op.Advise(&sink)?;
-            let result = op.MoveItems(&items, &folder).and_then(|()| complete_operation(&op));
+            let result = op.MoveItems(&items, &destination).and_then(|()| complete_operation(&op));
             let _ = op.Unadvise(cookie);
             let moved = std::mem::take(&mut *moved.lock().unwrap());
             let exact: HashSet<_> = moved.iter().collect();
@@ -211,9 +216,35 @@ pub fn paste(owner: HWND, folder: &Pidl, source: &mut super::clipboard::Source) 
             source.finish_move(completed, complete);
             return result.and_then(|()| if complete { Ok(()) } else { Err(E_ABORT.into()) });
         }
-        op.CopyItems(&items, &folder)?;
+        op.CopyItems(&items, &destination)?;
         complete_operation(&op)
     }
+}
+
+pub fn paste_into(owner: HWND, selection: &Pidl, source: &mut super::clipboard::Source) -> Result<()> {
+    let item = selection.item()?;
+    if let Some(folder) = folder_target(&item) {
+        paste(owner, &folder, source)
+    } else {
+        let target = unsafe { item.BindToHandler(None, &BHID_SFUIObject)? };
+        native_paste(target, source)
+    }
+}
+
+fn native_paste(target: IDropTarget, source: &mut super::clipboard::Source) -> Result<()> {
+    let data = source.for_drop()?;
+    let (keys, mut effect) = if source.is_cut() { (MK_SHIFT, DROPEFFECT_MOVE) } else { (MK_CONTROL, DROPEFFECT_COPY) };
+    let at = POINTL::default();
+    unsafe {
+        target.DragEnter(&data, keys, at, &mut effect)?;
+        if effect == DROPEFFECT_NONE {
+            let _ = target.DragLeave();
+            return Err(E_ABORT.into());
+        }
+        target.Drop(&data, keys, at, &mut effect)?;
+    }
+    source.drop_completed(&data);
+    Ok(())
 }
 
 pub fn open_item(owner: HWND, item: &Pidl) -> Result<()> {
@@ -270,6 +301,13 @@ fn complete_operation(op: &IFileOperation) -> Result<()> {
 pub fn selection(view: &IShellView) -> Result<Vec<Pidl>> {
     let selection: IShellItemArray = unsafe { view.GetItemObject(SVGIO_SELECTION)? };
     item_ids(&selection)
+}
+
+pub fn view_folder(view: &IShellView) -> Option<Pidl> {
+    unsafe {
+        let folder: IPersistFolder2 = view.cast::<IFolderView2>().ok()?.GetFolder().ok()?;
+        Pidl::take(folder.GetCurFolder().ok()?)
+    }
 }
 
 pub fn item_ids(items: &IShellItemArray) -> Result<Vec<Pidl>> {

@@ -7,7 +7,9 @@
 
 use super::{ClipboardRoute, classic, log, read};
 use crate::model::Entry;
+use crate::ClipboardVerb;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -42,7 +44,7 @@ pub enum Job {
     Fill { gn: u64, folder: Pidl, children: Vec<Pidl>, flags: u32, reply: isize, owner: isize, site: Option<usize> },
     /// Fills submenu `menu` (row `row` of level `depth`) and reads it.
     Sub { gn: u64, menu: isize, index: u32, depth: usize, row: usize, reply: isize },
-    Invoke { gn: u64, id: u32, owner: isize, at: (i32, i32), shift: bool, ctrl: bool, route: Option<ClipboardRoute> },
+    Invoke { gn: u64, id: u32, owner: isize, at: (i32, i32), shift: bool, ctrl: bool },
     /// Tracks the classic menu of the same HMENU and runs what is picked.
     Classic { gn: u64, owner: isize, at: (i32, i32), route: Option<ClipboardRoute> },
 }
@@ -67,6 +69,7 @@ struct Current {
     gn: u64,
     cm: IContextMenu,
     menu: HMENU,
+    clipboard: Vec<(u32, ClipboardVerb)>,
     site: Option<IObjectWithSite>,
 }
 
@@ -83,7 +86,7 @@ impl Drop for Current {
 }
 
 thread_local! {
-    static CURRENT: RefCell<Option<Current>> = const { RefCell::new(None) };
+    static CURRENT: RefCell<Option<Rc<Current>>> = const { RefCell::new(None) };
 }
 
 /// The worker's message window, made on first use.
@@ -201,7 +204,9 @@ fn handle(job: Job) {
                 }
             };
             let fill_ms = t.elapsed().as_secs_f64() * 1000.0;
-            post(reply, Reply::Filled { gn, entries, fill_ms, ok });
+            if reply != 0 {
+                post(reply, Reply::Filled { gn, entries, fill_ms, ok });
+            }
         }
         Job::Sub { gn, menu, index, depth, row, reply } => {
             let entries = CURRENT.with(|c| {
@@ -213,21 +218,17 @@ fn handle(job: Job) {
             });
             post(reply, Reply::Sub { gn, depth, row, entries: entries.unwrap_or_default() });
         }
-        Job::Invoke { gn, id, owner, at, shift, ctrl, route } => {
+        Job::Invoke { gn, id, owner, at, shift, ctrl } => {
             let cm = CURRENT.with(|c| c.borrow().as_ref().filter(|c| c.gn == gn).map(|c| c.cm.clone()));
             match cm {
-                Some(cm) => classic::invoke_with(&cm, HWND(owner as _), id, super::FIRST, POINT { x: at.0, y: at.1 }, shift, ctrl, route.as_ref()),
+                Some(cm) => classic::invoke_with(&cm, HWND(owner as _), id, super::FIRST, POINT { x: at.0, y: at.1 }, shift, ctrl),
                 None => log::line(&format!("worker: invoke {id} of stale menu {gn}")),
             }
         }
         Job::Classic { gn, owner, at, route } => {
-            let cur = CURRENT.with(|c| c.borrow().as_ref().filter(|c| c.gn == gn).map(|c| (c.cm.clone(), c.menu)));
-            let Some((cm, menu)) = cur else { return };
-            let id = classic::track(&cm, menu, at.0, at.1);
-            super::give_back(HWND(owner as _));
-            if id >= super::FIRST {
-                classic::invoke_with(&cm, HWND(owner as _), id, super::FIRST, POINT { x: at.0, y: at.1 }, false, false, route.as_ref());
-            }
+            let cur = CURRENT.with(|c| c.borrow().as_ref().filter(|c| c.gn == gn).cloned());
+            let Some(cur) = cur else { return };
+            classic::run(&cur.cm, cur.menu, HWND(owner as _), POINT { x: at.0, y: at.1 }, route.as_ref(), &cur.clipboard);
         }
     }
 }
@@ -262,13 +263,16 @@ fn fill(gn: u64, folder: &[u8], children: &[Pidl], flags: u32, owner: HWND, site
         let hr = cm.QueryContextMenu(menu, 0, super::FIRST, super::LAST, flags);
         let tq = t.elapsed().as_secs_f64() * 1000.0;
         let entries = read::entries(&cm, menu, super::FIRST);
+        let clipboard = entries.iter().filter_map(|entry| {
+            ClipboardVerb::from_canonical(&entry.verb).map(|verb| (entry.id, verb))
+        }).collect();
         log::line(&format!(
             "worker: fill {gn}: QueryContextMenu {tq:.1} ms ({hr:?}), {} entries read by {:.1} ms, site {}",
             entries.len(),
             t.elapsed().as_secs_f64() * 1000.0,
             site.is_some()
         ));
-        CURRENT.with(|c| *c.borrow_mut() = Some(Current { gn, cm, menu, site }));
+        CURRENT.with(|c| *c.borrow_mut() = Some(Rc::new(Current { gn, cm, menu, site, clipboard })));
         Ok(entries)
     }
 }

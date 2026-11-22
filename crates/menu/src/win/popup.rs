@@ -882,7 +882,9 @@ pub fn run(req: Request) -> Option<Pick> {
     }
     drain_late();
     let Request { src, key, items, more, owner, at, t0, mut fill } = req;
-    let cached = with(|ui| ui.recent.get(&key)).flatten();
+    // Worker selections are passed as IDs, so only the previous family's static rows apply.
+    let lookup = if matches!(src, Src::Worker(_)) { "items" } else { &key };
+    let cached = with(|ui| ui.recent.get(lookup)).flatten();
     // Nothing to show at once for a local menu: fill it first.
     let mut filled = None;
     if cached.is_none() {

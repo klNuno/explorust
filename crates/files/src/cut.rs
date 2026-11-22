@@ -34,6 +34,14 @@ impl<T: Eq + Hash> Cut<T> {
         matches!(self.0.lock().unwrap().status, Status::Consumed)
     }
 
+    pub fn consume(&self) -> bool {
+        let mut state = self.0.lock().unwrap();
+        let changed = !matches!(state.status, Status::Consumed);
+        state.status = Status::Consumed;
+        state.moved.clear();
+        changed
+    }
+
     pub fn reserve(self: &Arc<Self>, items: &mut Vec<T>) -> Option<Reservation<T>> {
         let mut state = self.0.lock().unwrap();
         if !matches!(state.status, Status::Ready) {
@@ -51,12 +59,18 @@ impl<T: Eq + Hash> Cut<T> {
 pub struct Reservation<T>(Arc<Cut<T>>);
 
 impl<T: Eq + Hash> Reservation<T> {
+    #[cfg(target_os = "windows")]
+    pub fn cut(&self) -> &Arc<Cut<T>> {
+        &self.0
+    }
+
     pub fn finish(self, moved: Vec<T>, complete: bool) {
-        let mut state = self.0.0.lock().unwrap();
         if complete {
-            state.status = Status::Consumed;
-            state.moved.clear();
-        } else {
+            self.0.consume();
+            return;
+        }
+        let mut state = self.0.0.lock().unwrap();
+        if matches!(state.status, Status::Reserved) {
             state.moved.extend(moved);
         }
     }
@@ -86,6 +100,16 @@ mod tests {
         let retry = cut.reserve(&mut files).unwrap();
         assert_eq!(files, ["b"]);
         retry.finish(vec!["b"], true);
+        assert!(cut.reserve(&mut vec!["a", "b"]).is_none());
+    }
+
+    #[test]
+    fn native_completion_survives_cancelling_a_reserved_paste() {
+        let cut = Arc::new(Cut::default());
+        let pending = cut.reserve(&mut vec!["a", "b"]).unwrap();
+        assert!(cut.consume());
+        assert!(!cut.consume());
+        pending.finish(vec!["a"], false);
         assert!(cut.reserve(&mut vec!["a", "b"]).is_none());
     }
 }

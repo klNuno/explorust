@@ -396,10 +396,6 @@ impl Tab {
         self.crumbs.len() > 1
     }
 
-    pub fn paste_folder(&self) -> Option<&Pidl> {
-        if self.path.is_some() && self.query.is_empty() { self.history.current() } else { None }
-    }
-
     pub fn refresh(&self) {
         if let Some(v) = self.shell_view() {
             let _ = unsafe { v.Refresh() };

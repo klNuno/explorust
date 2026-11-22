@@ -17,12 +17,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::UI::Shell::Common::{ITEMIDLIST, STRRET};
-use windows::Win32::UI::Shell::{IPersistFolder2, IShellFolder, SHGDNF, SHGDN_FORPARSING, SHGDN_INFOLDER, SVGIO_ALLVIEW, StrRetToBufW};
-use windows::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::{IPersistFolder2, SVGIO_ALLVIEW};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::Ole::IObjectWithSite;
-use windows::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW};
+use windows::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT};
 use windows::Win32::UI::Shell::{
     DefSubclassProc, IContextMenu, IFolderView2, IShellView, RemoveWindowSubclass, SVGIO_BACKGROUND,
@@ -62,16 +62,22 @@ pub fn show(owner: HWND, cm: &IContextMenu, x: i32, y: i32, items: bool, classic
 
 fn classic_preferred() -> bool {
     let path = windows_core::w!(r"Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32");
-    [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].into_iter().any(|root| {
+    [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].into_iter().find_map(|root| {
         let mut key = HKEY::default();
         unsafe {
             if RegOpenKeyExW(root, path, None, KEY_QUERY_VALUE, &mut key) != ERROR_SUCCESS {
-                return false;
+                return None;
             }
+            // Windows registers its real DLL here on current builds. The classic-menu
+            // override leaves the server name empty, or creates the key without a value.
+            let mut value = [0u8; 2];
+            let mut size = value.len() as u32;
+            let mut kind = REG_VALUE_TYPE::default();
+            let status = RegQueryValueExW(key, windows_core::PCWSTR::null(), None, Some(&mut kind), Some(value.as_mut_ptr()), Some(&mut size));
             let _ = RegCloseKey(key);
+            Some(status == ERROR_FILE_NOT_FOUND || (status == ERROR_SUCCESS && kind == REG_SZ && value == [0, 0]))
         }
-        true
-    })
+    }).unwrap_or(false)
 }
 
 /// The menu of `cm`, filled on this thread (after the first frame when a menu of its kind was
@@ -87,11 +93,8 @@ fn show_at(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool
         let hr = unsafe { cm.QueryContextMenu(menu, 0, FIRST, LAST, flags) };
         let tq = t0.elapsed().as_secs_f64() * 1000.0;
         log::line(&format!("classic menu ({}), handlers filled it in {tq:.1} ms ({hr:?})", if items { "items" } else { "background" }));
-        let id = classic::track(cm, menu, at.x, at.y);
-        give_back(owner);
-        if id >= FIRST {
-            classic::invoke(cm, owner, id, FIRST, at, route);
-        }
+        let clipboard = route.map(|_| read::clipboard_ids(cm, menu)).unwrap_or_default();
+        classic::run(cm, menu, owner, at, route, &clipboard);
         let _ = unsafe { DestroyMenu(menu) };
         return;
     }
@@ -116,15 +119,17 @@ fn show_at(owner: HWND, cm: &IContextMenu, at: POINT, items: bool, classic: bool
         fill: Some(&mut fill),
     };
     let pick = popup::run(req);
+    let routed = match &pick {
+        Some(popup::Pick::Command(_, verb)) => route_clipboard(route, verb),
+        _ => false,
+    };
     give_back(owner);
     match pick {
-        Some(popup::Pick::Command(id, _)) => classic::invoke(cm, owner, id, FIRST, at, route),
+        Some(popup::Pick::Command(id, _)) if !routed => classic::invoke(cm, owner, id, FIRST, at),
+        Some(popup::Pick::Command(..)) => {}
         Some(popup::Pick::More) => {
-            let id = classic::track(cm, menu, at.x, at.y);
-            give_back(owner);
-            if id >= FIRST {
-                classic::invoke(cm, owner, id, FIRST, at, route);
-            }
+            let clipboard = route.map(|_| read::clipboard_ids(cm, menu)).unwrap_or_default();
+            classic::run(cm, menu, owner, at, route, &clipboard);
         }
         Some(popup::Pick::Fallback) | None => log::line("dismissed"),
     }
@@ -163,9 +168,8 @@ fn background_key(defview: HWND) -> String {
     if class == "Progman" || class == "WorkerW" { "bg:desktop".into() } else { "bg:files".into() }
 }
 
-const SFGAO_FOLDER: u32 = 0x2000_0000;
-
 static GEN: AtomicU64 = AtomicU64::new(1);
+const ITEMS_KEY: &str = "items:selection";
 
 /// The view folder's absolute ID list.
 fn folder_of(fv: &IFolderView2) -> Option<worker::Pidl> {
@@ -179,9 +183,8 @@ fn folder_of(fv: &IFolderView2) -> Option<worker::Pidl> {
     }
 }
 
-/// The selection as the worker needs it: the view folder's ID list, the selected children's ID
-/// lists and the `model::Recent` key of the selection's kind.
-fn selection(fv: &IFolderView2, only_first: bool) -> Option<(worker::Pidl, Vec<worker::Pidl>, String)> {
+/// Copy the selection's IDs without asking its provider to resolve attributes or names.
+fn selection(fv: &IFolderView2, only_first: bool) -> Option<(worker::Pidl, Vec<worker::Pidl>)> {
     // SAFETY: COM calls on the view's thread; ID lists the view allocates are copied and freed.
     unsafe {
         let folder = folder_of(fv)?;
@@ -212,30 +215,7 @@ fn selection(fv: &IFolderView2, only_first: bool) -> Option<(worker::Pidl, Vec<w
                 }
             }
         }
-        if children.is_empty() {
-            return None;
-        }
-        let multi = if children.len() > 1 { "+" } else { "" };
-        let sf: IShellFolder = fv.GetFolder().ok()?;
-        let child = children[0].as_ptr() as *const ITEMIDLIST;
-        let mut attrs = SFGAO_FOLDER;
-        let _ = sf.GetAttributesOf(&[child], &mut attrs);
-        let kind = if attrs & SFGAO_FOLDER != 0 {
-            "folder".to_string()
-        } else {
-            let mut name = STRRET::default();
-            let ext = if sf.GetDisplayNameOf(child, SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FORPARSING.0), &mut name).is_ok() {
-                let mut out = [0u16; 260];
-                let _ = StrRetToBufW(&mut name, Some(child), &mut out);
-                let n = out.iter().position(|&c| c == 0).unwrap_or(0);
-                let name = String::from_utf16_lossy(&out[..n]);
-                name.rsplit_once('.').map(|(_, e)| format!(".{}", e.to_lowercase())).unwrap_or_default()
-            } else {
-                String::new()
-            };
-            ext
-        };
-        Some((folder, children, format!("items:{kind}{multi}")))
+        (!children.is_empty()).then_some((folder, children))
     }
 }
 
@@ -260,7 +240,7 @@ fn prewarm_view(defview: HWND, view: &IShellView) {
     });
     for family in first {
         let job = if family == "items" {
-            selection(&fv, true).map(|(folder, children, key)| (folder, children, key, CMF_CANRENAME))
+            selection(&fv, true).map(|(folder, children)| (folder, children, ITEMS_KEY.to_owned(), CMF_CANRENAME))
         } else {
             folder_of(&fv).map(|folder| (folder, Vec::new(), "bg:prewarm".to_string(), 0))
         };
@@ -276,9 +256,12 @@ fn prewarm_view(defview: HWND, view: &IShellView) {
 
 /// The selection's menu built and filled on the worker; the first frame shows the static part.
 /// False when the selection cannot be given to the worker.
-fn show_worker(defview: HWND, view: &IShellView, fv: &IFolderView2, at: POINT, t0: Instant, route: Option<&ClipboardRoute>) -> bool {
-    let Some((folder, children, key)) = selection(fv, false) else { return false };
-    let Some(reply) = popup::reply_window() else { return false };
+fn show_worker(defview: HWND, view: &IShellView, fv: &IFolderView2, at: POINT, t0: Instant, route: Option<&ClipboardRoute>, classic: bool, extended: bool) -> bool {
+    let Some((folder, children)) = selection(fv, false) else { return false };
+    let reply = if classic { 0 } else {
+        let Some(reply) = popup::reply_window() else { return false };
+        reply.0 as isize
+    };
     let gn = GEN.fetch_add(1, Ordering::Relaxed);
     let first_child = children[0].clone();
     let site = worker::marshal_site(view);
@@ -286,16 +269,24 @@ fn show_worker(defview: HWND, view: &IShellView, fv: &IFolderView2, at: POINT, t
         gn,
         folder,
         children,
-        flags: CMF_CANRENAME,
-        reply: reply.0 as isize,
+        flags: CMF_CANRENAME | if extended { CMF_EXTENDEDVERBS } else { 0 },
+        reply,
         owner: defview.0 as isize,
         site,
     });
     if !sent {
         return false;
     }
-    let req = popup::Request { src: popup::Src::Worker(gn), key, items: true, more: more_label(), owner: defview, at, t0, fill: None };
+    let more = || worker::send(worker::Job::Classic { gn, owner: defview.0 as isize, at: (at.x, at.y), route: route.cloned() });
+    if classic {
+        return more();
+    }
+    let req = popup::Request { src: popup::Src::Worker(gn), key: ITEMS_KEY.to_owned(), items: true, more: more_label(), owner: defview, at, t0, fill: None };
     let pick = popup::run(req);
+    let routed = match &pick {
+        Some(popup::Pick::Command(_, verb)) => route_clipboard(route, verb),
+        _ => false,
+    };
     give_back(defview);
     // SAFETY: modifier state of this thread's input.
     let (shift, ctrl) = unsafe { (GetKeyState(VK_SHIFT.0 as i32) < 0, GetKeyState(VK_CONTROL.0 as i32) < 0) };
@@ -312,14 +303,13 @@ fn show_worker(defview: HWND, view: &IShellView, fv: &IFolderView2, at: POINT, t
             };
             log::line(&format!("rename through the view: {:?}", r.err().map(|e| e.code())));
         }
-        Some(popup::Pick::Command(id, verb)) => {
-            if !route_clipboard(route, &verb) {
-                log::line(&format!("pick id {id} [{verb}]: the worker runs it"));
-                worker::send(worker::Job::Invoke { gn, id, owner: defview.0 as isize, at: (at.x, at.y), shift, ctrl, route: route.cloned() });
-            }
+        Some(popup::Pick::Command(id, verb)) if !routed => {
+            log::line(&format!("pick id {id} [{verb}]: the worker runs it"));
+            worker::send(worker::Job::Invoke { gn, id, owner: defview.0 as isize, at: (at.x, at.y), shift, ctrl });
         }
+        Some(popup::Pick::Command(..)) => {}
         Some(popup::Pick::More) => {
-            worker::send(worker::Job::Classic { gn, owner: defview.0 as isize, at: (at.x, at.y), route: route.cloned() });
+            more();
         }
         Some(popup::Pick::Fallback) => {
             log::line("worker fill failed: the view's own menu fills here");
@@ -502,9 +492,9 @@ fn on_context(defview: HWND, view: &IShellView, lp: LPARAM, t0: Instant, clipboa
         let items = fv.as_ref().and_then(|f| f.ItemCount(SVGIO_SELECTION).ok()).unwrap_or(0) > 0;
         let route = clipboard.and_then(|prepare| prepare(defview, view, items));
         let classic = shift || classic_preferred();
-        if items && !classic {
+        if items && (!classic || route.is_some()) {
             if let Some(fv) = &fv {
-                if show_worker(defview, view, fv, POINT { x, y }, t0, route.as_ref()) {
+                if show_worker(defview, view, fv, POINT { x, y }, t0, route.as_ref(), classic, shift) {
                     return true;
                 }
                 log::line("selection not given to the worker: the view's menu fills here");

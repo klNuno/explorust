@@ -123,29 +123,31 @@ fn with<R>(hwnd: HWND, f: impl FnOnce(&mut Frame) -> R) -> Option<R> {
 
 fn context_clipboard(defview: HWND, view: &IShellView, items: bool) -> Option<menu::ClipboardRoute> {
     let hwnd = unsafe { GetAncestor(defview, GA_ROOT) };
+    let commands = NEW_WINDOW.with(Cell::get)?.0 as isize;
     let selection = if items { shell::selection(view).ok() } else { None };
-    let mut handles_paste = false;
+    let target = if items {
+        let first = selection.as_deref().and_then(|items| match items {
+            [item] => Some(item.clone()),
+            _ => None,
+        });
+        first.map(operations::PasteTarget::Selection)
+    } else {
+        shell::view_folder(view).map(operations::PasteTarget::Folder)
+    };
+    let handles_paste = target.is_some();
     let paste = with(hwnd, |frame| {
         let tab = frame.tab()?;
         if tab.shell_view().as_ref() != Some(view) {
             return None;
         }
-        let folder = if items {
-            let [item] = selection.as_deref()? else { return None };
-            let target = shell::folder_target(&item.item().ok()?)?;
-            shell::fs_path(&target.item().ok()?)?;
-            target
-        } else {
-            tab.paste_folder()?.clone()
-        };
-        handles_paste = true;
         let id = tab.id;
-        frame.operation_worker().map(|worker| worker.paste_destination(id, folder))
+        let target = target?;
+        frame.operation_worker().map(|worker| worker.paste_destination(id, target, HWND(commands as _)))
     }).flatten();
     Some(Arc::new(move |verb| match verb {
         menu::ClipboardVerb::Cut | menu::ClipboardVerb::Copy if items => {
             if let Some(items) = selection.as_ref().filter(|items| !items.is_empty()) {
-                clipboard::publish(items.clone(), verb == menu::ClipboardVerb::Cut);
+                clipboard::publish(HWND(commands as _), items.clone(), verb == menu::ClipboardVerb::Cut);
             }
             true
         }
@@ -589,7 +591,7 @@ impl Frame {
             pressed: self.pressed,
             selection: selected > 0,
             share: self.share_available,
-            paste: ready && create && menus::file_clipboard(),
+            paste: ready && create && clipboard::can_paste(),
             create,
             ready,
             details: self.details.is_some(),
@@ -788,8 +790,8 @@ impl Frame {
                 if !items.is_empty() {
                     if c == Cmd::Delete {
                         self.submit_operation(t.id, operations::Action::Delete { items, results: t.index_results_id() });
-                    } else {
-                        clipboard::publish(items, c == Cmd::Cut);
+                    } else if let Some(commands) = NEW_WINDOW.with(Cell::get) {
+                        clipboard::publish(commands, items, c == Cmd::Cut);
                     }
                 }
                 return;
@@ -807,10 +809,11 @@ impl Frame {
                 share::open(self.hwnd, view).map(|registration| self.sharing = Some(registration))
             }
             Cmd::Paste => {
-                if let Some(folder) = t.paste_folder().cloned() {
+                let folder = sv.as_ref().and_then(shell::view_folder);
+                if let (Some(folder), Some(commands)) = (folder, NEW_WINDOW.with(Cell::get)) {
                     let id = t.id;
                     if let Some(worker) = self.operation_worker() {
-                        worker.paste_destination(id, folder).submit();
+                        worker.paste_destination(id, operations::PasteTarget::Folder(folder), commands).submit();
                     }
                 }
                 return;
@@ -913,7 +916,7 @@ impl Frame {
             let command = match (ctrl, vk) {
                 (true, VK_X) => Some(Cmd::Cut),
                 (true, VK_C) => Some(Cmd::Copy),
-                (true, VK_V) if self.tab().and_then(Tab::paste_folder).is_some() => Some(Cmd::Paste),
+                (true, VK_V) => Some(Cmd::Paste),
                 // A synthetic results folder needs the completion to remove the deleted row.
                 (false, VK_DELETE) if self.tab().and_then(Tab::index_results_id).is_some() => Some(Cmd::Delete),
                 _ => None,

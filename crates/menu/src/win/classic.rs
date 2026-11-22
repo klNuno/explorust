@@ -2,7 +2,8 @@
 //! `TrackPopupMenuEx`, owned by a hidden window that forwards the owner-draw and popup messages to
 //! the handler, and the command invocation shared with the Windows 11 menu.
 
-use super::{ClipboardRoute, log, route_clipboard};
+use super::{ClipboardRoute, log};
+use crate::ClipboardVerb;
 use std::cell::RefCell;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
@@ -98,7 +99,7 @@ unsafe extern "system" fn owner_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 /// Tracks the classic menu at a screen point; returns the chosen command id, 0 when dismissed.
-pub fn track(cm: &IContextMenu, menu: HMENU, x: i32, y: i32) -> u32 {
+fn track(cm: &IContextMenu, menu: HMENU, x: i32, y: i32) -> u32 {
     let h = owner();
     CURRENT.with(|c| *c.borrow_mut() = Some(cm.clone()));
     // SAFETY: a menu this thread owns, tracked modally by the menu manager.
@@ -112,20 +113,28 @@ pub fn track(cm: &IContextMenu, menu: HMENU, x: i32, y: i32) -> u32 {
     id
 }
 
+pub fn run(cm: &IContextMenu, menu: HMENU, owner: HWND, at: POINT, route: Option<&ClipboardRoute>, commands: &[(u32, ClipboardVerb)]) {
+    let id = track(cm, menu, at.x, at.y);
+    let routed = commands.iter().find(|(command, _)| *command == id)
+        .is_some_and(|(_, verb)| route.is_some_and(|handle| handle(*verb)));
+    if routed {
+        log::line(&format!("route classic id {id} to Files"));
+    }
+    super::give_back(owner);
+    if id >= super::FIRST && !routed {
+        invoke(cm, owner, id, super::FIRST, at);
+    }
+}
+
 /// Runs command `id` (ids start at `first`) with the point and the modifier keys, as Explorer does.
-pub fn invoke(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POINT, route: Option<&ClipboardRoute>) {
+pub fn invoke(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POINT) {
     // SAFETY: modifier state of this thread's input.
     let (shift, ctrl) = unsafe { (GetKeyState(VK_SHIFT.0 as i32) < 0, GetKeyState(VK_CONTROL.0 as i32) < 0) };
-    invoke_with(cm, owner, id, first, at, shift, ctrl, route);
+    invoke_with(cm, owner, id, first, at, shift, ctrl);
 }
 
 /// `invoke` with the modifier keys given (the worker thread has no keyboard state of its own).
-pub fn invoke_with(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POINT, shift: bool, ctrl: bool, route: Option<&ClipboardRoute>) {
-    let verb = super::read::verb(cm, id - first);
-    if route_clipboard(route, &verb) {
-        log::line(&format!("route id {id} verb '{verb}' to Files"));
-        return;
-    }
+pub fn invoke_with(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POINT, shift: bool, ctrl: bool) {
     let offset = (id - first) as usize;
     let mut mask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
     if shift {
@@ -150,8 +159,7 @@ pub fn invoke_with(cm: &IContextMenu, owner: HWND, id: u32, first: u32, at: POIN
     let r = unsafe { cm.InvokeCommand(&info as *const _ as *const CMINVOKECOMMANDINFO) };
     CURRENT.with(|c| c.borrow_mut().take());
     log::line(&format!(
-        "invoke id {id} verb '{}': {:?} in {:.1} ms",
-        verb,
+        "invoke id {id}: {:?} in {:.1} ms",
         r.err().map(|e| e.code()),
         t.elapsed().as_secs_f64() * 1000.0
     ));

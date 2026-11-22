@@ -14,7 +14,7 @@ pub const MSG_OPERATION: u32 = WM_APP + 0x12B;
 pub enum Action {
     Address { text: String, request: usize },
     Delete { items: Vec<Pidl>, results: Option<usize> },
-    Paste(Pidl, clipboard::Pending),
+    Paste(PasteTarget, clipboard::Pending),
     NewFolder(Pidl, &'static str),
     Properties(Vec<Pidl>),
 }
@@ -39,15 +39,23 @@ pub struct Worker {
 
 pub struct PasteDestination {
     tab: usize,
-    folder: Pidl,
+    target: PasteTarget,
+    commands: isize,
     input: Arc<Inbox<Option<Job>>>,
+}
+
+#[derive(Clone)]
+pub enum PasteTarget {
+    Folder(Pidl),
+    Selection(Pidl),
 }
 
 impl PasteDestination {
     pub fn submit(&self) {
-        if !self.input.send_with(|| Some(Job {
+        let source = clipboard::snapshot(HWND(self.commands as _));
+        if !self.input.send(Some(Job {
             tab: self.tab,
-            action: Action::Paste(self.folder.clone(), clipboard::snapshot()),
+            action: Action::Paste(self.target.clone(), source),
         })) {
             log::line("Files paste destination closed before submission");
         }
@@ -79,8 +87,8 @@ impl Worker {
         self.output.lock().unwrap().as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    pub fn paste_destination(&self, tab: usize, folder: Pidl) -> PasteDestination {
-        PasteDestination { tab, folder, input: self.input.clone() }
+    pub fn paste_destination(&self, tab: usize, target: PasteTarget, commands: HWND) -> PasteDestination {
+        PasteDestination { tab, target, commands: commands.0 as isize, input: self.input.clone() }
     }
 }
 
@@ -185,16 +193,27 @@ fn perform(owner: HWND, job: Job) -> Option<Response> {
             log::line(&format!("command Delete: {result:?} (operation STA)"));
             return results.filter(|_| result.is_ok()).map(|results| Response::Deleted { tab, results, items });
         }
-        Action::Paste(folder, source) => {
-            let result = match source.wait() {
-                Ok(mut source) => with_dialog_owner(owner, || shell::paste(owner, &folder, &mut source)),
+        Action::Paste(target, source) => {
+            let mut source = match source.wait() {
+                Ok(source) => source,
                 Err(error) if error.code() == ERROR_TIMEOUT.to_hresult() => {
                     log::line("command Paste: clipboard snapshot timed out (operation STA)");
                     return Some(Response::ClipboardTimedOut);
                 }
-                Err(error) => Err(error),
+                Err(error) => {
+                    log::line(&format!("command Paste: {error} (operation STA)"));
+                    return None;
+                }
             };
-            ("Paste", result, Some(folder))
+            let result = with_dialog_owner(owner, || match &target {
+                PasteTarget::Folder(folder) => shell::paste(owner, folder, &mut source),
+                PasteTarget::Selection(selection) => shell::paste_into(owner, selection, &mut source),
+            });
+            let refresh = match target {
+                PasteTarget::Folder(folder) => Some(folder),
+                PasteTarget::Selection(_) => None,
+            };
+            ("Paste", result, refresh)
         }
         Action::NewFolder(folder, name) => {
             let result = with_dialog_owner(owner, || {
@@ -242,12 +261,12 @@ mod tests {
         };
         let frame = DialogOwner::new(RECT::default()).unwrap();
         let worker = Worker::new(frame.0).unwrap();
-        let (release, pending) = clipboard::Pending::fixture();
-        worker.submit(1, Action::Paste(target.clone(), pending));
+        let (release, pending) = std::sync::mpsc::channel();
+        worker.submit(1, Action::Paste(PasteTarget::Folder(target.clone()), clipboard::Pending::Fixture(pending)));
         worker.submit(1, Action::NewFolder(target, "queued folder"));
         drop(worker);
         drop(frame);
-        release.send(Ok(clipboard::Source::test_cut(vec![source]))).unwrap();
+        release.send(clipboard::Source::test_cut(vec![source])).unwrap_or_else(|_| panic!("operation worker exited before draining"));
 
         let moved = target_path.join("move.txt");
         let created = target_path.join("queued folder");

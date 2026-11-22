@@ -1,6 +1,7 @@
 //! Reads an HMENU a context menu handler filled: text, verb, state, bitmap and submenus.
 
 use crate::model::{Entry, Kind, parse_label};
+use crate::ClipboardVerb;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, GetDIBits, GetObjectW, HBITMAP,
@@ -21,6 +22,17 @@ pub fn verb(cm: &IContextMenu, offset: u32) -> String {
     }
     let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
     String::from_utf16_lossy(&buf[..n])
+}
+
+/// Cut, Copy and Paste are top-level shell commands. Resolve them while the popup is filled.
+pub fn clipboard_ids(cm: &IContextMenu, menu: HMENU) -> Vec<(u32, ClipboardVerb)> {
+    unsafe {
+        (0..GetMenuItemCount(Some(menu)).max(0))
+            .map(|row| GetMenuItemID(menu, row))
+            .filter(|&id| (super::FIRST..=super::LAST).contains(&id))
+            .filter_map(|id| ClipboardVerb::from_canonical(&verb(cm, id - super::FIRST)).map(|verb| (id, verb)))
+            .collect()
+    }
 }
 
 /// Asks the handler to fill a submenu (Open with, New, Send to) before it is read.

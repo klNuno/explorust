@@ -97,6 +97,10 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 request_open(hwnd, Destination::Path(path, select), t0, 0);
                 LRESULT(1)
             }
+            clipboard::MSG_COMMAND => {
+                clipboard::execute(wp.0);
+                LRESULT(0)
+            }
             WM_TIMER if wp.0 == TIMER_SPARE => {
                 let _ = KillTimer(Some(hwnd), TIMER_SPARE);
                 VIEWS.with(|views| {
@@ -117,6 +121,11 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 }
 
 pub fn run_with_initial(initial: Option<&str>) {
+    let ole = unsafe { windows::Win32::System::Ole::OleInitialize(None) };
+    if let Err(error) = ole {
+        log::line(&format!("Files command OLE initialization failed: {error}"));
+        return;
+    }
     let t0 = Instant::now();
     let cmd = unsafe {
         let inst = GetModuleHandleW(None).unwrap_or_default();
@@ -151,6 +160,7 @@ pub fn run_with_initial(initial: Option<&str>) {
             Ok(h) => h,
             Err(e) => {
                 log::line(&format!("command window failed: {e}"));
+                windows::Win32::System::Ole::OleUninitialize();
                 return;
             }
         }
@@ -169,6 +179,10 @@ pub fn run_with_initial(initial: Option<&str>) {
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            if msg.hwnd.is_invalid() && msg.message == clipboard::MSG_RETIRE {
+                clipboard::retire(msg.wParam.0 != 0);
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -176,5 +190,7 @@ pub fn run_with_initial(initial: Option<&str>) {
             let _ = DestroyWindow(cmd);
         }
     }
+    clipboard::release();
+    unsafe { windows::Win32::System::Ole::OleUninitialize() };
     log::line("files: stopped");
 }

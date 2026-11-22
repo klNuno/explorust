@@ -4,7 +4,7 @@
 use crate::text::Strings;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, POINT};
 use windows::Win32::Storage::EnhancedStorage::{PKEY_DateModified, PKEY_ItemNameDisplay, PKEY_ItemTypeText, PKEY_Size};
-use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW};
+use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -91,13 +91,6 @@ pub fn more(hwnd: HWND, v: &IFolderView2, s: &Strings, at: POINT) -> windows_cor
         _ => {}
     }
     Ok(false)
-}
-
-pub fn file_clipboard() -> bool {
-    static SHELL_ITEMS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let shell_items = *SHELL_ITEMS.get_or_init(|| unsafe { RegisterClipboardFormatW(windows_core::w!("Shell IDList Array")) });
-    // CF_HDROP is 15. Some shell namespace handlers provide only the native shell item format.
-    unsafe { IsClipboardFormatAvailable(15).is_ok() || (shell_items != 0 && IsClipboardFormatAvailable(shell_items).is_ok()) }
 }
 
 /// Unicode text on the clipboard.
