@@ -1,12 +1,17 @@
 //! `--setup`: what the installer (`explorust-setup.exe`, crates/setup) runs once it has unpacked
 //! the files: one question, the install (`manage::install`: files, Apps entry and Start menu
-//! shortcuts, then the Shell value), then an offer to sign out so explorust starts. Run elevated
+//! shortcuts, then the Shell value), then restart the running shell or offer to sign out. Run elevated
 //! (the installer asks Windows); not elevated it asks. Elevated with another account's password it
 //! refuses: that account's settings would change instead of the signed-in user's.
 
 use crate::ui::{self, Icon, tr};
+use crate::launch_timing::{FALLBACK_EVENT, RELOAD_EVENT, build_verdict_event, reload_postponed_event, reload_preserves_files_event};
 use crate::manage::OTHER_ACCOUNT;
-use crate::{account, install, log};
+use crate::proc::Event;
+use crate::setup_mode::{self, Mode, Restart, RestartProgress};
+use crate::{account, install, log, taskbar};
+use std::path::Path;
+use std::time::{Duration, Instant};
 use windows::Win32::System::Shutdown::{EWX_LOGOFF, ExitWindowsEx, SHTDN_REASON_FLAG_PLANNED, SHTDN_REASON_MAJOR_APPLICATION};
 
 const INSTALL: i32 = 1;
@@ -29,11 +34,19 @@ pub fn run() -> u32 {
         );
         return OTHER_ACCOUNT;
     }
-    let again = install::dir().join("explorust.exe").exists();
-    let go = if again {
-        tr("Mettre à jour\nPrend effet à la prochaine ouverture de session.", "Update\nTakes effect at the next sign-in.")
-    } else {
-        tr("Installer\nPrend effet à la prochaine ouverture de session.", "Install\nTakes effect at the next sign-in.")
+    let exe = install::dir().join("explorust.exe");
+    let mode = install_mode(&exe);
+    let go = match mode {
+        Mode::UpdateLive { preserves_files: true, .. } => tr(
+            "Mettre à jour\nRedémarre explorust en quelques secondes, sans fermer la session.",
+            "Update\nRestarts explorust in a few seconds without signing out.",
+        ),
+        Mode::UpdateLive { preserves_files: false, .. } => tr(
+            "Mettre à jour\nRedémarre explorust sans fermer la session. Les fenêtres de Fichiers se ferment et les copies, déplacements et suppressions en cours s'arrêtent.",
+            "Update\nRestarts explorust without signing out. File Explorer windows close and ongoing copies, moves and deletions stop.",
+        ),
+        Mode::UpdateOnSignIn => tr("Mettre à jour\nPrend effet à la prochaine ouverture de session.", "Update\nTakes effect at the next sign-in."),
+        Mode::Install => tr("Installer\nPrend effet à la prochaine ouverture de session.", "Install\nTakes effect at the next sign-in."),
     };
     let pick = ui::choose(
         Icon::Shield,
@@ -71,6 +84,9 @@ pub fn run() -> u32 {
         );
         return code;
     }
+    if let Mode::UpdateLive { pid, .. } = mode {
+        return finish_live_update(&exe, pid);
+    }
     let pick = ui::choose(
         Icon::Info,
         tr("explorust est installé", "explorust is installed"),
@@ -96,4 +112,137 @@ pub fn run() -> u32 {
         }
     }
     0
+}
+
+fn install_mode(exe: &Path) -> Mode {
+    let installed = exe.is_file();
+    let shell = installed.then(|| taskbar::explorust(exe)).flatten();
+    // The session-scoped fallback event is held by the supervising guard, including an adopted one.
+    let reload = shell.is_some() && Event::open_for_signal(RELOAD_EVENT).is_ok();
+    let guarded = reload && Event::open_for_signal(FALLBACK_EVENT).is_ok();
+    let preserves_files = shell.is_some_and(|pid| Event::open_for_signal(&reload_preserves_files_event(pid)).is_ok());
+    setup_mode::choose(installed, shell, reload, guarded, preserves_files)
+}
+
+fn finish_live_update(exe: &Path, pid: u32) -> u32 {
+    let result = ui::working(
+        tr("Redémarrage d'explorust", "Restarting explorust"),
+        tr(
+            "Les opérations de fichiers en cours peuvent prendre du temps.",
+            "File operations in progress can take time.",
+        ),
+        || reload(exe, pid),
+    );
+    let details = log::dir().join("guard.log").display().to_string();
+    match result {
+        Restart::Updated(_) => ui::tell(
+            Icon::Info,
+            tr("explorust est à jour", "explorust is up to date"),
+            tr("La nouvelle version est déjà en cours d'exécution.", "The new version is already running."),
+            None,
+        ),
+        Restart::Windows(_) => ui::tell(
+            Icon::Warning,
+            tr("Windows a repris la main", "Windows took over"),
+            tr("La nouvelle version a été installée. Le journal indique pourquoi explorust s'est arrêté.", "The new version was installed. See the log for why explorust stopped."),
+            Some(&details),
+        ),
+        Restart::Deferred => ui::tell(
+            Icon::Info,
+            tr("Redémarrage d'explorust en attente", "explorust restart pending"),
+            tr(
+                "La nouvelle version a été installée. explorust redémarrera une fois les opérations de fichiers en cours terminées.",
+                "The new version was installed. explorust will restart when the current file operations finish.",
+            ),
+            None,
+        ),
+        Restart::Postponed => ui::tell(
+            Icon::Info,
+            tr("Redémarrage d'explorust reporté", "explorust restart postponed"),
+            tr(
+                "Une opération de fichiers est toujours en cours. La nouvelle version démarrera à la prochaine ouverture de session. Vous pouvez aussi relancer l'installeur une fois l'opération terminée.",
+                "A file operation is still running. The new version will start at the next sign-in. You can also run the installer again after the operation finishes.",
+            ),
+            None,
+        ),
+        Restart::Unconfirmed => ui::tell(
+            Icon::Warning,
+            tr("Redémarrage d'explorust non confirmé", "Could not confirm explorust restarted"),
+            tr("La nouvelle version a été installée. Consultez le journal pour en savoir plus.", "The new version was installed. See the log for details."),
+            Some(&details),
+        ),
+    }
+    0
+}
+
+fn reload(exe: &Path, original: u32) -> Restart {
+    // A running image may have been renamed during the swap. Its tray still identifies it.
+    let shell = taskbar::owns_tray(original).then_some(original).or_else(|| taskbar::explorust(exe));
+    if let Some(pid) = shell {
+        // The guard keeps running its previous image until the next sign-in. It starts the new
+        // explorust.exe in the same session once the old shell exits with the reload code.
+        if let Ok(event) = Event::open_for_signal(&reload_postponed_event(pid))
+            && let Err(error) = event.reset()
+        {
+            log::line(&format!("setup: could not clear the earlier reload outcome: {error}"));
+        }
+        if let Err(error) = Event::set_existing(RELOAD_EVENT) {
+            log::line(&format!("setup: could not request reload of pid {pid}: {error}"));
+        } else {
+            log::line(&format!("setup: reload requested for pid {pid}"));
+            return wait_for_restart(exe, pid);
+        }
+    } else {
+        log::line("setup: explorust's taskbar disappeared during installation");
+    }
+    taskbar::explorer().map_or(Restart::Unconfirmed, Restart::Windows)
+}
+
+fn wait_for_restart(exe: &Path, previous: u32) -> Restart {
+    let started = Instant::now();
+    let mut last_tray = started;
+    loop {
+        let progress = restart_progress(exe, previous);
+        let now = Instant::now();
+        if progress != RestartProgress::Missing {
+            last_tray = now;
+        }
+        let elapsed = now.duration_since(started);
+        if let Some(outcome) = setup_mode::restart_outcome(progress, elapsed, now.duration_since(last_tray)) {
+            match outcome {
+                Restart::Updated(pid) => log::line(&format!("setup: new explorust pid {pid} passed the build verdict and owns an answering taskbar (was {previous})")),
+                Restart::Windows(pid) => log::line(&format!("setup: Windows took over (explorer pid {pid})")),
+                Restart::Deferred => log::line(&format!("setup: reload still pending after {} s with the original shell pid {previous}", elapsed.as_secs())),
+                Restart::Postponed => log::line(&format!("setup: shell pid {previous} postponed the reload while a file operation was still running")),
+                Restart::Unconfirmed => log::line(&format!("setup: restart could not be confirmed within {} s", elapsed.as_secs())),
+            }
+            return outcome;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn restart_progress(exe: &Path, previous: u32) -> RestartProgress {
+    if let Some(pid) = taskbar::explorer() {
+        return RestartProgress::Windows(pid);
+    }
+    if Event::is_signalled(FALLBACK_EVENT) {
+        return RestartProgress::Missing;
+    }
+    if taskbar::owns_tray(previous) {
+        if Event::is_signalled(&reload_postponed_event(previous)) && !Event::is_signalled(RELOAD_EVENT) {
+            return RestartProgress::DrainCancelled;
+        }
+        return RestartProgress::OldShell;
+    }
+    let Some(pid) = taskbar::explorust(exe).filter(|&pid| pid != previous) else {
+        return RestartProgress::Missing;
+    };
+    if Event::is_signalled(&build_verdict_event(pid)) && taskbar::probe(pid) == crate::policy::Probe::Answered
+        && !Event::is_signalled(FALLBACK_EVENT)
+    {
+        RestartProgress::Verified(pid)
+    } else {
+        RestartProgress::Starting
+    }
 }

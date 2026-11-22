@@ -20,9 +20,9 @@ mod views;
 
 use crate::handover;
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use views::{Destination, Open, Windows};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::*;
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
@@ -36,6 +36,25 @@ const SPARE_DELAY_MS: u32 = 800;
 
 thread_local! {
     static VIEWS: RefCell<Option<Arc<Windows>>> = const { RefCell::new(None) };
+}
+
+static RUNNING: Mutex<Weak<Windows>> = Mutex::new(Weak::new());
+
+pub fn prepare_reload(limit: Duration) -> Option<Vec<String>> {
+    if !operations::drain_for_reload(limit) {
+        return None;
+    }
+    let windows = RUNNING.lock().unwrap().upgrade();
+    Some(windows.map(|windows| windows.folders_for_reload()).unwrap_or_default())
+}
+
+pub fn reopen_folders(folders: Vec<String>) {
+    let windows = RUNNING.lock().unwrap().upgrade();
+    if let Some(windows) = windows {
+        for path in folders {
+            windows.open(Open { destination: Destination::Path(path, false), position: None, requested: Instant::now(), queued_ms: 0 });
+        }
+    }
 }
 
 /// Dark menus and controls for the process; the dev exe calls it before `run`, the shell should.
@@ -52,10 +71,12 @@ pub fn ui_language() -> String {
     }
 }
 
-fn request_open(destination: Destination, requested: Instant, queued_ms: u32) -> bool {
-    VIEWS.with(|views| views.borrow().as_ref().is_some_and(|views|
-        views.open(Open { destination, position: None, requested, queued_ms })
-    ))
+fn request_open(destination: Destination, requested: Instant, queued_ms: u32) {
+    VIEWS.with(|views| {
+        if let Some(views) = views.borrow().as_ref() {
+            views.open(Open { destination, position: None, requested, queued_ms });
+        }
+    });
 }
 
 unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -69,9 +90,8 @@ unsafe extern "system" fn cmd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                         if arg != 0 {
                             log::line(&format!("FilesOpen lParam {arg}: no path protocol yet, opening Home"));
                         }
-                        if request_open(Destination::Home, t0, queued) {
-                            let _ = SetTimer(Some(hwnd), TIMER_SPARE, SPARE_DELAY_MS, None);
-                        }
+                        request_open(Destination::Home, t0, queued);
+                        let _ = SetTimer(Some(hwnd), TIMER_SPARE, SPARE_DELAY_MS, None);
                     }
                     Some((bus::Command::Shutdown, _)) => {
                         log::line("shutdown");
@@ -170,6 +190,7 @@ pub fn run_with_initial(initial: Option<&str>) {
         let _ = ChangeWindowMessageFilterEx(cmd, WM_COPYDATA, MSGFLT_ALLOW, None);
     }
     let windows = Windows::new(cmd);
+    *RUNNING.lock().unwrap() = Arc::downgrade(&windows);
     VIEWS.with(|views| *views.borrow_mut() = Some(windows.clone()));
     log::line(&format!("files: listening in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
     if let Some(path) = initial {

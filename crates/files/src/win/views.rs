@@ -29,19 +29,16 @@ enum Job {
     Close,
 }
 
-enum Launch {
-    Open(Open),
-    Prepare(Arc<AtomicBool>),
-}
-
-struct Spare {
+#[derive(Clone)]
+struct Window {
     inbox: Arc<Inbox<Job>>,
     ready: Arc<AtomicBool>,
+    folder: Arc<Mutex<Option<String>>>,
 }
 
 struct Sessions {
-    open: Vec<Arc<Inbox<Job>>>,
-    spare: Option<Spare>,
+    open: Vec<Window>,
+    spare: Option<Window>,
     offset: u8,
     closing: bool,
 }
@@ -77,30 +74,34 @@ impl Windows {
             return;
         }
         let at = state.position();
-        let ready = Arc::new(AtomicBool::new(false));
-        state.spare = self.spawn(at, Launch::Prepare(ready.clone())).map(|inbox| Spare { inbox, ready });
+        state.spare = self.spawn(at, None);
     }
 
-    /// Returns whether an already prepared Home view was used.
-    pub fn open(self: &Arc<Self>, request: Open) -> bool {
+    pub fn open(self: &Arc<Self>, request: Open) {
         let mut state = self.sessions.lock().unwrap();
         if state.closing {
-            return false;
+            return;
         }
-        state.open.retain(|inbox| !inbox.closed());
+        state.open.retain(|window| !window.inbox.closed());
         if matches!(request.destination, Destination::Home)
             && request.position.is_none()
             && let Some(spare) = state.spare.take_if(|spare| spare.ready.load(Ordering::Acquire))
             && spare.inbox.send(Job::OpenHome(Open { destination: Destination::Home, ..request }))
         {
-            state.open.push(spare.inbox);
-            return true;
+            state.open.push(spare);
+            return;
         }
         let at = request.position.unwrap_or_else(|| state.position());
-        if let Some(window) = self.spawn(at, Launch::Open(request)) {
+        if let Some(window) = self.spawn(at, Some(request)) {
             state.open.push(window);
         }
-        false
+    }
+
+    pub fn folders_for_reload(&self) -> Vec<String> {
+        let mut state = self.sessions.lock().unwrap();
+        state.closing = true;
+        state.open.iter().filter(|window| !window.inbox.closed())
+            .filter_map(|window| window.folder.lock().unwrap().clone()).collect()
     }
 
     pub fn shutdown(&self) {
@@ -110,22 +111,26 @@ impl Windows {
             spare.inbox.stop(Job::Close);
         }
         for window in state.open.drain(..) {
-            window.stop(Job::Close);
+            window.inbox.stop(Job::Close);
         }
     }
 
-    fn spawn(self: &Arc<Self>, at: (i32, i32), launch: Launch) -> Option<Arc<Inbox<Job>>> {
-        let inbox = Arc::new(Inbox::default());
-        let worker = inbox.clone();
+    fn spawn(self: &Arc<Self>, at: (i32, i32), request: Option<Open>) -> Option<Window> {
+        let window = Window {
+            inbox: Arc::new(Inbox::default()),
+            ready: Arc::new(AtomicBool::new(false)),
+            folder: Arc::new(Mutex::new(None)),
+        };
+        let worker = window.clone();
         let owner = Arc::downgrade(self);
         let cmd = self.cmd;
         if let Err(error) = std::thread::Builder::new().name("files-view".into()).spawn(move || {
-            run(owner, cmd, worker, launch, at);
+            run(owner, cmd, worker, request, at);
         }) {
             log::line(&format!("could not start a Files view thread: {error}"));
             return None;
         }
-        Some(inbox)
+        Some(window)
     }
 }
 
@@ -145,9 +150,9 @@ impl Drop for Ole {
     }
 }
 
-fn run(owner: Weak<Windows>, cmd: isize, inbox: Arc<Inbox<Job>>, launch: Launch, at: (i32, i32)) {
-    let jobs = inbox.attach();
-    if inbox.closed() {
+fn run(owner: Weak<Windows>, cmd: isize, window: Window, request: Option<Open>, at: (i32, i32)) {
+    let jobs = window.inbox.attach();
+    if window.inbox.closed() {
         return;
     }
     if let Err(error) = unsafe { OleInitialize(None) } {
@@ -158,12 +163,9 @@ fn run(owner: Weak<Windows>, cmd: isize, inbox: Arc<Inbox<Job>>, launch: Launch,
     OWNER.with(|slot| *slot.borrow_mut() = owner);
     let start = Instant::now();
     // A blocking provider can only delay its own window.
-    let resolved = match &launch {
-        Launch::Open(request) => resolve(&request.destination),
-        Launch::Prepare(_) => resolve(&Destination::Home),
-    };
-    let Some((place, selection, label)) = resolved else { return };
-    if inbox.closed() {
+    let destination = request.as_ref().map_or(&Destination::Home, |request| &request.destination);
+    let Some((place, selection, label)) = resolve(destination) else { return };
+    if window.inbox.closed() {
         return;
     }
     let sh = match gfx::Shared::new() {
@@ -174,7 +176,7 @@ fn run(owner: Weak<Windows>, cmd: isize, inbox: Arc<Inbox<Job>>, launch: Launch,
         }
     };
     frame::init(sh, crate::text::for_language(&ui_language()), HWND(cmd as _));
-    let hwnd = match frame::create(&place, at.0, at.1, matches!(launch, Launch::Prepare(_))) {
+    let hwnd = match frame::create(&place, at.0, at.1, request.is_none(), window.folder) {
         Ok(hwnd) => hwnd,
         Err(error) => {
             log::line(&format!("opening {label:?} failed: {error}"));
@@ -182,12 +184,11 @@ fn run(owner: Weak<Windows>, cmd: isize, inbox: Arc<Inbox<Job>>, launch: Launch,
             return;
         }
     };
-    match launch {
-        Launch::Open(request) => show(hwnd, &place, selection, &label, &request, false),
-        Launch::Prepare(ready) => {
-            ready.store(true, Ordering::Release);
-            log::line(&format!("Home spare prepared in {:.1} ms", start.elapsed().as_secs_f64() * 1000.0));
-        }
+    if let Some(request) = request {
+        show(hwnd, &place, selection, &label, &request, false);
+    } else {
+        window.ready.store(true, Ordering::Release);
+        log::line(&format!("Home spare prepared in {:.1} ms", start.elapsed().as_secs_f64() * 1000.0));
     }
     let mut msg = MSG::default();
     loop {

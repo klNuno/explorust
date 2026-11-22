@@ -2,7 +2,7 @@
 //! then wait for a quit request or the host's end.
 
 use crate::startup_retry::SessionStartup;
-use crate::{actions, components, events, guardwatch, keyhost, launch_timing, log, minimized, problem, selftest};
+use crate::{actions, components, events, guardwatch, keyhost, launch_timing, log, minimized, problem, reopen, selftest};
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ pub const SELF_TEST_FAILED: i32 = 4;
 pub const RELOAD: i32 = 5;
 /// A problem found inside (`problem`): the guard starts explorer.exe and tells the user.
 pub const PROBLEM: i32 = 6;
+const FILE_DRAIN_LIMIT: Duration = Duration::from_secs(120);
 static GRAPHICS_LOST: AtomicBool = AtomicBool::new(false);
 struct Args {
     ready_event: Option<String>,
@@ -100,7 +101,6 @@ fn shell(args: &Args) -> i32 {
             return HOST_FAILED;
         }
     };
-    let exits = ExitRequests { quit, reload };
     if components::parts_off().iter().any(|line| line == "render-stats") {
         render::Device::trace(log::line);
     }
@@ -108,6 +108,13 @@ fn shell(args: &Args) -> i32 {
         log::line(&format!("graphics device lost: {error}"));
         GRAPHICS_LOST.store(true, Ordering::Release);
     });
+    let postponed = events::Owned::create(&launch_timing::reload_postponed_event(std::process::id()))
+        .inspect_err(|error| log::line(&format!("reload postponed event: {error}")))
+        .ok();
+    let exits = ExitRequests { quit, reload, postponed };
+    let _reload_capability = events::Owned::create(&launch_timing::reload_preserves_files_event(std::process::id()))
+        .inspect_err(|error| log::line(&format!("reload capability: {error}")))
+        .ok();
     let offered = args.ready_event.as_deref()
         .and_then(|name| events::Owned::open_for_signal(&launch_timing::staged_event(name)));
     let negotiated = offered.is_some();
@@ -153,6 +160,16 @@ fn shell(args: &Args) -> i32 {
     keyhost::start();
     if let Err(code) = exits.wait_parts(false) {
         return code;
+    }
+    if let Some(guard) = reopen::guard_stamp(guardwatch::pid()) {
+        match reopen::take(&log::dir(), guard) {
+            Ok(folders) if !folders.is_empty() => {
+                log::line(&format!("reload: reopening {} Files windows", folders.len()));
+                files::reopen_folders(folders);
+            }
+            Ok(_) => {}
+            Err(error) => log::line(&format!("reload: could not read Files windows: {error}")),
+        }
     }
     log::line(&format!("native desktop ready in {} ms", launched.elapsed().as_millis()));
     components::spawn_watchdog(false);
@@ -206,11 +223,19 @@ fn shell(args: &Args) -> i32 {
     if let Some(code) = exits.requested(0) {
         return code;
     }
-    if let Some(phases) = &phases {
-        signal(&phases.verified, "build verdict");
-    } else if !legacy_ready_sent {
+    if phases.is_none() && !legacy_ready_sent {
         signal_legacy_ready(args.ready_event.as_deref());
     }
+    let verdict_signalled = phases.as_ref().is_none_or(|phases| signal(&phases.verified, "build verdict"));
+    // Publish the same verdict for setup even when the running guard uses the legacy protocol.
+    let _setup_verdict = if args.guard.is_some() && verdict_signalled {
+        events::Owned::create(&launch_timing::build_verdict_event(std::process::id()))
+            .inspect(|event| { signal(event, "setup build verdict"); })
+            .inspect_err(|error| log::line(&format!("setup build verdict: {error}")))
+            .ok()
+    } else {
+        None
+    };
     loop {
         if let Some(code) = exits.requested(250) {
             return code;
@@ -234,15 +259,14 @@ fn signal_legacy_ready(name: Option<&str>) -> bool {
     }
 }
 
-fn signal(event: &events::Owned, phase: &str) {
-    if let Err(e) = event.signal() {
-        log::line(&format!("{phase} event: {e}"));
-    }
+fn signal(event: &events::Owned, phase: &str) -> bool {
+    event.signal().inspect_err(|e| log::line(&format!("{phase} event: {e}"))).is_ok()
 }
 
 struct ExitRequests {
     quit: events::Owned,
     reload: events::Owned,
+    postponed: Option<events::Owned>,
 }
 
 impl ExitRequests {
@@ -288,11 +312,14 @@ impl ExitRequests {
         let code = if self.quit.wait(wait) {
             log::line("quit requested");
             CLEAN
-        } else if self.reload.wait(0) {
-            log::line("reload requested");
-            RELOAD
         } else if GRAPHICS_LOST.load(Ordering::Acquire) {
-            launch_timing::GRAPHICS_LOST as i32
+            let folders = files::prepare_reload(FILE_DRAIN_LIMIT).unwrap_or_else(|| {
+                log::line("graphics restart: file operations did not finish before the deadline");
+                Vec::new()
+            });
+            return Some(restart(launch_timing::GRAPHICS_LOST as i32, &folders));
+        } else if self.reload.wait(0) {
+            return self.try_reload();
         } else if let Some(why) = problem::take() {
             log::line(&format!("stopping on a problem: {why}"));
             PROBLEM
@@ -301,6 +328,38 @@ impl ExitRequests {
         };
         Some(shutdown(code))
     }
+
+    fn try_reload(&self) -> Option<i32> {
+        log::line("reload requested");
+        if let Some(event) = &self.postponed
+            && let Err(error) = event.reset()
+        {
+            log::line(&format!("reset reload postponed event: {error}"));
+        }
+        let Some(folders) = files::prepare_reload(FILE_DRAIN_LIMIT) else {
+            log::line("reload postponed: accepted file operations still running");
+            if let Err(error) = self.reload.reset() {
+                log::line(&format!("reset reload event: {error}"));
+            }
+            if let Some(event) = &self.postponed {
+                signal(event, "reload postponed");
+            }
+            return None;
+        };
+        Some(restart(RELOAD, &folders))
+    }
+}
+
+fn restart(code: i32, folders: &[String]) -> i32 {
+    let code = shutdown(code);
+    if let Some(guard) = reopen::guard_stamp(guardwatch::pid()) {
+        match reopen::save(&log::dir(), guard, folders) {
+            Ok(()) if !folders.is_empty() => log::line(&format!("restart: saved {} Files windows", folders.len())),
+            Ok(()) => {}
+            Err(error) => log::line(&format!("restart: could not save Files windows: {error}")),
+        }
+    }
+    code
 }
 
 fn shutdown(code: i32) -> i32 {

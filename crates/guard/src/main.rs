@@ -12,7 +12,7 @@
 //! - `--fallback`: ask a running guard to kill explorust and start explorer (same as Ctrl+Alt+Shift+F12).
 //! - `--status`: print the Shell value, the Windows build and the last good build.
 //! - `--adopt <pid>`: started by explorust when its guard died; supervises that explorust.
-//! - `--setup`: the installer's run (`setup`): question, `--install`, Apps entry, sign-out offer.
+//! - `--setup`: interactive installation or an update of the running shell (`setup`).
 //! - `--uninstall [--yes|--quiet]`: the user's way back (`uninstall`), asks Windows for rights.
 //!   `--machine [--for <sid>]` is its elevated half.
 
@@ -33,6 +33,7 @@ mod prefetch;
 mod proc;
 mod reg;
 mod setup;
+mod setup_mode;
 mod startup_retry;
 mod supervise;
 mod taskbar;

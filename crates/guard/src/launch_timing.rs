@@ -5,6 +5,20 @@ use std::time::Duration;
 
 pub const FALLBACK_EVENT: &str = r"Local\explorust-guard-fallback";
 pub const GRAPHICS_LOST: u32 = 7;
+pub const RELOAD_EVENT: &str = r"Local\explorust-reload";
+
+pub fn reload_preserves_files_event(pid: u32) -> String {
+    format!(r"Local\explorust-reload-preserves-files-{pid}")
+}
+
+pub fn reload_postponed_event(pid: u32) -> String {
+    format!(r"Local\explorust-reload-postponed-{pid}")
+}
+
+/// The build verdict addressed by shell PID, so setup need not know the guard's launch attempt.
+pub fn build_verdict_event(pid: u32) -> String {
+    format!(r"Local\explorust-build-verified-{pid}")
+}
 pub const REGISTRATION: Duration = Duration::from_secs(20);
 pub const PARTS: Duration = Duration::from_secs(20);
 pub const HOST: Duration = Duration::from_secs(100);

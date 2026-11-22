@@ -45,6 +45,8 @@ mod prefetch;
 mod problem;
 #[cfg(target_os = "windows")]
 mod run;
+#[cfg(any(target_os = "windows", test))]
+mod reopen;
 #[cfg(target_os = "windows")]
 mod selftest;
 #[cfg(target_os = "windows")]

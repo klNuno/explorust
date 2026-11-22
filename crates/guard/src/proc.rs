@@ -10,7 +10,7 @@ use windows::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, EVENT_MODIFY_STATE, GetExitCodeProcess, GetProcessId,
     INFINITE,
     OpenEventW, OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE, STARTUPINFOW, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
+    PROCESS_TERMINATE, ResetEvent, STARTUPINFOW, SYNCHRONIZATION_SYNCHRONIZE, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::core::{HSTRING, PCWSTR, PWSTR};
@@ -138,18 +138,34 @@ impl Event {
     }
 
     pub fn set_existing(name: &str) -> Result<(), String> {
-        // SAFETY: opens and sets an event another process created.
-        unsafe {
-            let h = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(name)).map_err(|e| format!("{name}: {e}"))?;
-            let r = SetEvent(h).map_err(|e| e.to_string());
-            let _ = CloseHandle(h);
-            r
-        }
+        Self::open_for_signal(name)?.signal()
+    }
+
+    pub fn open_for_signal(name: &str) -> Result<Event, String> {
+        // SAFETY: the returned event owns its handle and closes it on drop.
+        unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(name)) }
+            .map(Event)
+            .map_err(|e| format!("{name}: {e}"))
     }
 
     pub fn signal(&self) -> Result<(), String> {
         // SAFETY: the handle is valid while self lives.
         unsafe { SetEvent(self.0) }.map_err(|e| e.to_string())
+    }
+
+    pub fn reset(&self) -> Result<(), String> {
+        // SAFETY: the handle is valid while self lives.
+        unsafe { ResetEvent(self.0) }.map_err(|e| e.to_string())
+    }
+
+    pub fn is_signalled(name: &str) -> bool {
+        // SAFETY: the returned handle, when present, is closed by the owner.
+        unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) }
+            .is_ok_and(|handle| {
+                let event = Self(handle);
+                // SAFETY: the event handle is live and the wait returns immediately.
+                unsafe { WaitForSingleObject(event.0, 0) == WAIT_OBJECT_0 }
+            })
     }
 }
 
