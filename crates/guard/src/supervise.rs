@@ -13,9 +13,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub use launch_timing::FALLBACK_EVENT;
-use crate::switch_events::{EXITING_EXPLORER, RELEASE_EXPLORER, WATCHES_EXPLORER_HANDOFF, switch_event};
+use crate::switch_events::{EXITING_EXPLORER, RELEASE_EXPLORER, WATCHES_EXPLORER_HANDOFF};
 
 enum End {
+    /// The switch began rollback before the supervisor could launch the shell.
+    HandoffAborted,
     /// Something went wrong: explorer takes over and the user is told.
     Problem(String),
     /// Asked for (hotkey, `--fallback`, `--restore`, a clean exit): explorer, no message.
@@ -33,9 +35,14 @@ const RELOAD: u32 = 5;
 const PROBLEM: u32 = 6;
 
 /// `adopt`: the pid of a running explorust whose guard died; it is watched instead of starting one.
-pub fn run(adopt: Option<(u32, Option<String>)>, handoff: Option<u64>) -> u32 {
+pub fn run(adopt: Option<(u32, Option<String>)>, mut rollback: Option<Event>) -> u32 {
+    let live = rollback.is_some();
     let fallback = match Event::named(FALLBACK_EVENT) {
         Ok(e) => e,
+        Err(e) if live => {
+            log::line(&format!("guard: live handoff cannot start without the fallback event: {e}"));
+            return 1;
+        }
         Err(e) => {
             log::line(&format!("guard: {e}; starting explorer"));
             return explorer_forever(None);
@@ -43,10 +50,9 @@ pub fn run(adopt: Option<(u32, Option<String>)>, handoff: Option<u64>) -> u32 {
     };
     // Create the fallback event before checking rollback. A watcher starting recovery can
     // either prevent this start or signal fallback through the event held by this guard.
-    if handoff.is_some_and(|stamp| Event::is_signalled(&switch_event(stamp, "rollback"))) {
+    if rollback.as_ref().is_some_and(Event::signalled) {
         return 1;
     }
-    let live = handoff.is_some();
     hotkey::spawn(fallback.0);
     let exe = shell_exe();
     let build = reg::windows_build();
@@ -96,10 +102,11 @@ pub fn run(adopt: Option<(u32, Option<String>)>, handoff: Option<u64>) -> u32 {
             Some((child, None)) => watch(&child, &fallback, TaskbarWatch::new()),
             None => {
                 attempt += 1;
-                run_once(&exe, attempt, self_test, &build, &fallback, &mut startup)
+                run_once(&exe, attempt, self_test, &build, &fallback, &mut startup, rollback.take())
             }
         };
         let why = match end {
+            End::HandoffAborted => return 1,
             End::Reload => {
                 swap_next(&exe);
                 continue;
@@ -175,7 +182,7 @@ impl PhaseEvents {
     }
 }
 
-fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &Event, startup: &mut SessionStartup) -> End {
+fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &Event, startup: &mut SessionStartup, rollback: Option<Event>) -> End {
     let name = format!(r"Local\explorust-ready-{}-{attempt}", std::process::id());
     let phases = match PhaseEvents::open(&name) {
         Ok(phases) => phases,
@@ -199,6 +206,10 @@ fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &E
         args.push_str(" --self-test");
     }
     let _ = std::fs::remove_file(problem_file());
+    if rollback.is_some_and(|event| event.signalled() || taskbar::explorer_window().is_some()) {
+        log::line("guard: live handoff rolled back before shell launch");
+        return End::HandoffAborted;
+    }
     let child = match Child::spawn(exe, &args) {
         Ok(c) => c,
         Err(e) => return End::Problem(format!("explorust did not start: {e}")),

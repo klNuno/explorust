@@ -18,7 +18,8 @@
 //!   `--machine [--for <sid>]` is its elevated half.
 
 use crate::{account, install, log, manage, proc, reg, reopen, setup, supervise, taskbar, uninstall};
-use crate::switch_events::{GUARD_MUTEX, SWITCH_EXE};
+use crate::proc::Event;
+use crate::switch_events::{GUARD_MUTEX, SWITCH_EXE, switch_event};
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use windows::Win32::System::Threading::CreateMutexW;
@@ -98,6 +99,13 @@ fn run_live() -> u32 {
     let Some(stamp) = args.next().and_then(|stamp| stamp.parse::<u64>().ok()) else {
         return 2;
     };
+    let rollback = match Event::open_for_wait(&switch_event(stamp, "rollback")) {
+        Ok(event) => event,
+        Err(error) => {
+            log::line(&format!("guard: live handoff event unavailable: {error}"));
+            return 1;
+        }
+    };
     let switch = install::dir().join(SWITCH_EXE);
     if install::elevated()
         || !account::is_session_user()
@@ -110,10 +118,10 @@ fn run_live() -> u32 {
         log::line("guard: live handoff requires the installed switch worker and a free desktop");
         return 1;
     }
-    run_shell(None, Some(stamp))
+    run_shell(None, Some((stamp, rollback)))
 }
 
-fn run_shell(adopt: Option<(u32, Option<String>)>, handoff: Option<u64>) -> u32 {
+fn run_shell(adopt: Option<(u32, Option<String>)>, handoff: Option<(u64, Event)>) -> u32 {
     // SAFETY: one guard per session; the last-error value is read immediately after creation.
     let handle = match unsafe { CreateMutexW(None, false, &HSTRING::from(GUARD_MUTEX)) } {
         Ok(handle) => handle,
@@ -129,16 +137,16 @@ fn run_shell(adopt: Option<(u32, Option<String>)>, handoff: Option<u64>) -> u32 
         log::line("another guard runs in this session: exiting");
         return 0;
     }
-    if let Some(stamp) = handoff {
+    if let Some((stamp, _)) = &handoff {
         let Some(guard) = reopen::guard_stamp(std::process::id()) else {
             log::line("guard: could not identify this supervisor for the Files handoff");
             return 1;
         };
         let dir = log::dir();
-        if let Err(error) = reopen::take(&dir, stamp).and_then(|folders| reopen::save(&dir, guard, &folders)) {
+        if let Err(error) = reopen::take(&dir, *stamp).and_then(|folders| reopen::save(&dir, guard, &folders)) {
             log::line(&format!("guard: could not transfer the Files handoff: {error}"));
             return 1;
         }
     }
-    supervise::run(adopt, handoff)
+    supervise::run(adopt, handoff.map(|(_, rollback)| rollback))
 }

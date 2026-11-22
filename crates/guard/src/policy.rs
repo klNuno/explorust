@@ -83,10 +83,10 @@ pub enum Recovery {
     Start,
 }
 
-pub fn recovery_step(replacement: Option<u32>, taskbar_present: bool, guard_waiting: bool) -> Recovery {
+pub fn recovery_step(replacement: Option<u32>, taskbar_present: bool, launch_pending: bool) -> Recovery {
     if let Some(pid) = replacement {
         Recovery::Ready(pid)
-    } else if taskbar_present || guard_waiting {
+    } else if taskbar_present || launch_pending {
         Recovery::Wait
     } else {
         Recovery::Start

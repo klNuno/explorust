@@ -191,6 +191,7 @@ fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
     let retiring_pid = retiring.map(|process| process.pid);
     let started = Instant::now();
     let mut requested = false;
+    let mut launched = false;
     loop {
         let ready = taskbar::explorer_except(retiring_pid);
         // A live switch starts its new guard only after the old process exits. If the
@@ -201,25 +202,26 @@ fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
             && retiring.is_none_or(proc::Child::ended)
             && proc::Event::set_existing(supervise::FALLBACK_EVENT).is_ok();
         requested |= guard_waiting;
-        match recovery_step(ready, taskbar::any(), guard_waiting) {
+        // Explorer can forward the request to another process and leave before the tray is up.
+        match recovery_step(ready, taskbar::any(), guard_waiting || launched) {
+            Recovery::Ready(pid) if launched => return Ok(format!("replacement Explorer taskbar answers (pid {pid})")),
             Recovery::Ready(pid) if requested => return Ok(format!("the guard brought explorer back (pid {pid})")),
             Recovery::Ready(pid) => return Ok(format!("explorer's taskbar already answers (pid {pid})")),
-            Recovery::Start => break,
-            Recovery::Wait if started.elapsed() >= Duration::from_secs(45) => {
+            _ if started.elapsed() >= Duration::from_secs(45) => {
                 return Err("no replacement Explorer taskbar is answering after 45 s".into());
             }
-            Recovery::Wait => std::thread::sleep(Duration::from_millis(200)),
+            Recovery::Start if !taskbar::any() => {
+                // Explorer must run unelevated as the shell.
+                if install::elevated() {
+                    return Err("no shell runs: start explorer.exe from Task Manager".into());
+                }
+                let child = proc::Child::spawn(&supervise::explorer_path(), "")
+                    .map_err(|e| format!("explorer did not start: {e}"))?;
+                say(&format!("restore: started Explorer pid {} and waiting for its taskbar", child.pid));
+                launched = true;
+            }
+            Recovery::Start | Recovery::Wait => std::thread::sleep(Duration::from_millis(200)),
         }
-    }
-    // Explorer must run unelevated as the shell.
-    if install::elevated() {
-        return Err("no shell runs: start explorer.exe from Task Manager".into());
-    }
-    let child = proc::Child::spawn(&supervise::explorer_path(), "")
-        .map_err(|e| format!("explorer did not start: {e}"))?;
-    match taskbar::wait_explorer_except(&child, Duration::from_secs(45), retiring_pid) {
-        taskbar::Start::Up(pid) => Ok(format!("explorer started (pid {pid})")),
-        _ => Err("explorer started but its taskbar did not come".into()),
     }
 }
 

@@ -166,14 +166,20 @@ impl Event {
         unsafe { ResetEvent(self.0) }.map_err(|e| e.to_string())
     }
 
-    pub fn is_signalled(name: &str) -> bool {
+    pub fn open_for_wait(name: &str) -> Result<Event, String> {
         // SAFETY: the returned handle, when present, is closed by the owner.
         unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) }
-            .is_ok_and(|handle| {
-                let event = Self(handle);
-                // SAFETY: the event handle is live and the wait returns immediately.
-                unsafe { WaitForSingleObject(event.0, 0) == WAIT_OBJECT_0 }
-            })
+            .map(Event)
+            .map_err(|e| format!("{name}: {e}"))
+    }
+
+    pub fn signalled(&self) -> bool {
+        // SAFETY: the event handle is live and the wait returns immediately.
+        unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+    }
+
+    pub fn is_signalled(name: &str) -> bool {
+        Self::open_for_wait(name).is_ok_and(|event| event.signalled())
     }
 }
 

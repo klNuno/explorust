@@ -114,14 +114,10 @@ pub enum Start {
 
 /// Waits for a freshly started explorer to own an answering taskbar.
 pub fn wait_explorer(child: &Child, limit: Duration) -> Start {
-    wait_explorer_except(child, limit, None)
-}
-
-pub fn wait_explorer_except(child: &Child, limit: Duration, retiring: Option<u32>) -> Start {
     let t0 = Instant::now();
     let mut ended: Option<Instant> = None;
     loop {
-        if let Some(pid) = explorer_except(retiring) {
+        if let Some(pid) = explorer() {
             return Start::Up(pid);
         }
         if ended.is_none() && child.ended() {
