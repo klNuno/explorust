@@ -191,6 +191,9 @@ fn switch(
         Err(e) => {
             log::line(&format!("switch: {e}"));
             if let Err(e) = watcher.restore() {
+                if !watcher.exit_requested() {
+                    return Err("the switch stopped while preparing Explorer".into());
+                }
                 log::line(&format!("switch: {e}; restoring Windows directly"));
                 watcher.recover(exe, &explorer_process)?;
             }

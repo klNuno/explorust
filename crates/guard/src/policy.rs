@@ -83,10 +83,10 @@ pub enum Recovery {
     Start,
 }
 
-pub fn recovery_step(replacement: Option<u32>, retiring_has_tray: bool, guard_waiting: bool) -> Recovery {
+pub fn recovery_step(replacement: Option<u32>, taskbar_present: bool, guard_waiting: bool) -> Recovery {
     if let Some(pid) = replacement {
         Recovery::Ready(pid)
-    } else if retiring_has_tray || guard_waiting {
+    } else if taskbar_present || guard_waiting {
         Recovery::Wait
     } else {
         Recovery::Start
@@ -116,6 +116,14 @@ mod tests {
     fn recovery_starts_directly_when_the_signalled_guard_disappears() {
         assert_eq!(recovery_step(None, false, true), Recovery::Wait);
         assert_eq!(recovery_step(None, false, false), Recovery::Start);
+    }
+
+    #[test]
+    fn recovery_waits_for_adoption_when_the_shell_still_owns_the_taskbar() {
+        assert_eq!(recovery_step(None, true, true), Recovery::Wait);
+        assert_eq!(recovery_step(None, true, false), Recovery::Wait);
+        assert_eq!(recovery_step(None, true, true), Recovery::Wait);
+        assert_eq!(recovery_step(Some(42), false, true), Recovery::Ready(42));
     }
 
     fn secs(n: u64) -> Duration {

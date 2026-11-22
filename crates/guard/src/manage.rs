@@ -4,10 +4,10 @@
 //! signed-in user's own process). The order keeps a way back at every step: on install, the Apps
 //! entry exists before the Shell value; on removal, the Shell value is gone before any file.
 
+use crate::policy::{Recovery, recovery_step};
 use crate::{account, apps, folders, install, log, package, proc, reg, supervise, taskbar};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use crate::policy::{Recovery, recovery_step};
 
 /// Exit codes shared by `--install`, `--setup` and `--uninstall`.
 pub const FAILED: u32 = 1;
@@ -193,21 +193,15 @@ fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
     let mut requested = false;
     loop {
         let ready = taskbar::explorer_except(retiring_pid);
-        let retiring_tray = retiring_pid.is_some_and(taskbar::owns_tray);
-        // Do not keep the event open here. Its disappearance means the guard exited and we
-        // must start Windows directly, even if the guard accepted a fallback signal earlier.
         // A live switch starts its new guard only after the old process exits. If the
         // process remains without its taskbar, any guard is still waiting on the old desktop.
-        let prior_guard = retiring.is_some_and(|process| !process.ended());
-        let guard_waiting = if ready.is_some() || retiring_tray || prior_guard {
-            false
-        } else if requested {
-            proc::Event::open_for_signal(supervise::FALLBACK_EVENT).is_ok()
-        } else {
-            requested = proc::Event::set_existing(supervise::FALLBACK_EVENT).is_ok();
-            requested
-        };
-        match recovery_step(ready, retiring_tray, guard_waiting) {
+        // Reopen and signal the event on each poll. A replacement guard can publish a new
+        // event while its adopted taskbar still owns the desktop.
+        let guard_waiting = ready.is_none()
+            && retiring.is_none_or(proc::Child::ended)
+            && proc::Event::set_existing(supervise::FALLBACK_EVENT).is_ok();
+        requested |= guard_waiting;
+        match recovery_step(ready, taskbar::any(), guard_waiting) {
             Recovery::Ready(pid) if requested => return Ok(format!("the guard brought explorer back (pid {pid})")),
             Recovery::Ready(pid) => return Ok(format!("explorer's taskbar already answers (pid {pid})")),
             Recovery::Start => break,
@@ -216,11 +210,6 @@ fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
             }
             Recovery::Wait => std::thread::sleep(Duration::from_millis(200)),
         }
-    }
-    if taskbar::any() {
-        return taskbar::explorer_except(retiring_pid)
-            .map(|pid| format!("explorer's taskbar already answers (pid {pid})"))
-            .ok_or_else(|| "a taskbar runs without its guard: sign out and in again to finish".into());
     }
     // Explorer must run unelevated as the shell.
     if install::elevated() {
