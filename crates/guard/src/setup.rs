@@ -5,7 +5,7 @@
 //! refuses: that account's settings would change instead of the signed-in user's.
 
 use crate::ui::{self, Icon, tr};
-use crate::launch_timing::{FALLBACK_EVENT, RELOAD_EVENT, build_verdict_event, reload_preserves_files_event};
+use crate::launch_timing::{FALLBACK_EVENT, RELOAD_EVENT, build_verdict_event, reload_postponed_event, reload_preserves_files_event};
 use crate::manage::OTHER_ACCOUNT;
 use crate::proc::Event;
 use crate::setup_mode::{self, Mode, Restart, RestartProgress};
@@ -156,6 +156,15 @@ fn finish_live_update(exe: &Path, pid: u32) -> u32 {
             ),
             None,
         ),
+        Restart::Postponed => ui::tell(
+            Icon::Info,
+            tr("Redémarrage d'explorust reporté", "explorust restart postponed"),
+            tr(
+                "Une opération de fichiers est toujours en cours. La nouvelle version démarrera à la prochaine ouverture de session. Vous pouvez aussi relancer l'installeur une fois l'opération terminée.",
+                "A file operation is still running. The new version will start at the next sign-in. You can also run the installer again after the operation finishes.",
+            ),
+            None,
+        ),
         Restart::Unconfirmed => ui::tell(
             Icon::Warning,
             tr("Redémarrage d'explorust non confirmé", "Could not confirm explorust restarted"),
@@ -172,6 +181,11 @@ fn reload(exe: &Path, original: u32) -> Restart {
     if let Some(pid) = shell {
         // The guard keeps running its previous image until the next sign-in. It starts the new
         // explorust.exe in the same session once the old shell exits with the reload code.
+        if let Ok(event) = Event::open_for_signal(&reload_postponed_event(pid))
+            && let Err(error) = event.reset()
+        {
+            log::line(&format!("setup: could not clear the earlier reload outcome: {error}"));
+        }
         if let Err(error) = Event::set_existing(RELOAD_EVENT) {
             log::line(&format!("setup: could not request reload of pid {pid}: {error}"));
         } else {
@@ -199,6 +213,7 @@ fn wait_for_restart(exe: &Path, previous: u32) -> Restart {
                 Restart::Updated(pid) => log::line(&format!("setup: new explorust pid {pid} passed the build verdict and owns an answering taskbar (was {previous})")),
                 Restart::Windows(pid) => log::line(&format!("setup: Windows took over (explorer pid {pid})")),
                 Restart::Deferred => log::line(&format!("setup: reload still pending after {} s with the original shell pid {previous}", elapsed.as_secs())),
+                Restart::Postponed => log::line(&format!("setup: shell pid {previous} postponed the reload while a file operation was still running")),
                 Restart::Unconfirmed => log::line(&format!("setup: restart could not be confirmed within {} s", elapsed.as_secs())),
             }
             return outcome;
@@ -215,6 +230,9 @@ fn restart_progress(exe: &Path, previous: u32) -> RestartProgress {
         return RestartProgress::Missing;
     }
     if taskbar::owns_tray(previous) {
+        if Event::is_signalled(&reload_postponed_event(previous)) && !Event::is_signalled(RELOAD_EVENT) {
+            return RestartProgress::DrainCancelled;
+        }
         return RestartProgress::OldShell;
     }
     let Some(pid) = taskbar::explorust(exe).filter(|&pid| pid != previous) else {

@@ -9,6 +9,7 @@ const MISSING_TRAY_LIMIT: Duration = Duration::from_secs(60);
 pub enum RestartProgress {
     OldShell,
     Starting,
+    DrainCancelled,
     Verified(u32),
     Windows(u32),
     Missing,
@@ -19,6 +20,7 @@ pub enum Restart {
     Updated(u32),
     Windows(u32),
     Deferred,
+    Postponed,
     Unconfirmed,
 }
 
@@ -26,6 +28,7 @@ pub fn restart_outcome(progress: RestartProgress, elapsed: Duration, without_tra
     match progress {
         RestartProgress::Windows(pid) => Some(Restart::Windows(pid)),
         RestartProgress::Verified(pid) => Some(Restart::Updated(pid)),
+        RestartProgress::DrainCancelled => Some(Restart::Postponed),
         RestartProgress::OldShell if elapsed >= RESTART_LIMIT => Some(Restart::Deferred),
         _ if elapsed >= RESTART_LIMIT => Some(Restart::Unconfirmed),
         RestartProgress::Missing if without_tray >= MISSING_TRAY_LIMIT => Some(Restart::Unconfirmed),
@@ -51,6 +54,11 @@ pub fn choose(installed: bool, shell_pid: Option<u32>, reload: bool, guarded: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancelled_drain_reports_postponement_immediately() {
+        assert_eq!(restart_outcome(RestartProgress::DrainCancelled, Duration::from_secs(120), Duration::ZERO), Some(Restart::Postponed));
+    }
 
     #[test]
     fn a_file_drain_cannot_keep_the_installer_open_indefinitely() {

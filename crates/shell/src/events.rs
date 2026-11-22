@@ -1,7 +1,7 @@
 //! Named events: the ready signal the guard waits for and the quit request of `--quit`.
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, EVENT_MODIFY_STATE, OpenEventW, ResetEvent, SetEvent, WaitForSingleObject};
 use windows::Win32::System::Threading::SYNCHRONIZATION_SYNCHRONIZE;
 use windows::core::HSTRING;
 
@@ -50,6 +50,11 @@ impl Owned {
     pub fn signal(&self) -> Result<(), String> {
         // SAFETY: the handle is valid while self lives.
         unsafe { SetEvent(self.0) }.map_err(|e| e.to_string())
+    }
+
+    pub fn reset(&self) -> Result<(), String> {
+        // SAFETY: the handle is valid while self lives.
+        unsafe { ResetEvent(self.0) }.map_err(|e| e.to_string())
     }
 }
 

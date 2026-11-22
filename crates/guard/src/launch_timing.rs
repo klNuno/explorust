@@ -10,6 +10,10 @@ pub fn reload_preserves_files_event(pid: u32) -> String {
     format!(r"Local\explorust-reload-preserves-files-{pid}")
 }
 
+pub fn reload_postponed_event(pid: u32) -> String {
+    format!(r"Local\explorust-reload-postponed-{pid}")
+}
+
 /// The build verdict addressed by shell PID, so setup need not know the guard's launch attempt.
 pub fn build_verdict_event(pid: u32) -> String {
     format!(r"Local\explorust-build-verified-{pid}")

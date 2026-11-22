@@ -3,6 +3,7 @@
 
 use super::{clipboard, inbox::Inbox, log, shell::{self, Pidl}};
 use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicUsize, Ordering}};
+use std::time::Duration;
 use windows::Win32::Foundation::{ERROR_TIMEOUT, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::UI::Shell::SHMultiFileProperties;
@@ -71,14 +72,20 @@ impl Drop for Mutation {
 }
 
 /// Run outside all Files STAs so their message pumps keep servicing clipboard and operation calls.
-pub fn drain_for_reload() {
+pub fn drain_for_reload(limit: Duration) -> bool {
     let mut drain = DRAIN.lock().unwrap();
     drain.sealed = true;
-    if drain.pending != 0 {
-        log::line(&format!("reload: waiting for {} accepted file operations", drain.pending));
-        drop(DRAINED.wait_while(drain, |state| state.pending != 0).unwrap());
-        log::line("reload: accepted file operations finished");
+    if drain.pending == 0 {
+        return true;
     }
+    log::line(&format!("reload: waiting for {} accepted file operations", drain.pending));
+    let (mut drain, _) = DRAINED.wait_timeout_while(drain, limit, |state| state.pending != 0).unwrap();
+    if drain.pending != 0 {
+        drain.sealed = false;
+        return false;
+    }
+    log::line("reload: accepted file operations finished");
+    true
 }
 
 pub struct Worker {
@@ -291,7 +298,7 @@ fn perform(owner: HWND, job: Job) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf, time::{Duration, Instant}};
+    use std::{fs, path::PathBuf, time::Instant};
 
     struct Fixture(PathBuf);
 
@@ -325,9 +332,12 @@ mod tests {
         drop(worker);
         drop(frame);
 
+        assert!(!drain_for_reload(Duration::ZERO));
+        drop(Mutation::accept().expect("a cancelled reload must accept new file operations"));
+
         let (done, drained) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            drain_for_reload();
+            assert!(drain_for_reload(Duration::from_secs(10)));
             // Reopen the static test process's gate for other tests.
             DRAIN.lock().unwrap().sealed = false;
             done.send(()).unwrap();

@@ -15,6 +15,7 @@ pub const SELF_TEST_FAILED: i32 = 4;
 pub const RELOAD: i32 = 5;
 /// A problem found inside (`problem`): the guard starts explorer.exe and tells the user.
 pub const PROBLEM: i32 = 6;
+const FILE_DRAIN_LIMIT: Duration = Duration::from_secs(120);
 struct Args {
     ready_event: Option<String>,
     staged_ready: bool,
@@ -98,7 +99,10 @@ fn shell(args: &Args) -> i32 {
             return HOST_FAILED;
         }
     };
-    let exits = ExitRequests { quit, reload };
+    let postponed = events::Owned::create(&launch_timing::reload_postponed_event(std::process::id()))
+        .inspect_err(|error| log::line(&format!("reload postponed event: {error}")))
+        .ok();
+    let exits = ExitRequests { quit, reload, postponed };
     let _reload_capability = events::Owned::create(&launch_timing::reload_preserves_files_event(std::process::id()))
         .inspect_err(|error| log::line(&format!("reload capability: {error}")))
         .ok();
@@ -253,6 +257,7 @@ fn signal(event: &events::Owned, phase: &str) -> bool {
 struct ExitRequests {
     quit: events::Owned,
     reload: events::Owned,
+    postponed: Option<events::Owned>,
 }
 
 impl ExitRequests {
@@ -299,8 +304,7 @@ impl ExitRequests {
             log::line("quit requested");
             CLEAN
         } else if self.reload.wait(0) {
-            log::line("reload requested");
-            RELOAD
+            return self.try_reload();
         } else if let Some(why) = problem::take() {
             log::line(&format!("stopping on a problem: {why}"));
             PROBLEM
@@ -309,13 +313,25 @@ impl ExitRequests {
         };
         Some(shutdown(code))
     }
-}
 
-fn shutdown(code: i32) -> i32 {
-    let folders = (code == RELOAD).then(files::prepare_reload);
-    keyhost::stop();
-    components::shutdown_all();
-    if let Some(folders) = folders {
+    fn try_reload(&self) -> Option<i32> {
+        log::line("reload requested");
+        if let Some(event) = &self.postponed
+            && let Err(error) = event.reset()
+        {
+            log::line(&format!("reset reload postponed event: {error}"));
+        }
+        let Some(folders) = files::prepare_reload(FILE_DRAIN_LIMIT) else {
+            log::line("reload postponed: accepted file operations still running");
+            if let Err(error) = self.reload.reset() {
+                log::line(&format!("reset reload event: {error}"));
+            }
+            if let Some(event) = &self.postponed {
+                signal(event, "reload postponed");
+            }
+            return None;
+        };
+        let code = shutdown(RELOAD);
         if let Some(guard) = reopen::guard_stamp(guardwatch::pid()) {
             match reopen::save(&log::dir(), guard, &folders) {
                 Ok(()) if !folders.is_empty() => log::line(&format!("reload: saved {} Files windows", folders.len())),
@@ -323,7 +339,14 @@ fn shutdown(code: i32) -> i32 {
                 Err(error) => log::line(&format!("reload: could not save Files windows: {error}")),
             }
         }
-    } else {
+        Some(code)
+    }
+}
+
+fn shutdown(code: i32) -> i32 {
+    keyhost::stop();
+    components::shutdown_all();
+    if code != RELOAD {
         minimized::restore();
     }
     code

@@ -22,7 +22,7 @@ use crate::handover;
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, Weak};
 use views::{Destination, Open, Windows};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::*;
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
@@ -41,10 +41,12 @@ thread_local! {
 
 static RUNNING: Mutex<Weak<Windows>> = Mutex::new(Weak::new());
 
-pub fn prepare_reload() -> Vec<String> {
-    operations::drain_for_reload();
+pub fn prepare_reload(limit: Duration) -> Option<Vec<String>> {
+    if !operations::drain_for_reload(limit) {
+        return None;
+    }
     let windows = RUNNING.lock().unwrap().upgrade();
-    windows.map(|windows| windows.folders_for_reload()).unwrap_or_default()
+    Some(windows.map(|windows| windows.folders_for_reload()).unwrap_or_default())
 }
 
 pub fn reopen_folders(folders: Vec<String>) {
