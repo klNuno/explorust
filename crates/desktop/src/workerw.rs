@@ -15,25 +15,29 @@
 //! last (bottom) child.
 //!
 //! Here the DefView is opaque (alpha 255, the list view paints the wallpaper as its background)
-//! until the desktop is raised; then it is color-keyed (the list view background is `KEY`) and the
-//! WorkerW paints the wallpaper. Key-colored pixels let the mouse through, so WorkerW forwards
-//! its mouse messages to the list view. A wallpaper child retains its own input and the desktop
-//! also gets a right-click on blank background over that child.
+//! until the desktop is raised; then the WorkerW paints the wallpaper. With icons shown the
+//! DefView is color-keyed (the list view background is `KEY`). With icons hidden the list view
+//! cannot paint that key, so the whole DefView is transparent. WorkerW forwards mouse messages
+//! that pass through the view. A wallpaper child retains its own input and the desktop also gets
+//! a right-click on blank background over that child.
 
+use crate::view_layer::{ViewLayer, view_layer};
 use crate::{log, progman, screen};
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetClipBox, InvalidateRect, MapWindowPoints, PAINTSTRUCT, HDC};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW, HWND_BOTTOM,
-    IDC_ARROW, LWA_ALPHA, LWA_COLORKEY, LoadCursorW, RegisterClassExW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SendMessageW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, WINDOWPOS,
-    WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_PRINTCLIENT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_WINDOWPOSCHANGING, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, CS_DBLCLKS,
-    WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_VISIBLE,
+    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, GWL_EXSTYLE, GWL_STYLE,
+    GetClientRect, GetWindowLongPtrW, HWND_BOTTOM, IDC_ARROW, LWA_ALPHA, LWA_COLORKEY, LoadCursorW,
+    RegisterClassExW, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SendMessageW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, WINDOWPOS, WM_ERASEBKGND,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WM_XBUTTONDBLCLK,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_VISIBLE,
 };
 use windows_core::{PCWSTR, w};
 
@@ -61,23 +65,53 @@ pub fn supported() -> bool {
     ok && (v.dwMajorVersion, v.dwMinorVersion) >= (6, 3)
 }
 
-/// Makes the DefView a layered child: opaque, or color-keyed once raised.
+/// Makes the DefView a layered child and follows live icon visibility once raised.
 pub fn layer_view(dv: HWND, raised: bool) -> bool {
+    let layered = apply_view_layer(dv, raised);
+    if layered && raised
+        && let Some(list) = folder_view(dv)
+        // SAFETY: the list view and its parent belong to this thread.
+        && !unsafe { SetWindowSubclass(list, Some(icon_visibility), 0, dv.0 as usize) }.as_bool()
+    {
+        log::line("DefView: could not track desktop icon visibility");
+    }
+    layered
+}
+
+fn apply_view_layer(dv: HWND, raised: bool) -> bool {
     // SAFETY: style and layering of the view window this thread created.
     unsafe {
         let ex = GetWindowLongPtrW(dv, GWL_EXSTYLE);
         if ex & WS_EX_LAYERED.0 as isize == 0 {
             SetWindowLongPtrW(dv, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
         }
-        let ok = if raised {
-            SetLayeredWindowAttributes(dv, KEY, 0, LWA_COLORKEY)
-        } else {
-            SetLayeredWindowAttributes(dv, COLORREF(0), 255, LWA_ALPHA)
-        }
-        .is_ok();
+        let layer = view_layer(raised, folder_view(dv).is_some_and(icons_visible));
+        let (color, alpha, flags) = match layer {
+            ViewLayer::Opaque => (COLORREF(0), 255, LWA_ALPHA),
+            ViewLayer::ColorKey => (KEY, 0, LWA_COLORKEY),
+            ViewLayer::Transparent => (COLORREF(0), 0, LWA_ALPHA),
+        };
+        let ok = SetLayeredWindowAttributes(dv, color, alpha, flags).is_ok();
         let layered = GetWindowLongPtrW(dv, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize != 0;
-        log::line(&format!("DefView layered {layered} (attributes {ok}), raised {raised}"));
+        log::line(&format!("DefView layered {layered} (attributes {ok}), raised {raised}, {layer:?}"));
         layered && ok
+    }
+}
+
+unsafe extern "system" fn icon_visibility(
+    list: HWND, msg: u32, wp: WPARAM, lp: LPARAM, id: usize, data: usize,
+) -> LRESULT {
+    // SAFETY: WM_WINDOWPOSCHANGED carries a live WINDOWPOS and the subclass owns this list view.
+    unsafe {
+        if msg == WM_WINDOWPOSCHANGED {
+            let flags = (*(lp.0 as *const WINDOWPOS)).flags;
+            if flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW) != Default::default() {
+                apply_view_layer(HWND(data as _), true);
+            }
+        } else if msg == WM_NCDESTROY {
+            let _ = RemoveWindowSubclass(list, Some(icon_visibility), id);
+        }
+        DefSubclassProc(list, msg, wp, lp)
     }
 }
 
@@ -132,7 +166,15 @@ pub fn repaint_list() {
 }
 
 fn list_view() -> Option<HWND> {
-    let dv = progman::defview()?;
+    folder_view(progman::defview()?)
+}
+
+fn icons_visible(list: HWND) -> bool {
+    // SAFETY: queries the list's own visibility bit, even while Progman is still being shown.
+    unsafe { GetWindowLongPtrW(list, GWL_STYLE) & WS_VISIBLE.0 as isize != 0 }
+}
+
+fn folder_view(dv: HWND) -> Option<HWND> {
     // SAFETY: a child lookup in this thread's view window.
     unsafe { FindWindowExW(Some(dv), None, w!("SysListView32"), None) }.ok()
 }
@@ -181,7 +223,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             Some(LRESULT(0))
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-            let lv = list_view()?;
+            let lv = list_view().filter(|&list| icons_visible(list))?;
             // SAFETY: same-thread message to the list view; wheel points are in screen pixels.
             Some(unsafe { SendMessageW(lv, msg, Some(wp), Some(lp)) })
         }
@@ -196,8 +238,17 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
 }
 
 fn forward_mouse(from: HWND, msg: u32, wp: WPARAM, pt: POINT) -> Option<LRESULT> {
-    let lv = list_view()?;
+    let dv = progman::defview()?;
+    let list = folder_view(dv);
     let mut pt = [pt];
+    let Some(lv) = list.filter(|&list| icons_visible(list)) else {
+        if msg == WM_RBUTTONUP {
+            // SAFETY: maps the point to screen coordinates for WM_CONTEXTMENU.
+            unsafe { MapWindowPoints(Some(from), None, &mut pt) };
+            input::background_menu(dv, list, input::pack(pt[0]));
+        }
+        return Some(LRESULT(0));
+    };
     // SAFETY: maps one point to the list view and sends a mouse message to this thread's window.
     unsafe {
         MapWindowPoints(Some(from), Some(lv), &mut pt);

@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_BOTTOM, IDC_ARROW, IsWindow, LoadCursorW, MSG, MoveWindow, PostQuitMessage, RegisterClassExW, SPI_SETDESKWALLPAPER,
     SPI_SETWORKAREA, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetWindowPos,
     ShowWindow, TranslateMessage, UnregisterClassW, WA_INACTIVE, WINDOWPOS, WM_ACTIVATE, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYFIRST, WM_KEYLAST, WM_PAINT, WM_PRINTCLIENT, WM_SETFOCUS, WM_SETTINGCHANGE,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYFIRST, WM_KEYLAST, WM_MOUSEACTIVATE, WM_PAINT, WM_PRINTCLIENT, WM_SETFOCUS, WM_SETTINGCHANGE,
     WM_SIZE, WM_SYSCOLORCHANGE, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
@@ -291,6 +291,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             raise(hwnd, wp, lp);
             Some(LRESULT(0))
         }
+        WM_MOUSEACTIVATE => with(|s| s.wallpaper_input.as_ref()?.right_click_activation(lp)).flatten(),
         workerw::input::MSG_RIGHT => {
             if let (Some(view), Some(worker)) = (defview(), with(|s| s.wallpaper_input.as_ref().and(s.workerw)).flatten()) {
                 workerw::input::right_click(hwnd, view, worker, lp);
