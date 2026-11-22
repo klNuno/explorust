@@ -25,8 +25,8 @@ fn say(msg: &str) {
 /// `--install`: elevated, the machine part then this user's; not elevated (a dev run), only the
 /// Shell value pointing to this exe.
 pub fn install() -> u32 {
-    let lock = match install::lock() {
-        Ok(l) => l,
+    let _switch = match install::switch_lock_for(0) {
+        Ok(lock) => lock,
         Err(e) => {
             say(&format!("install: {e}"));
             return BUSY;
@@ -45,6 +45,17 @@ pub fn install() -> u32 {
         say("install: elevated as another account; sign in with an administrator account and install from there");
         return OTHER_ACCOUNT;
     }
+    let lock = if elevated {
+        match install::lock() {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                say(&format!("install: {e}"));
+                return BUSY;
+            }
+        }
+    } else {
+        None
+    };
     // Anything already there (even a damaged install other accounts may use) is not undone on a
     // failure: only a machine with no trace of explorust is.
     let fresh = !install::dir().exists() && !reg::has_uninstall_entry() && reg::machine_users().is_empty();
@@ -148,7 +159,6 @@ pub fn restore_session() -> (Result<String, String>, Result<String, String>) {
         say("restore: requested Windows desktop and waiting for pending handoffs");
         let locks = crate::policy::lock_for_restore(
             install::switch_lock_for,
-            install::lock_for,
             install::recovery_lock_for,
         )?;
         Ok((cancel, locks))

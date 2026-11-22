@@ -97,9 +97,7 @@ fn windows(class: PCWSTR) -> Vec<(HWND, u32)> {
     entries
 }
 
-pub fn file_operations() -> bool {
-    !windows(w!("OperationStatusWindow")).is_empty()
-}
+pub use guard::taskbar::explorer_file_operations as file_operations;
 
 pub fn folder_windows() -> Vec<(isize, u32)> {
     windows(w!("CabinetWClass"))

@@ -78,7 +78,11 @@ pub fn explorer_except(retiring: Option<u32>) -> Option<u32> {
 }
 
 pub fn explorer_window() -> Option<(HWND, u32)> {
-    trays().into_iter().find(|(_, pid)| is_explorer(*pid))
+    explorer_window_except(None)
+}
+
+pub fn explorer_window_except(excluded: Option<u32>) -> Option<(HWND, u32)> {
+    trays().into_iter().find(|(_, pid)| Some(*pid) != excluded && is_explorer(*pid))
 }
 
 pub fn explorer_window_for(pid: u32) -> Option<HWND> {
@@ -120,15 +124,22 @@ pub fn any() -> bool {
     !trays().is_empty()
 }
 
-pub fn recovery_tray(launched: Option<u32>) -> RecoveryTray {
+pub fn recovery_tray(replacement: Option<u32>) -> RecoveryTray {
     let trays = trays();
     if trays.is_empty() {
         RecoveryTray::Missing
-    } else if trays.iter().all(|&(_, owner)| Some(owner) == launched) {
-        RecoveryTray::Launched
+    } else if let Some(pid) = replacement
+        && trays.iter().all(|&(_, owner)| owner == pid)
+    {
+        RecoveryTray::Replacement(pid)
     } else {
         RecoveryTray::Other
     }
+}
+
+pub fn explorer_file_operations() -> bool {
+    // SAFETY: this is only a lookup on the current desktop.
+    unsafe { FindWindowExW(None, None, w!("OperationStatusWindow"), None).is_ok() }
 }
 
 pub enum Start {

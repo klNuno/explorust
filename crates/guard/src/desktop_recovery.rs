@@ -12,7 +12,6 @@ const RETIRING_EXPLORER_GRACE: Duration = Duration::from_secs(10);
 pub struct ExplorerExit<'a> {
     pub process: &'a Child,
     pub state: ExitState,
-    pub file_operations: fn() -> bool,
     pub repost: &'a mut dyn FnMut(usize) -> Result<bool, String>,
 }
 
@@ -30,6 +29,7 @@ pub fn restore_desktop(
     let mut recovery = ExplorerRecovery::default();
     let mut requested = false;
     let mut launch: Option<Child> = None;
+    let mut replacement: Option<Child> = None;
     let mut last_error = None;
     let mut orphan: Option<(u32, Instant)> = None;
     let mut watching_original = false;
@@ -45,9 +45,9 @@ pub fn restore_desktop(
             Some(_) => OriginalTray::Present,
             None => OriginalTray::Missing,
         };
-        let file_operations = original.is_some_and(|exit| (exit.file_operations)());
+        let file_operations = taskbar::explorer_file_operations();
         let tray_gone_grace_elapsed = if retiring.is_some()
-            && state == ExitState::Posted && original_tray == OriginalTray::Missing && !file_operations
+            && original_tray == OriginalTray::Missing && !file_operations
         {
             original_missing_since.get_or_insert_with(Instant::now).elapsed() >= RETIRING_EXPLORER_GRACE
         } else {
@@ -101,12 +101,10 @@ pub fn restore_desktop(
                 continue;
             }
             DesktopAction::StopRetiringExplorer => {
-                if let Some(exit) = original {
-                    match stop_retiring_explorer(exit) {
-                        Ok(true) => recovery = ExplorerRecovery::default(),
-                        Ok(false) => {}
-                        Err(error) => log::line(&format!("restore: {error}")),
-                    }
+                if let Some(exit) = original
+                    && let Err(error) = stop_retiring_explorer(exit)
+                {
+                    log::line(&format!("restore: {error}"));
                 }
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
@@ -145,10 +143,21 @@ pub fn restore_desktop(
             DesktopAction::WaitForAdoption | DesktopAction::Restore => {}
         }
 
-        let launched = launch.as_ref().map(|child| child.pid);
-        let tray = taskbar::recovery_tray(launched);
+        // Explorer can hand the launch to an existing process. Only consider an actual
+        // Windows Explorer tray that appeared after we started a recovery launch.
+        let owner = if launch.is_some() {
+            taskbar::explorer_window_except(retiring).map(|(_, pid)| pid)
+        } else {
+            None
+        };
+        if replacement.as_ref().is_some_and(Child::ended)
+            || replacement.as_ref().map(|child| child.pid) != owner
+        {
+            replacement = owner.and_then(|pid| Child::monitor(pid).ok());
+        }
+        let tray = taskbar::recovery_tray(replacement.as_ref().map(|child| child.pid));
         let blocked = decision != DesktopAction::Restore;
-        match recovery.step(started.elapsed(), tray, blocked, launch.as_ref().is_none_or(Child::ended)) {
+        match recovery.step(started.elapsed(), tray, blocked, launch.as_ref().is_none_or(Child::ended), file_operations) {
             Recovery::Exhausted if keep_trying => {
                 if !blocked && tray != RecoveryTray::Other {
                     // Keep the launcher handle so the next attempt can stop its hung process.
@@ -165,15 +174,22 @@ pub fn restore_desktop(
             Recovery::Exhausted => {
                 return Err(last_error.unwrap_or_else(|| "Explorer recovery ended without an answering taskbar".into()));
             }
-            Recovery::Start if taskbar::recovery_tray(launched) != RecoveryTray::Other => {
+            Recovery::Restart(pid) => {
+                if let Some(child) = replacement.as_ref().filter(|child| child.pid == pid)
+                    && let Err(error) = stop_hung_replacement(child)
+                {
+                    log::line(&format!("restore: {error}"));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Recovery::Start if !taskbar::any() && recovery_shell_owner(installed_shell).is_none() => {
                 if install::elevated() {
                     return Err("no shell runs: start explorer.exe from Task Manager".into());
                 }
                 if let Some(child) = &launch {
                     if !child.ended() {
-                        if taskbar::explorer_except(retiring).is_some()
-                            || taskbar::recovery_tray(launched) == RecoveryTray::Other
-                        {
+                        if taskbar::any() || taskbar::explorer_file_operations() {
+                            std::thread::sleep(Duration::from_millis(200));
                             continue;
                         }
                         log::line(&format!("restore: stopping unresponsive recovery Explorer pid {}", child.pid));
@@ -208,21 +224,44 @@ fn recovery_shell_owner(exe: &Path) -> Option<u32> {
     taskbar::explorust_shell_window(exe).or_else(|| taskbar::explorust(exe))
 }
 
-fn stop_retiring_explorer(exit: &ExplorerExit<'_>) -> Result<bool, String> {
+fn stop_retiring_explorer(exit: &ExplorerExit<'_>) -> Result<(), String> {
     let pid = exit.process.pid;
     let child = Child::open(pid)?;
     if taskbar::explorer_except(Some(pid)).is_some()
-        || (exit.file_operations)()
+        || taskbar::explorer_file_operations()
         || taskbar::owns_tray(pid)
         || exit.process.ended()
     {
-        return Ok(false);
+        return Ok(());
     }
     // SAFETY: the original handle still identifies the same live process as the terminate
-    // handle. Its exit was posted, its taskbar is gone, and no file operation is active.
+    // handle. Its exit may have been posted, its taskbar is gone, and no file operation is active.
     unsafe { TerminateProcess(child.handle, 1) }
         .map_err(|e| format!("could not stop retiring Explorer pid {pid}: {e}"))?;
     log::line(&format!("restore: stopped retiring Explorer pid {pid} after its taskbar disappeared"));
     wait_any(&[exit.process.handle], Some(1_000));
-    Ok(true)
+    Ok(())
+}
+
+fn stop_hung_replacement(process: &Child) -> Result<(), String> {
+    let pid = process.pid;
+    let Some(window) = taskbar::explorer_window_for(pid) else {
+        return Ok(());
+    };
+    let child = Child::open(pid)?;
+    if taskbar::answers(window, policy::ANSWER_WITHIN)
+        || taskbar::explorer_file_operations()
+        || taskbar::explorer_window_for(pid) != Some(window)
+        || taskbar::recovery_tray(Some(pid)) != RecoveryTray::Replacement(pid)
+        || process.ended()
+    {
+        return Ok(());
+    }
+    // SAFETY: the saved process and taskbar identities still match. The taskbar did not answer
+    // its bounded probe and no Explorer file operation is active on the desktop.
+    unsafe { TerminateProcess(child.handle, 1) }
+        .map_err(|e| format!("could not stop unresponsive replacement Explorer pid {pid}: {e}"))?;
+    log::line(&format!("restore: stopped unresponsive replacement Explorer pid {pid}"));
+    wait_any(&[process.handle], Some(1_000));
+    Ok(())
 }

@@ -504,7 +504,6 @@ fn recover(
     let restored = restore_desktop(exe, Some(ExplorerExit {
         state,
         process: original,
-        file_operations: explorer::file_operations,
         repost: &mut repost,
     }))?;
     log::line(&format!("switch: restored Windows: {}", restored.description));

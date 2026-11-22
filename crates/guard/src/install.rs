@@ -210,11 +210,7 @@ impl Drop for Lock {
 }
 
 pub fn lock() -> Result<Lock, String> {
-    lock_for(0)
-}
-
-pub fn lock_for(timeout_ms: u32) -> Result<Lock, String> {
-    named_lock(r"Global\explorust-setup", timeout_ms, "another explorust install or uninstall is running")
+    named_lock(r"Global\explorust-setup", 0, "another explorust install or uninstall is running")
 }
 
 pub fn switch_lock_for(timeout_ms: u32) -> Result<Lock, String> {

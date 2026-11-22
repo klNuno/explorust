@@ -146,7 +146,7 @@ fn switch(
     exe: &Path,
     cancel: &ui::Cancel,
 ) -> Result<Outcome, String> {
-    let locks = (install::switch_lock_for(0)?, install::lock()?);
+    let lock = install::switch_lock_for(0)?;
     let expected = format!("\"{}\"", guard.display());
     if !reg::shell().is_some_and(|value| value.eq_ignore_ascii_case(&expected)) || !exe.is_file() {
         return Err("explorust is not installed as this user's sign-in shell".into());
@@ -203,7 +203,7 @@ fn switch(
                 }
                 log::line(&format!("switch: {e}; restoring Windows directly"));
                 let late_folders = watcher.recover(exe, &explorer_process)?;
-                drop(locks);
+                drop(lock);
                 if let Some(folders) = late_folders {
                     watcher::restore_late_folders(&explorer_process, &folders)?;
                 }
