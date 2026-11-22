@@ -214,6 +214,11 @@ impl ShellAction {
     }
 }
 
+/// Window property a part sets on its visible window (`Shell_TrayWnd`) once its first frame is
+/// drawn. An auto-hidden taskbar starts off screen and hidden, so visibility cannot tell the shell
+/// that the bar is up.
+pub const PAINTED_PROP: &str = "explorust.painted";
+
 /// The class name of an owner's command window: `explorust.<name>`, a message-only or hidden window.
 /// The taskbar also owns `Shell_TrayWnd`; that one stays Windows' name for tray icons and AppBars.
 pub fn class_of(owner: Owner) -> String {
