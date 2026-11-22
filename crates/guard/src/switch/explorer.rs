@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
-    CoUninitialize, IServiceProvider,
+    CoUninitialize, IDispatch, IServiceProvider,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -137,36 +137,45 @@ pub fn launch_switch(guard: &Path) -> Result<(), String> {
     let Some(dir) = guard.parent() else {
         return Err("the installed guard has no working directory".into());
     };
-    let result = (|| {
-        let _apartment = Apartment::new()?;
-        // SAFETY: all automation methods run on this COM apartment, with live arguments.
-        unsafe {
-            let list: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
-            let mut hwnd = 0;
-            let desktop = list.FindWindowSW(
+    let _apartment =
+        Apartment::new().map_err(|e| format!("initialize Explorer automation: {e}"))?;
+    // SAFETY: all automation methods run on this COM apartment, with live arguments.
+    unsafe {
+        let list: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)
+            .map_err(|e| format!("get ShellWindows: {e}"))?;
+        let mut hwnd = 0;
+        let desktop = list
+            .FindWindowSW(
                 &VARIANT::from(CSIDL_DESKTOP as i32),
                 &VARIANT::default(),
                 SWC_DESKTOP,
                 &mut hwnd,
                 SWFO_NEEDDISPATCH,
-            )?;
-            let browser: IShellBrowser = desktop
-                .cast::<IServiceProvider>()?
-                .QueryService(&SID_STopLevelBrowser)?;
-            let folder: IShellFolderViewDual = browser
-                .QueryActiveShellView()?
-                .GetItemObject(SVGIO_BACKGROUND)?;
-            let app: IShellDispatch2 = folder.Application()?.cast()?;
-            app.ShellExecute(
-                &path,
-                &VARIANT::from(BSTR::from("--switch")),
-                &VARIANT::from(BSTR::from(dir.to_string_lossy().as_ref())),
-                &VARIANT::from(BSTR::from("open")),
-                &VARIANT::from(1),
             )
-        }
-    })();
-    result.map_err(|e| format!("launch the switch through Explorer: {e}"))
+            .map_err(|e| format!("find Explorer's desktop: {e}"))?;
+        let browser: IShellBrowser = desktop
+            .cast::<IServiceProvider>()
+            .and_then(|services| services.QueryService(&SID_STopLevelBrowser))
+            .map_err(|e| format!("get Explorer's desktop browser: {e}"))?;
+        // Background automation is exposed through IDispatch by the shell view.
+        let folder: IShellFolderViewDual = browser
+            .QueryActiveShellView()
+            .and_then(|view| view.GetItemObject::<IDispatch>(SVGIO_BACKGROUND))
+            .and_then(|dispatch| dispatch.cast())
+            .map_err(|e| format!("get Explorer's desktop folder automation: {e}"))?;
+        let app: IShellDispatch2 = folder
+            .Application()
+            .and_then(|app| app.cast())
+            .map_err(|e| format!("get Explorer's application automation: {e}"))?;
+        app.ShellExecute(
+            &path,
+            &VARIANT::from(BSTR::from("--switch")),
+            &VARIANT::from(BSTR::from(dir.to_string_lossy().as_ref())),
+            &VARIANT::from(BSTR::from("open")),
+            &VARIANT::from(1),
+        )
+        .map_err(|e| format!("launch the switch through Explorer: {e}"))
+    }
 }
 
 pub fn open_folders() -> Result<Vec<String>, String> {
@@ -242,10 +251,14 @@ pub fn exit(tray: HWND, pid: u32) -> Result<(), String> {
     if taskbar::explorer_window() != Some((tray, pid)) {
         return Err("Explorer's taskbar changed while preparing to switch".into());
     }
-    // SAFETY: this is the taskbar's Exit Explorer command, with no pointer arguments.
-    unsafe { PostMessageW(Some(tray), EXIT_EXPLORER, WPARAM(0), LPARAM(0)) }
-        .map_err(|e| format!("request Exit Explorer: {e}"))?;
-    log::line(&format!("switch: requested Exit Explorer for pid {pid}"));
+    let desktop_owners: Vec<_> = windows(w!("Progman"))
+        .into_iter()
+        .map(|(_, owner)| owner)
+        .filter(|&owner| taskbar::is_explorer(owner))
+        .chain([pid])
+        .collect();
+    // Ask separate folder windows to close while the desktop can still service their shell
+    // registrations. Their Explorer processes may keep COM objects alive after the window closes.
     for (folder, owner) in folder_windows() {
         if owner != pid {
             // SAFETY: standard close to a folder window in a separate Explorer process.
@@ -256,25 +269,33 @@ pub fn exit(tray: HWND, pid: u32) -> Result<(), String> {
             }
         }
     }
+    // SAFETY: this is the taskbar's Exit Explorer command, with no pointer arguments.
+    unsafe { PostMessageW(Some(tray), EXIT_EXPLORER, WPARAM(0), LPARAM(0)) }
+        .map_err(|e| format!("request Exit Explorer: {e}"))?;
+    log::line(&format!("switch: requested Exit Explorer for pid {pid}"));
     let started = Instant::now();
     loop {
-        let running = processes()?;
-        if running.is_empty() {
-            log::line(&format!(
-                "switch: all Explorer processes in this session exited after {} ms",
-                started.elapsed().as_millis()
-            ));
-            return Ok(());
-        }
         if let Some((_, owner)) = taskbar::explorer_window()
             && owner != pid
         {
             return Err(format!("Windows restarted Explorer as pid {owner}"));
         }
+        let running = processes()?;
+        let pids: Vec<_> = running.iter().map(|process| process.pid).collect();
+        let desktop_present = pids.iter().any(|owner| desktop_owners.contains(owner));
+        let new_desktop = windows(w!("Progman"))
+            .into_iter()
+            .any(|(_, owner)| taskbar::is_explorer(owner));
+        if !desktop_present && !new_desktop {
+            log::line(&format!(
+                "switch: Explorer desktop exited after {} ms (background Explorer pids: {pids:?})",
+                started.elapsed().as_millis()
+            ));
+            return Ok(());
+        }
         if started.elapsed() >= Duration::from_secs(30) {
-            let pids: Vec<_> = running.iter().map(|process| process.pid).collect();
             return Err(format!(
-                "Explorer did not exit within 30 s (remaining pids {pids:?})"
+                "Explorer's desktop did not exit within 30 s (remaining pids {pids:?})"
             ));
         }
         std::thread::sleep(Duration::from_millis(200));

@@ -273,9 +273,9 @@ fn wait_for_verdict(exe: &Path, supervisor: &JoinHandle<u32>) -> Result<Outcome,
         + launch_timing::VERDICT_BUDGET
         + Duration::from_secs(30);
     loop {
-        if let Some(pid) = taskbar::explorer() {
-            log::line(&format!("switch: Windows took over (Explorer pid {pid})"));
-            return Ok(Outcome::Windows);
+        if let Some((_, pid)) = taskbar::explorer_window() {
+            let _ = Event::set_existing(FALLBACK_EVENT);
+            return recover_windows(&format!("Explorer pid {pid} took back the taskbar"));
         }
         if supervisor.is_finished() {
             return recover_windows("supervision ended before the build verdict");
@@ -285,6 +285,7 @@ fn wait_for_verdict(exe: &Path, supervisor: &JoinHandle<u32>) -> Result<Outcome,
             && Event::is_signalled(&build_verdict_event(pid))
             && taskbar::probe(pid) == policy::Probe::Answered
             && !Event::is_signalled(FALLBACK_EVENT)
+            && taskbar::explorer_window().is_none()
         {
             log::line(&format!(
                 "switch: explorust pid {pid} passed the build verdict and owns an answering taskbar"
