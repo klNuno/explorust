@@ -28,6 +28,14 @@ pub fn same_windows(saved: &[Folder], observed: impl Iterator<Item = (isize, u32
     saved_handles == observed.collect()
 }
 
+pub fn handoff_paths(entries: &[Folder], earlier_receipts: &HashSet<(isize, u32)>) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|folder| !earlier_receipts.contains(&(folder.hwnd, folder.owner)))
+        .map(|folder| folder.path.clone())
+        .collect()
+}
+
 /// Keep the window identity alongside its parsing name for recovery in either process.
 pub fn encode(entries: &[Folder]) -> String {
     use std::fmt::Write;
@@ -118,5 +126,12 @@ mod tests {
         assert_eq!(decode(&encode(&entries)).unwrap(), entries);
         assert!(decode("17\0").is_err());
         assert!(decode("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn skips_only_the_window_already_owned_by_an_earlier_receipt() {
+        let entries = [folder(1, 10, "shared"), folder(2, 10, "shared"), folder(3, 20, "other")];
+        let earlier = HashSet::from([(1, 10), (3, 99)]);
+        assert_eq!(handoff_paths(&entries, &earlier), ["shared", "other"]);
     }
 }

@@ -13,7 +13,7 @@ use windows::Win32::Security::Cryptography::{
     CertDeleteCertificateFromStore, CertFindCertificateInStore, CertOpenStore, CertFreeCertificateContext, HCERTSTORE,
     PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::Win32::UI::Shell::IsUserAnAdmin;
@@ -218,27 +218,36 @@ pub fn lock_for(timeout_ms: u32) -> Result<Lock, String> {
 }
 
 pub fn recovery_lock_for(timeout_ms: u32) -> Result<Lock, String> {
-    named_lock(crate::switch_events::RECOVERY_MUTEX, timeout_ms, "the independent desktop recovery is still running")
+    try_recovery_lock_for(timeout_ms)?
+        .ok_or_else(|| "the independent desktop recovery is still running".into())
 }
 
-pub fn folder_close_lock(owner: u32, hwnd: isize) -> Result<Lock, String> {
-    named_lock(
-        &format!(r"Local\explorust-switch-folder-close-{owner}-{hwnd}"),
-        0,
-        "this Explorer window already has a pending close",
-    )
+pub fn try_recovery_lock_for(timeout_ms: u32) -> Result<Option<Lock>, String> {
+    try_named_lock(crate::switch_events::RECOVERY_MUTEX, timeout_ms)
+}
+
+pub fn try_folder_close_lock(owner: u32, hwnd: isize) -> Result<Option<Lock>, String> {
+    try_named_lock(&format!(r"Local\explorust-switch-folder-close-{owner}-{hwnd}"), 0)
 }
 
 fn named_lock(name: &str, timeout_ms: u32, busy: &str) -> Result<Lock, String> {
+    try_named_lock(name, timeout_ms)?.ok_or_else(|| busy.into())
+}
+
+fn try_named_lock(name: &str, timeout_ms: u32) -> Result<Option<Lock>, String> {
     // SAFETY: a named mutex; the handle moves into the Lock.
     unsafe {
         let h = CreateMutexW(None, false, &HSTRING::from(name)).map_err(|e| format!("{name}: {e}"))?;
-        let w = WaitForSingleObject(h, timeout_ms);
-        if w == WAIT_OBJECT_0 || w == WAIT_ABANDONED {
-            Ok(Lock(h))
-        } else {
-            let _ = CloseHandle(h);
-            Err(busy.into())
+        match WaitForSingleObject(h, timeout_ms) {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(Lock(h))),
+            result => {
+                let error = (result != WAIT_TIMEOUT).then(|| GetLastError());
+                let _ = CloseHandle(h);
+                match error {
+                    Some(error) => Err(format!("wait for {name}: {error:?}")),
+                    None => Ok(None),
+                }
+            }
         }
     }
 }

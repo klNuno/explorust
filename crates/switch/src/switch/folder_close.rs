@@ -9,7 +9,7 @@ use super::{
 use guard::proc::{Child, Event, wait_any};
 use guard::switch_events::{SWITCH_EXE, switch_event};
 use guard::{account, install, log, reopen, taskbar};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetPropW, MSG, PM_NOREMOVE, PeekMessageW, RemovePropW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
@@ -21,10 +21,32 @@ fn receipt_name(stamp: u64, hwnd: isize) -> String {
     switch_event(stamp, &format!("folder-{hwnd}"))
 }
 
-pub fn close(owner: u32, stamp: u64, folder: &Folder, budget: Duration) -> Result<bool, String> {
+pub enum Handoff {
+    Snapshot,
+    EarlierReceipt,
+    Pending,
+}
+
+pub fn close(owner: u32, stamp: u64, folder: &Folder, budget: Duration) -> Result<Handoff, String> {
     let hwnd = folder.hwnd;
-    if !explorer::folder_windows().contains(&(hwnd, folder.owner)) {
-        return Ok(true);
+    let open = || explorer::folder_windows().contains(&(hwnd, folder.owner));
+    let started = Instant::now();
+    if let Some(probe) = install::try_folder_close_lock(folder.owner, hwnd)? {
+        drop(probe);
+    } else {
+        // The earlier receipt keeps its lock while we hold the recovery mutex. Leave it
+        // responsible for reopening this window after the new switch commits or rolls back.
+        while open() {
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(Handoff::Pending);
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(50)));
+        }
+        return Ok(Handoff::EarlierReceipt);
+    }
+    if !open() {
+        return Ok(Handoff::Snapshot);
     }
     let settled = Event::named(&receipt_name(stamp, hwnd))?;
     let watcher = std::process::id();
@@ -32,9 +54,10 @@ pub fn close(owner: u32, stamp: u64, folder: &Folder, budget: Duration) -> Resul
         &install::dir().join(SWITCH_EXE),
         &format!("--close-folder {watcher} {owner} {stamp} {hwnd}"),
     )?;
-    wait_any(&[settled.0, closer.handle], Some(budget.as_millis() as u32));
+    let remaining = budget.saturating_sub(started.elapsed());
+    wait_any(&[settled.0, closer.handle], Some(remaining.as_millis() as u32));
     // Even on timeout, the close process owns the request and can reopen this folder later.
-    Ok(!explorer::folder_windows().contains(&(hwnd, folder.owner)))
+    Ok(if open() { Handoff::Pending } else { Handoff::Snapshot })
 }
 
 pub fn run(arguments: impl Iterator<Item = String>) -> u32 {
@@ -79,7 +102,9 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
         .into_iter()
         .find(|folder| folder.hwnd == hwnd)
         .ok_or("folder not in the switch snapshot")?;
-    let _receipt = install::folder_close_lock(folder.owner, hwnd)?;
+    let Some(_receipt) = install::try_folder_close_lock(folder.owner, hwnd)? else {
+        return Ok(());
+    };
     if !explorer::folder_windows().contains(&(hwnd, folder.owner)) {
         return Ok(());
     }

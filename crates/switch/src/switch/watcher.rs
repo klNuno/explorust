@@ -1,14 +1,15 @@
 //! Keep an independent process alive from Explorer preparation through the build verdict.
 
 use super::{
-    exit_state::{ExitState, exit_state},
-    explorer, folder_close,
+    exit_state::{ExitState, exit_state, resolve_repost},
+    explorer, folder_close, prepare_lock,
     reopen_list::{self, Folder},
 };
 use guard::launch_timing::FALLBACK_EVENT;
 use guard::proc::{Child, Event, wait_any};
 use guard::switch_events::{CANCEL_FOR_RESTORE, EXITING_EXPLORER, SWITCH_EXE, switch_event};
 use guard::{account, bring_back_explorer_except, install, log, policy::RECOVERY_BUDGET, reopen, taskbar, ui};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
@@ -20,6 +21,8 @@ const FAILED: u32 = 1;
 
 pub(super) struct Signals {
     prepared: Event,
+    prepare_exit: Event,
+    close_ready: Event,
     exit: Event,
     post_desktop: Event,
     exit_intent: Event,
@@ -37,6 +40,8 @@ impl Signals {
         let get = |name| Event::named(&switch_event(stamp, name));
         Ok(Self {
             prepared: get("prepared")?,
+            prepare_exit: get("prepare-exit")?,
+            close_ready: get("close-ready")?,
             exit: get("exit")?,
             post_desktop: get("post-desktop")?,
             exit_intent: get("exit-intent")?,
@@ -56,6 +61,7 @@ impl Signals {
 }
 
 pub enum Desktop {
+    Cancelled,
     Vacated,
     Restored,
     Postponed,
@@ -108,8 +114,25 @@ impl Watcher {
         Ok(None)
     }
 
-    pub fn vacate_desktop(&mut self, tray: HWND, pid: u32) -> Result<Desktop, String> {
+    pub fn vacate_desktop(&mut self, tray: HWND, pid: u32, cancel: &ui::Cancel) -> Result<Desktop, String> {
         let exiting = Event::named(EXITING_EXPLORER)?;
+        self.signals.prepare_exit.signal()?;
+        let prepare_started = Instant::now();
+        loop {
+            if super::cancel_requested(cancel) {
+                return Ok(Desktop::Cancelled);
+            }
+            match wait_any(&[self.child.handle, self.signals.close_ready.0], Some(100)) {
+                Some(0) if self.child.exit_code() == POSTPONED => return Ok(Desktop::Postponed),
+                Some(0) => return Err("the watcher stopped before it was ready to close folders".into()),
+                Some(1) if !super::cancel_requested(cancel) && cancel.commit() => break,
+                Some(1) => return Ok(Desktop::Cancelled),
+                _ if prepare_started.elapsed() >= PREPARE_BUDGET + Duration::from_secs(1) => {
+                    return Ok(Desktop::Postponed);
+                }
+                _ => {}
+            }
+        }
         self.signals.exit.signal()?;
         self.committed = true;
         let started = Instant::now();
@@ -245,7 +268,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         folders.len()
     ));
     signals.prepared.signal()?;
-    if wait_any(&[owner_process.handle, signals.rollback.0, signals.exit.0], None) != Some(2) {
+    if wait_any(&[owner_process.handle, signals.rollback.0, signals.prepare_exit.0], None) != Some(2) {
         clear_snapshot(stamp);
         let _ = std::fs::remove_file(snapshot);
         return Ok(0);
@@ -270,7 +293,15 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         }
         // Uninstall can wait for the close and rollback, including after our owner dies.
         // Release the lock before any further COM capture.
-        let recovery = install::recovery_lock_for(0)?;
+        let Some(recovery) = prepare_lock::wait(
+            || (!abandoned()).then(|| PREPARE_BUDGET.saturating_sub(refresh_started.elapsed())),
+            |slice| install::try_recovery_lock_for(slice.as_millis() as u32),
+        )? else {
+            continue;
+        };
+        if abandoned() || explorer::file_operations() {
+            continue;
+        }
         if reopen_list::same_windows(&folders, explorer::folder_windows().into_iter()) {
             break recovery;
         }
@@ -280,15 +311,21 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
             let _ = std::fs::remove_file(&snapshot);
         })?;
     };
+    signals.close_ready.signal()?;
+    if wait_any(&[owner_process.handle, signals.rollback.0, signals.exit.0], None) != Some(2) {
+        clear_snapshot(stamp);
+        let _ = std::fs::remove_file(&snapshot);
+        return Ok(0);
+    }
     let started = (|| -> Result<bool, String> {
-        let paths: Vec<_> = folders.iter().map(|folder| folder.path.clone()).collect();
-        reopen::save(&log::dir(), stamp, &paths).map_err(|e| format!("save Files handoff: {e}"))?;
-        if !close_folders(&folders, explorer_pid, owner, stamp, abandoned)? {
+        let Some(earlier_receipts) = close_folders(&folders, explorer_pid, owner, stamp, abandoned)? else {
             return Ok(false);
-        }
+        };
         if abandoned() {
             return Err("the switch ended before Exit Explorer".into());
         }
+        let paths = reopen_list::handoff_paths(&folders, &earlier_receipts);
+        reopen::save(&log::dir(), stamp, &paths).map_err(|e| format!("save Files handoff: {e}"))?;
         signals.post_desktop.signal()?;
         let events = [signals.exiting.0, signals.exit_cancelled.0, owner_process.handle, signals.rollback.0];
         match wait_any(&events, None) {
@@ -337,25 +374,43 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
     Ok(RESTORED)
 }
 
-fn close_folders(folders: &[Folder], desktop: u32, owner: u32, stamp: u64, abandoned: impl Fn() -> bool) -> Result<bool, String> {
+fn close_folders(
+    folders: &[Folder],
+    desktop: u32,
+    owner: u32,
+    stamp: u64,
+    abandoned: impl Fn() -> bool,
+) -> Result<Option<HashSet<(isize, u32)>>, String> {
     let started = Instant::now();
+    let mut earlier_receipts = HashSet::new();
     for folder in folders.iter().filter(|folder| folder.owner != desktop) {
         if abandoned() {
             return Err("the switch ended while closing Explorer folders".into());
         }
         if explorer::file_operations() {
             log::line("switch: a file operation started during folder closing");
-            return Ok(false);
+            return Ok(None);
         }
         let budget = explorer::EXIT_BUDGET.saturating_sub(started.elapsed()).min(Duration::from_secs(2));
-        if budget.is_zero() || !folder_close::close(owner, stamp, folder, budget)? {
-            log::line(&format!("switch: Explorer folder in pid {} did not complete the close request", folder.owner));
-            return Ok(false);
+        let handoff = if budget.is_zero() {
+            folder_close::Handoff::Pending
+        } else {
+            folder_close::close(owner, stamp, folder, budget)?
+        };
+        match handoff {
+            folder_close::Handoff::Snapshot => {}
+            folder_close::Handoff::EarlierReceipt => {
+                earlier_receipts.insert((folder.hwnd, folder.owner));
+            }
+            folder_close::Handoff::Pending => {
+                log::line(&format!("switch: Explorer folder in pid {} did not complete the close request", folder.owner));
+                return Ok(None);
+            }
         }
     }
     // Another window may have opened while the outgoing desktop processed the closes.
     let original: Vec<_> = folders.iter().filter(|folder| folder.owner == desktop).map(|folder| (folder.hwnd, folder.owner)).collect();
-    Ok(explorer::folder_windows().iter().all(|window| original.contains(window)))
+    Ok(explorer::folder_windows().iter().all(|window| original.contains(window)).then_some(earlier_receipts))
 }
 
 fn capture_folders(snapshot: &Path, started: Instant) -> Result<Vec<Folder>, String> {
@@ -402,10 +457,9 @@ fn recover(stamp: u64, signals: &Signals, exe: &Path, tray: HWND, original: &Chi
                 log::line("switch: desktop exit outcome is uncertain after the worker stopped");
                 // A queued exit can still close the original after it answers a probe. If it
                 // still owns the tray, finish the same request only after a fresh transfer check.
-                if taskbar::explorer_window() == Some((tray, original.pid))
-                    && !explorer::post_exit(tray, original.pid, || Ok(()))?
-                {
-                    return Err("cannot confirm Exit Explorer while a file operation is running".into());
+                let owns_taskbar = || taskbar::explorer_window() == Some((tray, original.pid));
+                if owns_taskbar() {
+                    resolve_repost(explorer::post_exit(tray, original.pid, || Ok(())), owns_taskbar)?;
                 }
                 Some(original)
             }

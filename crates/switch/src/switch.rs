@@ -4,6 +4,7 @@ mod close_progress;
 mod exit_state;
 mod explorer;
 pub(crate) mod folder_close;
+mod prepare_lock;
 mod reopen_list;
 pub(crate) mod watcher;
 
@@ -172,12 +173,13 @@ fn switch(
         // Just collect the legacy guard's handle. The previous guard still watches Explorer
         // throughout the cancellable preparation, including if a new file operation starts.
         let previous = previous_guard(pid, guard)?;
-        if !explorer::file_operations() && !cancel_requested(cancel) && cancel.commit() {
+        if !explorer::file_operations() && !cancel_requested(cancel) {
             break (watcher, previous);
         }
     };
-    let started = watcher.vacate_desktop(tray, pid).and_then(|desktop| {
+    let started = watcher.vacate_desktop(tray, pid, cancel).and_then(|desktop| {
         match desktop {
+            watcher::Desktop::Cancelled => return Ok(cancelled()),
             watcher::Desktop::Postponed => return Ok(postponed()),
             watcher::Desktop::Restored => return Ok(Outcome::Windows),
             watcher::Desktop::Vacated => {}
