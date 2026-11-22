@@ -31,7 +31,7 @@ pub fn run() -> u32 {
     }
     let again = install::dir().join("explorust.exe").exists();
     let go = if again {
-        tr("Mettre à jour\nRemplace la version installée.", "Update\nReplaces the installed version.")
+        tr("Mettre à jour\nPrend effet à la prochaine ouverture de session.", "Update\nTakes effect at the next sign-in.")
     } else {
         tr("Installer\nPrend effet à la prochaine ouverture de session.", "Install\nTakes effect at the next sign-in.")
     };

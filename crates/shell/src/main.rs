@@ -53,10 +53,11 @@ mod startup_rules;
 
 #[cfg(target_os = "windows")]
 fn main() {
-    match std::env::args().nth(1).as_deref() {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
         Some("--prefetch-symbols") => std::process::exit(prefetch::run()),
         Some("--download-symbols") => std::process::exit(if uwp_host::prefetch() { 0 } else { 1 }),
-        Some("--startup-apps") => std::process::exit(startup::run()),
+        Some("--startup-apps") => std::process::exit(startup::run(args.next().as_deref())),
         _ => {}
     }
     // Before any COM call of the process (AppContainer hosts call back into twinui here).

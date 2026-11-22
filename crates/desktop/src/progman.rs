@@ -292,7 +292,9 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             Some(LRESULT(0))
         }
         workerw::input::MSG_RIGHT => {
-            workerw::input::right_click(lp);
+            if let (Some(view), Some(worker)) = (defview(), with(|s| s.wallpaper_input.as_ref().and(s.workerw)).flatten()) {
+                workerw::input::right_click(hwnd, view, worker, lp);
+            }
             Some(LRESULT(0))
         }
         WM_WALLPAPER => {
@@ -355,6 +357,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             Some(LRESULT(0))
         }
         WM_DESTROY => {
+            drop(with(|s| s.wallpaper_input.take()));
             let desk = with(|s| s.desk.take()).flatten();
             if let Some(d) = desk {
                 d.destroy();

@@ -42,7 +42,7 @@ pub fn run(adopt: Option<(u32, Option<String>)>) -> u32 {
     let build = reg::windows_build();
     let mut attempt = 0u32;
     let mut adopted = None;
-    let mut startup_launched = false;
+    let mut startup_worker_started = false;
     if let Some((pid, name)) = adopt {
         log::line(&format!("guard adopts explorust pid {pid}: its guard ended"));
         match Child::open(pid) {
@@ -73,7 +73,7 @@ pub fn run(adopt: Option<(u32, Option<String>)>) -> u32 {
         let self_test = reg::last_good_build().as_deref() != Some(build.as_str());
         let end = match adopted.take() {
             Some((child, Some(name))) => match PhaseEvents::open(&name) {
-                Ok(phases) => supervise(&child, &fallback, &phases, self_test, &build, &exe, &mut startup_launched),
+                Ok(phases) => supervise(&child, &fallback, &phases, self_test, &build, &exe, &mut startup_worker_started),
                 Err(e) => {
                     child.kill();
                     End::Problem(e)
@@ -82,7 +82,7 @@ pub fn run(adopt: Option<(u32, Option<String>)>) -> u32 {
             Some((child, None)) => watch(&child, &fallback, TaskbarWatch::new()),
             None => {
                 attempt += 1;
-                run_once(&exe, attempt, self_test, &build, &fallback, &mut startup_launched)
+                run_once(&exe, attempt, self_test, &build, &fallback, &mut startup_worker_started)
             }
         };
         match end {
@@ -128,6 +128,7 @@ fn turn_off(why: &str) -> Notice {
 }
 
 struct PhaseEvents {
+    staged: Event,
     native: Event,
     immersive: Event,
     verified: Event,
@@ -136,6 +137,7 @@ struct PhaseEvents {
 impl PhaseEvents {
     fn open(name: &str) -> Result<Self, String> {
         Ok(Self {
+            staged: Event::named(&launch_timing::staged_event(name))?,
             native: Event::named(&launch_timing::native_event(name))?,
             immersive: Event::named(&launch_timing::immersive_event(name))?,
             verified: Event::named(name)?,
@@ -143,13 +145,14 @@ impl PhaseEvents {
     }
 }
 
-fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &Event, startup_launched: &mut bool) -> End {
+fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &Event, startup_worker_started: &mut bool) -> End {
     let name = format!(r"Local\explorust-ready-{}-{attempt}", std::process::id());
     let phases = match PhaseEvents::open(&name) {
         Ok(phases) => phases,
         Err(e) => return End::Fallback(e),
     };
-    let mut args = format!("--ready-event {name} --staged-ready --guard {}", std::process::id());
+    // Legacy shells accept these arguments too. Our staged offer is a named event.
+    let mut args = format!("--ready-event {name} --guard {}", std::process::id());
     if self_test {
         args.push_str(" --self-test");
     }
@@ -159,19 +162,36 @@ fn run_once(exe: &Path, attempt: u32, self_test: bool, build: &str, fallback: &E
         Err(e) => return End::Problem(format!("explorust did not start: {e}")),
     };
     log::line(&format!("started explorust pid {} ({args})", child.pid));
-    supervise(&child, fallback, &phases, self_test, build, exe, startup_launched)
+    let legacy = launch_timing::legacy_budget(self_test);
+    match wait_any(&[fallback.0, child.handle, phases.staged.0, phases.verified.0], Some(legacy.as_millis() as u32)) {
+        Some(0) => {
+            child.kill();
+            End::Fallback("hotkey or --fallback during readiness negotiation".into())
+        }
+        Some(1) => ended(&child, Some("readiness negotiation")),
+        Some(2) => supervise(&child, fallback, &phases, self_test, build, exe, startup_worker_started),
+        Some(_) => {
+            log::line("explorust ready (legacy protocol)");
+            record_ready(self_test, build);
+            watch(&child, fallback, TaskbarWatch::new())
+        }
+        None => {
+            let _ = fallback.signal();
+            child.kill();
+            End::Problem(format!("explorust did not negotiate or signal readiness after {} s", legacy.as_secs()))
+        }
+    }
 }
 
-fn supervise(child: &Child, fallback: &Event, phases: &PhaseEvents, self_test: bool, build: &str, exe: &Path, startup_launched: &mut bool) -> End {
+fn supervise(child: &Child, fallback: &Event, phases: &PhaseEvents, self_test: bool, build: &str, exe: &Path, startup_worker_started: &mut bool) -> End {
     if let Err(end) = wait_phase(child, fallback, &phases.native, "native desktop", launch_timing::NATIVE_BUDGET, None) {
         return end;
     }
     log::line("explorust native desktop ready");
-    if !*startup_launched {
-        match Child::spawn(exe, "--startup-apps") {
-            Ok(runner) => {
-                *startup_launched = true;
-                log::line(&format!("session startup runner pid {}", runner.pid));
+    if !*startup_worker_started {
+        match crate::startup_retry::spawn(exe) {
+            Ok(()) => {
+                *startup_worker_started = true;
             }
             Err(e) => log::line(&format!("could not start the session startup runner: {e}")),
         }
@@ -186,11 +206,15 @@ fn supervise(child: &Child, fallback: &Event, phases: &PhaseEvents, self_test: b
         }
         log::line(&format!("explorust {label} ready"));
     }
+    record_ready(self_test, build);
+    watch(child, fallback, taskbar)
+}
+
+fn record_ready(self_test: bool, build: &str) {
     folders::handler(true);
     if self_test && let Err(e) = reg::set_last_good_build(build) {
         log::line(&format!("could not record the good build: {e}"));
     }
-    watch(child, fallback, taskbar)
 }
 
 fn wait_phase(child: &Child, fallback: &Event, phase: &Event, label: &str, budget: Duration, mut taskbar: Option<&mut TaskbarWatch>) -> Result<(), End> {

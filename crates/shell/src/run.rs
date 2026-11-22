@@ -98,7 +98,9 @@ fn shell(args: &Args) -> i32 {
         }
     };
     let exits = ExitRequests { quit, reload };
-    let staged = args.ready_event.as_deref().filter(|_| args.staged_ready);
+    let offered = args.ready_event.as_deref()
+        .and_then(|name| events::Owned::open_for_signal(&launch_timing::staged_event(name)));
+    let staged = args.ready_event.as_deref().filter(|_| args.staged_ready || offered.is_some());
     let phases = match staged.map(PhaseEvents::open).transpose() {
         Ok(phases) => phases,
         Err(e) => {
@@ -106,6 +108,10 @@ fn shell(args: &Args) -> i32 {
             return HOST_FAILED;
         }
     };
+    if let Some(event) = offered && let Err(e) = event.signal() {
+        log::line(&format!("staged readiness negotiation: {e}"));
+        return HOST_FAILED;
+    }
     if let Some(pid) = args.guard {
         guardwatch::spawn(pid, staged.map(str::to_string));
     }

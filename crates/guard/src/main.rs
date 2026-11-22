@@ -33,6 +33,7 @@ mod prefetch;
 mod proc;
 mod reg;
 mod setup;
+mod startup_retry;
 mod supervise;
 mod taskbar;
 mod ui;

@@ -39,21 +39,26 @@ pub fn spawn_legacy_runner() {
     }
 }
 
-pub fn run() -> i32 {
+pub fn run(ack: Option<&str>) -> i32 {
     if events::Owned::is_signalled(launch_timing::FALLBACK_EVENT) {
         log::line("startup: handoff requested before claim; Explorer owns startup");
         return 0;
     }
-    match registry::claim() {
-        Ok(true) => {
-            log::line("startup: session runner claimed Explorer's startup marker");
-            launch_all();
-        }
-        Ok(false) => log::line("startup: apps already handled for this logon"),
+    let claimed = match registry::claim() {
+        Ok(claimed) => claimed,
         Err(e) => {
             log::line(&format!("startup: could not claim this logon: {e}"));
             return 1;
         }
+    };
+    if let Some(name) = ack && let Err(e) = events::set_existing(name) {
+        log::line(&format!("startup: could not acknowledge claim: {e}"));
+    }
+    if claimed {
+        log::line("startup: session runner claimed Explorer's startup marker");
+        launch_all();
+    } else {
+        log::line("startup: apps already handled for this logon");
     }
     0
 }

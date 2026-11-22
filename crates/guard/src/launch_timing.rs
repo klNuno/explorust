@@ -15,6 +15,15 @@ pub const IMMERSIVE_BUDGET: Duration =
     Duration::from_secs(HOST.as_secs() + PARTS.as_secs() + HANDOFF.as_secs());
 pub const VERDICT_BUDGET: Duration = Duration::from_secs(SELF_TEST.as_secs() + HANDOFF.as_secs());
 
+/// Pre-stage shell versions send a single readiness signal after the whole startup.
+pub fn legacy_budget(self_test: bool) -> Duration {
+    Duration::from_secs(if self_test { 120 } else { 45 })
+}
+
+pub fn staged_event(ready: &str) -> String {
+    format!("{ready}-staged")
+}
+
 pub fn native_event(ready: &str) -> String {
     format!("{ready}-native")
 }

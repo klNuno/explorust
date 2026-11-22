@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Builds explorust (with every part) and the guard for Windows, sends them to the guest g1 and
-# reloads the running shell: explorust exits with code 5, the guard swaps in explorust.next.exe
-# and starts it. --guard also replaces explorust-guard.exe (renamed while it runs, used from the
-# next logon). Run it under tools/g1-locked.sh when other workers share the guest.
+# Builds and deploys the shell and guard. The running shell's guard watcher adopts the
+# on-disk guard before the shell reloads. Run under tools/g1-locked.sh.
 # The notify helper (explorust-notify.exe, run with the identity of its sparse package) and that
 # package (explorust-notify.msix, registered by --install) go along: the running helper locks its
 # exe, so it is renamed aside (explorust-notify.old<n>.exe, deleted by a later deploy) before the copy.
@@ -12,7 +10,7 @@
 # tools/authenticode-sign.py, explorust.exe stays plain; the files go to C:\explorust as before, then a SYSTEM step renames the
 # running exes in Program Files aside and copies the new ones in (the medium-integrity guard cannot
 # write there), and --reload restarts the new explorust.exe.
-# Usage: tools/g1-deploy.sh [--guard]
+# Usage: tools/g1-deploy.sh
 set -eu
 cd /home/boite/projects/explorust
 pf='C:\Program Files\explorust'
@@ -52,16 +50,9 @@ timeout 120 os win push g1 dist/explorust-notify.msix 'C:\explorust' >/dev/null
 timeout 90 os win run g1 --ps -- 'Set-Location C:\explorust; foreach ($n in "explorust-viewer", "explorust-taskman") { Remove-Item "$n.old*.exe" -EA SilentlyContinue; if (Test-Path "$n.exe") { Rename-Item "$n.exe" ("$n.old" + (Get-Random) + ".exe") } }; "handlers set aside"' >/dev/null
 timeout 120 os win push g1 dist/explorust-viewer.exe 'C:\explorust' >/dev/null
 timeout 120 os win push g1 dist/explorust-taskman.exe 'C:\explorust' >/dev/null
-if [ "${1:-}" = "--guard" ]; then
-  cp "$t/explorust-guard.exe" dist/explorust-guard.next.exe
-  timeout 120 os win push g1 dist/explorust-guard.next.exe 'C:\explorust' >/dev/null
-  if [ $ua = 0 ]; then
-    timeout 90 os win run g1 --ps -- 'Set-Location C:\explorust; Remove-Item explorust-guard.old.exe -EA SilentlyContinue; if (Test-Path explorust-guard.exe) { Rename-Item explorust-guard.exe explorust-guard.old.exe }; Rename-Item explorust-guard.next.exe explorust-guard.exe; "guard replaced"' >/dev/null
-  fi
-fi
 if [ $ua = 1 ]; then
   # Swap as SYSTEM: <name>.exe -> <name>.old (a running image can be renamed), then copy the new one.
-  timeout 90 os win run g1 --ps -- "\$d='$pf'; function swap(\$src, \$name) { if (-not (Test-Path \$src)) { return }; Remove-Item \"\$d\\\$name.old\" -EA SilentlyContinue; if (Test-Path \"\$d\\\$name.exe\") { Rename-Item \"\$d\\\$name.exe\" \"\$name.old\" }; Copy-Item \$src \"\$d\\\$name.exe\"; Remove-Item \$src; \"\$name swapped\" }; Copy-Item C:\\explorust\\explorust-open.exe C:\\explorust\\explorust-open.stage.exe; Copy-Item C:\\explorust\\explorust-keys.exe C:\\explorust\\explorust-keys.stage.exe; swap C:\\explorust\\explorust.next.exe explorust; swap C:\\explorust\\explorust-open.stage.exe explorust-open; swap C:\\explorust\\explorust-keys.stage.exe explorust-keys; swap C:\\explorust\\explorust-guard.next.exe explorust-guard; Get-ChildItem \"\$d\\explorust-notify.old*.exe\" -EA SilentlyContinue | Remove-Item -EA SilentlyContinue; if (Test-Path \"\$d\\explorust-notify.exe\") { Rename-Item \"\$d\\explorust-notify.exe\" (\"explorust-notify.old\" + (Get-Random) + \".exe\") }; Copy-Item C:\\explorust\\explorust-notify.exe \"\$d\\explorust-notify.exe\"; Copy-Item C:\\explorust\\explorust-notify.msix \"\$d\\explorust-notify.msix\" -Force; 'explorust-notify swapped'; \$dll=\"\$d\\explorust_inject.dll\"; if (Test-Path C:\\explorust\\explorust_inject.dll) { Remove-Item \"\$dll.old\" -EA SilentlyContinue; if (Test-Path \$dll) { Rename-Item \$dll explorust_inject.dll.old }; Copy-Item C:\\explorust\\explorust_inject.dll \$dll; 'explorust_inject swapped' }" >/dev/null
+  timeout 90 os win run g1 --ps -- "\$d='$pf'; function swap(\$src, \$name) { if (-not (Test-Path \$src)) { return }; Remove-Item \"\$d\\\$name.old\" -EA SilentlyContinue; if (Test-Path \"\$d\\\$name.exe\") { Rename-Item \"\$d\\\$name.exe\" \"\$name.old\" }; Copy-Item \$src \"\$d\\\$name.exe\"; Remove-Item \$src; \"\$name swapped\" }; Copy-Item C:\\explorust\\explorust-open.exe C:\\explorust\\explorust-open.stage.exe; Copy-Item C:\\explorust\\explorust-keys.exe C:\\explorust\\explorust-keys.stage.exe; swap C:\\explorust\\explorust.next.exe explorust; swap C:\\explorust\\explorust-open.stage.exe explorust-open; swap C:\\explorust\\explorust-keys.stage.exe explorust-keys; Get-ChildItem \"\$d\\explorust-notify.old*.exe\" -EA SilentlyContinue | Remove-Item -EA SilentlyContinue; if (Test-Path \"\$d\\explorust-notify.exe\") { Rename-Item \"\$d\\explorust-notify.exe\" (\"explorust-notify.old\" + (Get-Random) + \".exe\") }; Copy-Item C:\\explorust\\explorust-notify.exe \"\$d\\explorust-notify.exe\"; Copy-Item C:\\explorust\\explorust-notify.msix \"\$d\\explorust-notify.msix\" -Force; 'explorust-notify swapped'; \$dll=\"\$d\\explorust_inject.dll\"; if (Test-Path C:\\explorust\\explorust_inject.dll) { Remove-Item \"\$dll.old\" -EA SilentlyContinue; if (Test-Path \$dll) { Rename-Item \$dll explorust_inject.dll.old }; Copy-Item C:\\explorust\\explorust_inject.dll \$dll; 'explorust_inject swapped' }" >/dev/null
 fi
 if [ $ua = 1 ]; then
   # The handlers next to explorust.exe in Program Files, as SYSTEM, the running ones renamed aside.
@@ -77,11 +68,92 @@ if [ $ua = 1 ]; then
   timeout 120 os win push g1 dist/explorust-index.exe 'C:\explorust' >/dev/null
   timeout 90 os win run g1 --ps -- "\$d='$pf'; sc.exe stop explorust-index | Out-Null; \$n=0; while ((Get-Process explorust-index -EA SilentlyContinue) -and \$n -lt 50) { Start-Sleep -Milliseconds 100; \$n++ }; Get-ChildItem \"\$d\\explorust-index.old*.exe\" -EA SilentlyContinue | Remove-Item -EA SilentlyContinue; if (Test-Path \"\$d\\explorust-index.exe\") { Rename-Item \"\$d\\explorust-index.exe\" ('explorust-index.old' + (Get-Random) + '.exe') }; Copy-Item C:\\explorust\\explorust-index.exe \"\$d\\explorust-index.exe\"; Remove-Item C:\\explorust\\explorust-index.exe; & \"\$d\\explorust-index.exe\" --install" >/dev/null
 fi
-# The viewer registers itself for the logged-on user (--ps runs as SYSTEM): ProgID, OpenWithProgids,
-# RegisteredApplications under HKCU; no default changes.
-timeout 90 os win run g1 --desktop -- "$hd\explorust-viewer.exe" --register >/dev/null 2>&1 || true
-# Any explorust.exe can ask the running one to reload.
-timeout 90 os win run g1 --desktop -- 'C:\explorust\explorust.exe' --reload >/dev/null 2>&1 || true
-sleep 4
-out=$(timeout 90 os win run g1 --ps -- '& C:\explorust\g1-state.ps1 -Tail 8' 2>&1)
-cat "$(echo "$out" | grep '^log:' | awk '{print $2}')"
+# Adopt the on-disk guard before restarting the shell. A replaced file alone leaves the
+# old guard's startup policy in charge. All process changes here are confined to g1.
+cp dist/explorust-guard.exe dist/explorust-guard.next.exe
+timeout 90 os win push g1 dist/explorust-guard.next.exe 'C:\explorust' >/dev/null
+guard_command=$(cat <<'PS'
+$ErrorActionPreference = 'Stop'
+$source = 'C:\explorust\explorust-guard.next.exe'
+$live = Join-Path $d 'explorust-guard.exe'
+$shell = Get-CimInstance Win32_Process -Filter "Name = 'explorust.exe'" |
+    Where-Object { $_.SessionId -gt 0 -and $_.CommandLine -like '* --ready-event *' } |
+    Select-Object -First 1
+if (-not $shell) { throw 'No running explorust shell; guard adoption requires one.' }
+$session = $shell.SessionId
+$shellProcess = Get-Process -Id $shell.ProcessId
+$old = @(Get-Process explorust-guard | Where-Object SessionId -eq $session)
+if ($old.Count -ne 1) { throw "Expected one running guard in session $session, got $($old.Count)." }
+$changed = -not (Test-Path $live) -or (Get-FileHash $source).Hash -ne (Get-FileHash $live).Hash
+if ($changed) {
+    $staged = "$live.stage"
+    $aside = "$live.old$($old[0].Id)"
+    Copy-Item $source $staged -Force
+    if (Test-Path $live) { Move-Item $live $aside -Force }
+    try { Move-Item $staged $live }
+    catch {
+        if (Test-Path $aside) { Move-Item $aside $live }
+        throw
+    }
+}
+Remove-Item $source
+# The disk hash cannot identify the running image: setup may already have replaced it.
+$oldId = $old[0].Id
+Stop-Process -Id $oldId -Force
+for ($n = 0; $n -lt 100; $n++) {
+    $new = Get-Process explorust-guard -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq $session -and $_.Id -ne $oldId -and $_.Path -eq $live }
+    if ($new -and -not $shellProcess.HasExited) {
+        "guard adopted shell $($shellProcess.Id): $oldId -> $($new.Id)"
+        break
+    }
+    Start-Sleep -Milliseconds 100
+}
+if (-not $new -or $shellProcess.HasExited) { throw 'Replacement guard did not adopt the running shell.' }
+"SHELL_PID=$($shellProcess.Id)"
+PS
+)
+guard_result=$(timeout 90 os win run g1 --ps -- "\$d='$hd'; $guard_command" 2>&1) || {
+  echo "g1-deploy: guard adoption failed: $guard_result" >&2
+  guard_log=$(echo "$guard_result" | awk '/^log: / {print $2}')
+  [ -f "$guard_log" ] && cat "$guard_log" >&2
+  exit 1
+}
+guard_log=$(echo "$guard_result" | awk '/^log: / {print $2}')
+cat "$guard_log"
+old_shell=$(sed -n 's/^SHELL_PID=\([0-9]*\).*/\1/p' "$guard_log")
+[ -n "$old_shell" ] || { echo "g1-deploy: guard did not confirm the running shell PID" >&2; exit 1; }
+# Register the viewer and request reload in the interactive user's session. In g1 the
+# guest's --desktop command can take over a minute after the task itself has run.
+reload="$hd\explorust.exe"
+[ "$mode" = plain ] && reload="$hd\explorust.next.exe"
+reload_command=$(cat <<'PS'
+$ErrorActionPreference = 'Stop'
+$session = (Get-Process -Id $oldPid).SessionId
+$task = "explorust-g1-deploy-$oldPid"
+$viewer = New-ScheduledTaskAction -Execute "$d\explorust-viewer.exe" -Argument '--register'
+$restart = New-ScheduledTaskAction -Execute $reload -Argument '--reload'
+$principal = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\agent" -LogonType Interactive
+Register-ScheduledTask -TaskName $task -Action @($viewer, $restart) -Principal $principal -Force | Out-Null
+try {
+    Start-ScheduledTask -TaskName $task
+    for ($n = 0; $n -lt 100; $n++) {
+        if (-not (Get-Process -Id $oldPid -ErrorAction SilentlyContinue)) {
+            $new = Get-CimInstance Win32_Process -Filter "Name = 'explorust.exe' AND SessionId = $session" |
+                Where-Object CommandLine -like '* --ready-event *'
+            if ($new) { break }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if ($n -eq 100) { throw 'The shell did not restart under the guard.' }
+    & C:\explorust\g1-state.ps1 -Tail 8
+} finally {
+    Unregister-ScheduledTask -TaskName $task -Confirm:$false
+}
+PS
+)
+reload_status=0
+out=$(timeout 90 os win run g1 --ps -- "\$d='$hd'; \$reload='$reload'; \$oldPid=$old_shell; $reload_command" 2>&1) || reload_status=$?
+reload_log=$(echo "$out" | awk '/^log: / {print $2}')
+if [ -f "$reload_log" ]; then cat "$reload_log"; else echo "$out"; fi
+exit "$reload_status"

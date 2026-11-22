@@ -30,6 +30,12 @@ impl Owned {
             .map_err(|e| format!("CreateEvent {name}: {e}"))
     }
 
+    /// Opens a named event offered by the supervising guard without creating it.
+    pub fn open_for_signal(name: &str) -> Option<Self> {
+        // SAFETY: the returned handle is closed by the owner.
+        unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(name)) }.ok().map(Self)
+    }
+
     pub fn wait(&self, ms: u32) -> bool {
         // SAFETY: the handle is valid while self lives.
         unsafe { WaitForSingleObject(self.0, ms) == WAIT_OBJECT_0 }
