@@ -16,7 +16,7 @@ use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IServi
 use windows::Win32::System::Ole::IOleWindow;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::*;
-use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetWindowRect, HWND_TOP, PostMessageW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, ShowWindow, WM_NCDESTROY, WM_WINDOWPOSCHANGED};
+use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetWindowRect, HWND_TOP, IsChild, PostMessageW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, ShowWindow, WM_NCDESTROY, WM_WINDOWPOSCHANGED};
 use windows_core::{GUID, IUnknownImpl, Interface, Ref, Result, implement};
 
 pub const MSG_NAVIGATION: u32 = 0x8000 + 0x120;
@@ -299,6 +299,14 @@ impl Tab {
 
     pub fn browser(&self) -> &Browser {
         self.results.as_ref().map(|(_, view)| view).unwrap_or(&self.host)
+    }
+
+    /// Only the visible items view handles shell-view accelerators. The native navigation tree
+    /// receives its own messages, including when the results browser covers the folder's items.
+    pub fn focused_items(&self, focused: HWND) -> Option<IShellView> {
+        let view = self.shell_view()?;
+        let hwnd = unsafe { view.GetWindow().ok()? };
+        (!hwnd.is_invalid() && (hwnd == focused || unsafe { IsChild(hwnd, focused).as_bool() })).then_some(view)
     }
 
     pub fn invalidate_address(&mut self) -> usize {

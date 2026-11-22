@@ -4,7 +4,8 @@
 //! `exec:<path>` (`ShellExecuteEx` open, as the Run box does), `windows` (what the shell's window
 //! list reports for each window: its URL and its active view's folder), `frames` (visibility
 //! and DWM cloak state of Files windows), `activate:<x>,<y>` (click a verified Files window),
-//! `maximize` (the foreground Files window). Results go to `files-test.log` beside the exe.
+//! `maximize` or `place:<x>,<y>,<width>,<height>` (the foreground Files window), `focus` (native
+//! focus and ancestor classes). Results go to `files-test.log` beside the exe.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
@@ -134,6 +135,8 @@ mod win {
             "frames" => frames(),
             "activate" if n.len() == 2 => activate(n[0], n[1]),
             "maximize" => maximize(),
+            "place" if n.len() == 4 => place(&n),
+            "focus" => focus(),
             _ => "unknown step".into(),
         }
     }
@@ -146,6 +149,40 @@ mod win {
             }
             let _ = ShowWindow(hwnd, SW_MAXIMIZE);
             "ok".into()
+        }
+    }
+
+    fn place(n: &[i32]) -> String {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if !is_files(hwnd) {
+                return "Files does not have the foreground".into();
+            }
+            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+            format!("{:?}", SetWindowPos(hwnd, None, n[0], n[1], n[2], n[3], SWP_NOACTIVATE | SWP_NOZORDER | SWP_ASYNCWINDOWPOS))
+        }
+    }
+
+    fn focus() -> String {
+        unsafe {
+            let root = GetForegroundWindow();
+            let thread = GetWindowThreadProcessId(root, None);
+            let mut info = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+            if let Err(error) = GetGUIThreadInfo(thread, &mut info) {
+                return format!("{error}");
+            }
+            let mut hwnd = info.hwndFocus;
+            let mut ancestors = Vec::new();
+            while !hwnd.is_invalid() {
+                let mut class = [0u16; 64];
+                let len = GetClassNameW(hwnd, &mut class) as usize;
+                ancestors.push(String::from_utf16_lossy(&class[..len]));
+                match GetParent(hwnd) {
+                    Ok(parent) => hwnd = parent,
+                    Err(_) => break,
+                }
+            }
+            ancestors.join(" > ")
         }
     }
 

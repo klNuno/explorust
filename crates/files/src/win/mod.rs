@@ -2,6 +2,7 @@
 //! `WM_COPYDATA` handover), a hidden window kept ready, and the message loop.
 
 mod chrome;
+mod clipboard;
 mod details;
 mod frame;
 mod gfx;

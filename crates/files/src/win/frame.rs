@@ -11,7 +11,7 @@ use crate::win::details::Pane;
 use crate::win::gfx::{Canvas, Shared};
 use crate::win::shell::{self, Pidl};
 use crate::win::tab::{self, Tab};
-use crate::win::{log, menus, operations, search, share, shellwindows};
+use crate::win::{clipboard, log, menus, operations, search, share, shellwindows};
 use render::style::{self, Native, Part, WindowStyle};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -733,9 +733,11 @@ impl Frame {
                 let Some(view) = &sv else { return };
                 let Ok(items) = shell::selection(view) else { return };
                 if !items.is_empty() {
-                    let action = if c == Cmd::Delete { operations::Action::Delete { items, results: t.index_results_id() } }
-                        else { operations::Action::Clipboard(items, c == Cmd::Cut) };
-                    self.submit_operation(t.id, action);
+                    if c == Cmd::Delete {
+                        self.submit_operation(t.id, operations::Action::Delete { items, results: t.index_results_id() });
+                    } else {
+                        clipboard::publish(items, c == Cmd::Cut);
+                    }
                 }
                 return;
             }
@@ -752,11 +754,11 @@ impl Frame {
                 share::open(self.hwnd, view).map(|registration| self.sharing = Some(registration))
             }
             Cmd::Paste => {
-                if t.path.is_none() || !t.query.is_empty() || !menus::file_clipboard() {
+                if t.path.is_none() || !t.query.is_empty() {
                     return;
                 }
                 if let Some(folder) = t.history.current() {
-                    self.submit_operation(t.id, operations::Action::Paste(folder.clone()));
+                    self.submit_operation(t.id, operations::Action::Paste(folder.clone(), clipboard::snapshot()));
                 }
                 return;
             }
@@ -812,7 +814,9 @@ impl Frame {
         let vk = VIRTUAL_KEY(msg.wParam.0 as u16);
         let ctrl = key_down(VK_CONTROL);
         let alt = key_down(VK_MENU);
-        let in_edit = class_of(msg.hwnd) == "Edit";
+        let in_frame = msg.hwnd == self.hwnd;
+        let in_edit = if in_frame { self.address.is_some() || self.search_focus } else { class_of(msg.hwnd) == "Edit" };
+        let items = self.tab().filter(|_| !in_frame && !in_edit).and_then(|t| t.focused_items(msg.hwnd));
         let ours = match vk {
             VK_ESCAPE if !in_edit && self.clear_search() => {
                 self.draw();
@@ -821,7 +825,7 @@ impl Frame {
             VK_LEFT if alt => Some(Hit::Back),
             VK_RIGHT if alt => Some(Hit::Forward),
             VK_UP if alt => Some(Hit::Up),
-            VK_BACK if !in_edit && !ctrl && !alt => Some(Hit::Back),
+            VK_BACK if !ctrl && !alt && crate::edit::backspace_navigates(in_edit, items.is_some()) => Some(Hit::Back),
             VK_F5 => Some(Hit::Refresh),
             VK_F4 if !alt => Some(Hit::Address),
             VK_L if ctrl => Some(Hit::Address),
@@ -851,13 +855,20 @@ impl Frame {
             }
             return true;
         }
-        if in_edit || msg.hwnd == self.hwnd {
-            return false;
+        let Some(view) = items else { return false };
+        if ctrl && !alt && !key_down(VK_SHIFT) {
+            let command = match vk {
+                VK_X => Some(Cmd::Cut),
+                VK_C => Some(Cmd::Copy),
+                VK_V if self.tab().is_some_and(|t| t.path.is_some() && t.query.is_empty()) => Some(Cmd::Paste),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.act(Hit::Cmd(command));
+                return true;
+            }
         }
-        match self.tab().and_then(|t| t.shell_view()) {
-            Some(v) => (unsafe { v.TranslateAccelerator(msg) }) == S_OK,
-            None => false,
-        }
+        (unsafe { view.TranslateAccelerator(msg) }) == S_OK
     }
 
     /// Keys while the address or search box has the focus.
@@ -924,8 +935,8 @@ impl Frame {
         }
     }
 
-    fn operation_results(&mut self) {
-        let Some(worker) = &self.operations else { return };
+    fn operation_results(&mut self, worker_id: usize) {
+        let Some(worker) = self.operations.as_ref().filter(|worker| worker.id == worker_id) else { return };
         for response in worker.take() {
             match response {
                 operations::Response::Address { tab, request, destination } => {
@@ -1465,11 +1476,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             operations::MSG_OPERATION => {
-                with(hwnd, Frame::operation_results);
+                with(hwnd, |f| f.operation_results(wp.0));
                 LRESULT(0)
             }
             WM_CLOSE => {
-                with(hwnd, |f| f.tabs.clear());
+                with(hwnd, |f| {
+                    f.operations.take();
+                    f.tabs.clear();
+                });
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
@@ -1477,7 +1491,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = windows::Win32::System::DataExchange::RemoveClipboardFormatListener(hwnd);
                 BROWSES.with(|pending| pending.borrow_mut().retain(|(window, _, _)| *window != hwnd));
                 NAVIGATION.with(|pending| pending.borrow_mut().retain(|(window, _, _)| *window != hwnd));
-                if let Some(Some(c)) = with(hwnd, |f| f.sw_cookie.take()) {
+                if let Some(Some(c)) = with(hwnd, |f| {
+                    f.operations.take();
+                    f.sw_cookie.take()
+                }) {
                     shellwindows::revoke(c);
                 }
                 FRAMES.with(|f| f.borrow_mut().retain(|(h, _)| *h != hwnd));

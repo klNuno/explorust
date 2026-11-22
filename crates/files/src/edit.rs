@@ -9,6 +9,11 @@ pub struct LineEdit {
     pub all: bool,
 }
 
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn backspace_navigates(editing: bool, items_focused: bool) -> bool {
+    !editing && items_focused
+}
+
 impl LineEdit {
     pub fn set(&mut self, s: &str) {
         self.text = s.chars().collect();
@@ -97,6 +102,14 @@ impl LineEdit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backspace_navigates_only_from_the_items_view() {
+        assert!(backspace_navigates(false, true));
+        assert!(!backspace_navigates(true, false));
+        assert!(!backspace_navigates(true, true));
+        assert!(!backspace_navigates(false, false));
+    }
 
     #[test]
     fn typing_replaces_the_selection() {

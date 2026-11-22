@@ -1,28 +1,20 @@
 //! Filesystem and extension work on an operation STA per window. Only owned paths and PIDLs cross
 //! the boundary so a provider cannot block by calling back through the view's COM apartment.
 
-use super::{inbox::Inbox, log, shell::{self, Pidl}};
-use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, GlobalFree, HWND, LPARAM, S_OK, WPARAM};
-use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
-use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_MOVE, OleFlushClipboard, OleInitialize, OleSetClipboard, OleUninitialize};
-use windows::Win32::UI::Shell::*;
+use super::{clipboard, inbox::Inbox, log, shell::{self, Pidl}};
+use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}, mpsc};
+use windows::Win32::Foundation::{E_ABORT, HWND, LPARAM, WPARAM};
+use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
+use windows::Win32::UI::Shell::SHMultiFileProperties;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows_core::{Interface, Result};
-
-// The generated wrapper treats S_FALSE as success. Preserve the distinction so a closing view
-// flushes its own delayed clipboard data without touching another application's clipboard.
-windows_core::link!("ole32.dll" "system" fn OleIsCurrentClipboard(data: *mut core::ffi::c_void) -> windows_core::HRESULT);
+use windows_core::Result;
 
 pub const MSG_OPERATION: u32 = WM_APP + 0x12B;
 
 pub enum Action {
     Address { text: String, request: usize },
-    Clipboard(Vec<Pidl>, bool),
     Delete { items: Vec<Pidl>, results: Option<usize> },
-    Paste(Pidl),
+    Paste(Pidl, mpsc::Receiver<Result<clipboard::Source>>),
     NewFolder(Pidl, &'static str),
     Properties(Vec<Pidl>),
 }
@@ -39,19 +31,22 @@ struct Job {
 }
 
 pub struct Worker {
+    pub id: usize,
     input: Arc<Inbox<Option<Job>>>,
-    output: Arc<Mutex<Vec<Response>>>,
+    output: Arc<Mutex<Option<Vec<Response>>>>,
 }
 
 impl Worker {
     pub fn new(hwnd: HWND) -> std::io::Result<Self> {
         let input = Arc::new(Inbox::default());
-        let output = Arc::new(Mutex::new(Vec::new()));
+        static NEXT_WORKER: AtomicUsize = AtomicUsize::new(1);
+        let id = NEXT_WORKER.fetch_add(1, Ordering::Relaxed);
+        let output = Arc::new(Mutex::new(Some(Vec::new())));
         let hwnd = hwnd.0 as isize;
         let jobs = input.clone();
         let replies = output.clone();
-        std::thread::Builder::new().name("files-operations".into()).spawn(move || run(hwnd, jobs, replies))?;
-        Ok(Self { input, output })
+        std::thread::Builder::new().name("files-operations".into()).spawn(move || run(hwnd, id, jobs, replies))?;
+        Ok(Self { id, input, output })
     }
 
     pub fn submit(&self, tab: usize, action: Action) {
@@ -61,31 +56,34 @@ impl Worker {
     }
 
     pub fn take(&self) -> Vec<Response> {
-        std::mem::take(&mut *self.output.lock().unwrap())
+        self.output.lock().unwrap().as_mut().map(std::mem::take).unwrap_or_default()
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.input.stop(None);
+        self.output.lock().unwrap().take();
+        // Keep accepted mutations in FIFO order. Work that only serves the closed frame can go.
+        self.input.close(None, |job| job.as_ref().is_some_and(|job| matches!(job.action,
+            Action::Delete { .. } | Action::Paste(..) | Action::NewFolder(..))));
     }
 }
 
-fn run(owner: isize, input: Arc<Inbox<Option<Job>>>, output: Arc<Mutex<Vec<Response>>>) {
+fn run(owner: isize, id: usize, input: Arc<Inbox<Option<Job>>>, output: Arc<Mutex<Option<Vec<Response>>>>) {
     let receiver = input.attach();
     if let Err(error) = unsafe { OleInitialize(None) } {
         log::line(&format!("Files operation OLE initialization failed: {error}"));
         return;
     }
     let owner = HWND(owner as _);
-    let mut clipboard = None;
     let mut msg = MSG::default();
     'pump: loop {
         while let Some(job) = receiver.next() {
             let Some(job) = job else { break 'pump };
-            if let Some(response) = perform(owner, job, &mut clipboard) && !input.closed() {
-                output.lock().unwrap().push(response);
-                let _ = unsafe { PostMessageW(Some(owner), MSG_OPERATION, WPARAM(0), LPARAM(0)) };
+            let operation_owner = if output.lock().unwrap().is_some() { owner } else { HWND::default() };
+            if let Some(response) = perform(operation_owner, job) && let Some(responses) = output.lock().unwrap().as_mut() {
+                responses.push(response);
+                let _ = unsafe { PostMessageW(Some(owner), MSG_OPERATION, WPARAM(id), LPARAM(0)) };
             }
         }
         unsafe {
@@ -96,17 +94,10 @@ fn run(owner: isize, input: Arc<Inbox<Option<Job>>>, output: Arc<Mutex<Vec<Respo
             DispatchMessageW(&msg);
         }
     }
-    unsafe {
-        if let Some(data) = clipboard {
-            if OleIsCurrentClipboard(data.as_raw()) == S_OK {
-                let _ = OleFlushClipboard();
-            }
-        }
-        OleUninitialize();
-    }
+    unsafe { OleUninitialize() };
 }
 
-fn perform(owner: HWND, job: Job, clipboard: &mut Option<IDataObject>) -> Option<Response> {
+fn perform(owner: HWND, job: Job) -> Option<Response> {
     let Job { tab, action } = job;
     let (verb, result, refresh) = match action {
         Action::Address { text, request } => {
@@ -122,21 +113,21 @@ fn perform(owner: HWND, job: Job, clipboard: &mut Option<IDataObject>) -> Option
             }
             return Some(Response::Address { tab, request, destination });
         }
-        Action::Clipboard(items, cut) => {
-            let result = put_clipboard(&items, cut).map(|data| *clipboard = Some(data));
-            (if cut { "Cut" } else { "Copy" }, result, None)
-        }
         Action::Delete { items, results } => {
             let result = shell::delete_items(owner, &items);
             log::line(&format!("command Delete: {result:?} (operation STA)"));
             return results.filter(|_| result.is_ok()).map(|results| Response::Deleted { tab, results, items });
         }
-        Action::Paste(folder) => ("Paste", shell::paste(owner, &folder), Some(folder)),
+        Action::Paste(folder, source) => {
+            let result = source.recv().unwrap_or_else(|_| Err(E_ABORT.into()))
+                .and_then(|source| shell::paste(owner, &folder, &source));
+            ("Paste", result, Some(folder))
+        }
         Action::NewFolder(folder, name) => {
             ("New", folder.item().and_then(|item| shell::new_folder(owner, &item, name)), Some(folder))
         }
         Action::Properties(items) => {
-            let result = data_object(&items).and_then(|data| unsafe { SHMultiFileProperties(&data, 0) });
+            let result = shell::data_object(&items).and_then(|data| unsafe { SHMultiFileProperties(&data, 0) });
             ("Properties", result, None)
         }
     };
@@ -144,39 +135,50 @@ fn perform(owner: HWND, job: Job, clipboard: &mut Option<IDataObject>) -> Option
     refresh.filter(|_| result.is_ok()).map(|folder| Response::Refresh { tab, folder })
 }
 
-fn data_object(items: &[Pidl]) -> Result<IDataObject> {
-    if items.is_empty() {
-        return Err(E_INVALIDARG.into());
-    }
-    let children: Vec<_> = items.iter().map(Pidl::as_ptr).collect();
-    // Absolute item IDs are relative to the desktop ID list. Keep the paths in the shell's
-    // IDataObject so paste can use the original namespace, including mixed-parent results.
-    let desktop = Pidl(vec![0, 0]);
-    unsafe { SHCreateDataObject(Some(desktop.as_ptr()), Some(&children), None::<&IDataObject>) }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, path::PathBuf, time::{Duration, Instant}};
 
-fn put_clipboard(items: &[Pidl], cut: bool) -> Result<IDataObject> {
-    let data = data_object(items)?;
-    unsafe {
-        let format = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
-        if format == 0 {
-            return Err(windows_core::Error::from_thread());
+    struct Fixture(PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
         }
-        let h = GlobalAlloc(GMEM_MOVEABLE, size_of::<u32>())?;
-        let value = GlobalLock(h).cast::<u32>();
-        if value.is_null() {
-            let _ = GlobalFree(Some(h));
-            return Err(E_FAIL.into());
-        }
-        *value = if cut { DROPEFFECT_MOVE } else { DROPEFFECT_COPY }.0;
-        let _ = GlobalUnlock(h);
-        let format = FORMATETC { cfFormat: format as u16, dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32, ..Default::default() };
-        let storage = STGMEDIUM { tymed: TYMED_HGLOBAL.0 as u32, u: STGMEDIUM_0 { hGlobal: h }, ..Default::default() };
-        if let Err(error) = data.SetData(&format, &storage, true) {
-            let _ = GlobalFree(Some(h));
-            return Err(error);
-        }
-        OleSetClipboard(&data)?;
     }
-    Ok(data)
+
+    #[test]
+    fn accepted_paste_and_new_folder_finish_after_window_closes() {
+        let dir = std::env::temp_dir().join(format!("explorust-files-drain-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let fixture = Fixture(dir);
+        let source_path = fixture.0.join("move.txt");
+        let target_path = fixture.0.join("target");
+        fs::write(&source_path, "move me").unwrap();
+        fs::create_dir(&target_path).unwrap();
+        let (source, target) = unsafe {
+            OleInitialize(None).unwrap();
+            let source = Pidl::parse_result(source_path.to_str().unwrap());
+            let target = Pidl::parse_result(target_path.to_str().unwrap());
+            OleUninitialize();
+            (source.unwrap(), target.unwrap())
+        };
+        let worker = Worker::new(HWND::default()).unwrap();
+        let (release, pending) = mpsc::channel();
+        worker.submit(1, Action::Paste(target.clone(), pending));
+        worker.submit(1, Action::NewFolder(target, "queued folder"));
+        drop(worker);
+        release.send(Ok(clipboard::Source { items: vec![source], cut: true })).unwrap();
+
+        let moved = target_path.join("move.txt");
+        let created = target_path.join("queued folder");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !created.is_dir() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(created.is_dir(), "queued New Folder did not finish");
+        assert!(!source_path.exists(), "Paste did not move the accepted selection");
+        assert_eq!(fs::read_to_string(moved).unwrap(), "move me");
+    }
 }

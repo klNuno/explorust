@@ -3,16 +3,16 @@
 //! the ones Explorer itself uses).
 
 use std::ffi::c_void;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT};
+use windows::Win32::Foundation::{E_INVALIDARG, HWND, LPARAM};
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IDataObject};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::SystemServices::{SFGAO_BROWSABLE, SFGAO_FOLDER, SFGAO_LINK};
 use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, DestroyMenu, EnumChildWindows, GetClassNameW, SW_SHOWNORMAL, SendMessageW, WM_THEMECHANGED,
+    EnumChildWindows, GetClassNameW, SW_SHOWNORMAL, SendMessageW, WM_THEMECHANGED,
 };
 use windows_core::{BOOL, HSTRING, PCSTR, PCWSTR, PWSTR, Result, w};
 
@@ -173,37 +173,33 @@ pub fn home() -> Option<Pidl> {
     Pidl::parse("shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}").or_else(|| Pidl::parse("shell:MyComputerFolder"))
 }
 
-const CMIC_MASK_UNICODE: u32 = 0x4000;
-
-/// Invokes a canonical verb ("cut", "copy", "delete", "paste", "NewFolder", ...) on a context menu.
-fn invoke(menu: &IContextMenu, hwnd: HWND, verb: &str) -> Result<()> {
-    let a: Vec<u8> = verb.bytes().chain(std::iter::once(0)).collect();
-    let wv = shelldata::wide(verb);
-    unsafe {
-        let hmenu = CreatePopupMenu()?;
-        let fill = menu.QueryContextMenu(hmenu, 0, 1, 0x7fff, CMF_NORMAL | CMF_CANRENAME);
-        let info = CMINVOKECOMMANDINFOEX {
-            cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-            fMask: CMIC_MASK_UNICODE,
-            hwnd,
-            lpVerb: PCSTR(a.as_ptr()),
-            lpVerbW: PCWSTR(wv.as_ptr()),
-            nShow: SW_SHOWNORMAL.0,
-            ptInvoke: POINT::default(),
-            ..Default::default()
-        };
-        let r = fill.ok().and_then(|()| menu.InvokeCommand(&info as *const _ as *const CMINVOKECOMMANDINFO));
-        let _ = DestroyMenu(hmenu);
-        r
+pub fn data_object(items: &[Pidl]) -> Result<IDataObject> {
+    if items.is_empty() {
+        return Err(E_INVALIDARG.into());
     }
+    let children: Vec<_> = items.iter().map(Pidl::as_ptr).collect();
+    // Absolute IDs are relative to the desktop. A selection can span multiple folders.
+    let desktop = Pidl(vec![0, 0]);
+    unsafe { SHCreateDataObject(Some(desktop.as_ptr()), Some(&children), None::<&IDataObject>) }
 }
 
-pub fn paste(owner: HWND, folder: &Pidl) -> Result<()> {
+pub fn paste(owner: HWND, folder: &Pidl, source: &super::clipboard::Source) -> Result<()> {
+    let children: Vec<_> = source.items.iter().map(Pidl::as_ptr).collect();
+    let same_folder = source.items.iter().all(|item| item.parent().as_ref() == Some(folder));
+    let folder = folder.item()?;
+    let mut flags = FOF_ALLOWUNDO | FOFX_ADDUNDORECORD;
+    if !source.cut && same_folder {
+        flags |= FOF_RENAMEONCOLLISION;
+    }
     unsafe {
-        let parent = SHGetDesktopFolder()?;
-        let folder: IShellFolder = parent.BindToObject(folder.as_ptr(), None)?;
-        let menu = folder.CreateViewObject(owner)?;
-        invoke(&menu, owner, "paste")
+        let items = SHCreateShellItemArrayFromIDLists(&children)?;
+        let op = file_operation(owner, flags)?;
+        if source.cut {
+            op.MoveItems(&items, &folder)?;
+        } else {
+            op.CopyItems(&items, &folder)?;
+        }
+        complete_operation(&op)
     }
 }
 
@@ -221,9 +217,7 @@ pub fn open_item(owner: HWND, item: &Pidl) -> Result<()> {
 
 pub fn new_folder(owner: HWND, folder: &IShellItem, name: &str) -> Result<()> {
     unsafe {
-        let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
-        op.SetOwnerWindow(owner)?;
-        op.SetOperationFlags(FOF_RENAMEONCOLLISION | FOF_NOCONFIRMMKDIR)?;
+        let op = file_operation(owner, FOF_RENAMEONCOLLISION | FOF_NOCONFIRMMKDIR)?;
         op.NewItem(folder, FILE_ATTRIBUTE_DIRECTORY.0, &HSTRING::from(name), PCWSTR::null(), None::<&IFileOperationProgressSink>)?;
         complete_operation(&op)
     }
@@ -233,11 +227,20 @@ pub fn delete_items(owner: HWND, items: &[Pidl]) -> Result<()> {
     let children: Vec<_> = items.iter().map(Pidl::as_ptr).collect();
     unsafe {
         let selection = SHCreateShellItemArrayFromIDLists(&children)?;
-        let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
-        op.SetOwnerWindow(owner)?;
-        op.SetOperationFlags(FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOFX_RECYCLEONDELETE)?;
+        let op = file_operation(owner, FOF_ALLOWUNDO | FOFX_ADDUNDORECORD | FOFX_RECYCLEONDELETE)?;
         op.DeleteItems(&selection)?;
         complete_operation(&op)
+    }
+}
+
+fn file_operation(owner: HWND, flags: FILEOPERATION_FLAGS) -> Result<IFileOperation> {
+    unsafe {
+        let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
+        if !owner.is_invalid() {
+            op.SetOwnerWindow(owner)?;
+        }
+        op.SetOperationFlags(flags)?;
+        Ok(op)
     }
 }
 
@@ -252,10 +255,14 @@ fn complete_operation(op: &IFileOperation) -> Result<()> {
 }
 
 pub fn selection(view: &IShellView) -> Result<Vec<Pidl>> {
+    let selection: IShellItemArray = unsafe { view.GetItemObject(SVGIO_SELECTION)? };
+    item_ids(&selection)
+}
+
+pub fn item_ids(items: &IShellItemArray) -> Result<Vec<Pidl>> {
     unsafe {
-        let selection: IShellItemArray = view.GetItemObject(SVGIO_SELECTION)?;
-        (0..selection.GetCount()?)
-            .map(|i| Pidl::of(&selection.GetItemAt(i)?).ok_or_else(windows_core::Error::empty))
+        (0..items.GetCount()?)
+            .map(|i| Pidl::of(&items.GetItemAt(i)?).ok_or_else(windows_core::Error::empty))
             .collect()
     }
 }

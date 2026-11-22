@@ -34,10 +34,14 @@ impl<T> Inbox<T> {
     }
 
     pub fn stop(&self, last: T) {
+        self.close(last, |_| false);
+    }
+
+    pub fn close(&self, last: T, keep: impl FnMut(&T) -> bool) {
         let mut state = self.0.lock().unwrap();
         if !state.closed {
             state.closed = true;
-            state.jobs.clear();
+            state.jobs.retain(keep);
             state.jobs.push_back(last);
             state.wake();
         }
@@ -79,5 +83,21 @@ impl<T> Drop for Receiver<'_, T> {
         let mut state = self.0.0.lock().unwrap();
         state.closed = true;
         state.jobs.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_seals_the_queue_and_keeps_accepted_mutations_in_order() {
+        let inbox = Inbox::default();
+        assert!(inbox.send(Some("paste")));
+        assert!(inbox.send(Some("address")));
+        assert!(inbox.send(Some("new folder")));
+        inbox.close(None, |job| *job != Some("address"));
+        assert!(!inbox.send(Some("late request")));
+        assert_eq!(inbox.0.lock().unwrap().jobs, [Some("paste"), Some("new folder"), None]);
     }
 }
