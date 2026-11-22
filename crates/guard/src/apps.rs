@@ -15,7 +15,7 @@ fn programs() -> PathBuf {
 
 pub const SETTINGS_EXE: &str = "explorust-settings.exe";
 
-/// Localized name, target arguments and description. An empty argument targets Settings.
+/// Localized name, action and description for each shortcut.
 fn shortcuts() -> [(&'static str, &'static str, &'static str); 4] {
     [
         (
@@ -76,6 +76,7 @@ pub fn register(guard: &Path) -> Result<String, String> {
     let quiet = format!("\"{g}\" --uninstall --quiet");
     let location = dir.display().to_string();
     let settings = dir.join(SETTINGS_EXE);
+    let switch = dir.join(crate::switch_events::SWITCH_EXE);
     let icon = format!("\"{}\",0", settings.display());
     let entry = reg::set_uninstall_entry(
         &[
@@ -102,7 +103,12 @@ pub fn register(guard: &Path) -> Result<String, String> {
         }
     }
     for (name, args, desc) in shortcuts() {
-        let target = if args.is_empty() { &settings } else { guard };
+        let target = match args {
+            "" => &settings,
+            "--switch" if switch.is_file() => &switch,
+            "--switch" => continue,
+            _ => guard,
+        };
         match make_link(&folder.join(format!("{name}.lnk")), target, args, desc, &settings) {
             Ok(()) => made += 1,
             Err(e) => errors.push(e),

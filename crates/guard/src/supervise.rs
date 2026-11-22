@@ -13,8 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub use launch_timing::FALLBACK_EVENT;
-pub const RELEASE_EXPLORER: &str = r"Local\explorust-guard-release-explorer";
-pub const WATCHES_EXPLORER_HANDOFF: &str = r"Local\explorust-guard-watches-explorer-handoff";
+use crate::switch_events::{EXITING_EXPLORER, RELEASE_EXPLORER, WATCHES_EXPLORER_HANDOFF, switch_event};
 
 enum End {
     /// Something went wrong: explorer takes over and the user is told.
@@ -34,7 +33,7 @@ const RELOAD: u32 = 5;
 const PROBLEM: u32 = 6;
 
 /// `adopt`: the pid of a running explorust whose guard died; it is watched instead of starting one.
-pub fn run(adopt: Option<(u32, Option<String>)>, live: bool) -> u32 {
+pub fn run(adopt: Option<(u32, Option<String>)>, handoff: Option<u64>) -> u32 {
     let fallback = match Event::named(FALLBACK_EVENT) {
         Ok(e) => e,
         Err(e) => {
@@ -42,7 +41,13 @@ pub fn run(adopt: Option<(u32, Option<String>)>, live: bool) -> u32 {
             return explorer_forever(None);
         }
     };
-    let _hotkey = hotkey::spawn(fallback.0);
+    // Create the fallback event before checking rollback. A watcher starting recovery can
+    // either prevent this start or signal fallback through the event held by this guard.
+    if handoff.is_some_and(|stamp| Event::is_signalled(&switch_event(stamp, "rollback"))) {
+        return 1;
+    }
+    let live = handoff.is_some();
+    hotkey::spawn(fallback.0);
     let exe = shell_exe();
     let build = reg::windows_build();
     let mut attempt = 0u32;
@@ -451,7 +456,7 @@ fn explorer_forever(notice: Option<Notice>) -> u32 {
                 } else {
                     wait_any(&[shell.handle], None);
                 }
-                if Event::is_signalled(crate::switch::watcher::EXITING_EXPLORER) {
+                if Event::is_signalled(EXITING_EXPLORER) {
                     return released_explorer();
                 }
                 log::line(&format!("explorer pid {pid} ended after {} s, code {:#x}", up.elapsed().as_secs(), shell.exit_code()));

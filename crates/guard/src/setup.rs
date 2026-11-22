@@ -9,7 +9,7 @@ use crate::launch_timing::{FALLBACK_EVENT, RELOAD_EVENT, build_verdict_event, re
 use crate::manage::OTHER_ACCOUNT;
 use crate::proc::Event;
 use crate::setup_mode::{self, Mode, Restart, RestartProgress};
-use crate::{account, install, log, taskbar};
+use crate::{account, explorer_launch, install, log, switch_events::SWITCH_EXE, taskbar};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use windows::Win32::System::Shutdown::{EWX_LOGOFF, ExitWindowsEx, SHTDN_REASON_FLAG_PLANNED, SHTDN_REASON_MAJOR_APPLICATION};
@@ -105,8 +105,11 @@ pub fn run() -> u32 {
         return finish_live_update(&exe, pid);
     }
     if let Mode::SwitchLive { .. } = mode {
-        match crate::switch::launch_from_setup() {
-            Ok(()) => return 0,
+        match explorer_launch::launch_switch(&install::dir().join(SWITCH_EXE)) {
+            Ok(()) => {
+                log::line("switch: Explorer launched the unelevated session switch");
+                return 0;
+            }
             Err(e) => log::line(&format!("setup: live switch unavailable after installation: {e}")),
         }
     }
@@ -146,7 +149,7 @@ fn install_mode(exe: &Path) -> (Mode, bool) {
     let preserves_files = shell.is_some_and(|pid| Event::open_for_signal(&reload_preserves_files_event(pid)).is_ok());
     let explorer_present = shell.is_none() && taskbar::explorer_window().is_some();
     let explorer = explorer_present
-        && match crate::switch::can_launch_switch() {
+        && match explorer_launch::can_launch_switch() {
             Ok(()) => true,
             Err(e) => {
                 log::line(&format!("setup: cannot switch now: {e}"));

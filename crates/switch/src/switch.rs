@@ -4,12 +4,12 @@ mod explorer;
 mod reopen_list;
 pub(crate) mod watcher;
 
-use crate::launch_timing::{self, FALLBACK_EVENT, build_verdict_event};
-use crate::proc::{Child, Event};
-use crate::ui::{self, Icon, tr};
-use crate::{GUARD_MUTEX, account, install, log, policy, reg, reopen, supervise, taskbar};
+use guard::launch_timing::{self, FALLBACK_EVENT, build_verdict_event};
+use guard::proc::{Child, Event};
+use guard::switch_events::{CANCEL_FOR_RESTORE, GUARD_MUTEX, RELEASE_EXPLORER, SWITCH_EXE, WATCHES_EXPLORER_HANDOFF};
+use guard::ui::{self, Icon, tr};
+use guard::{account, explorer_launch, install, log, policy, reg, reopen, taskbar};
 use std::path::Path;
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND};
@@ -22,12 +22,8 @@ const VERDICT_LIMIT: Duration = Duration::from_secs(
         + launch_timing::VERDICT_BUDGET.as_secs()
         + 30,
 );
-const CANCEL_FOR_RESTORE: &str = r"Local\explorust-cancel-switch-for-restore";
-
-pub use explorer::can_launch_switch;
-
 pub fn launch_from_setup() -> Result<(), String> {
-    explorer::launch_switch(&install::dir().join("explorust-guard.exe"))?;
+    explorer_launch::launch_switch(&install::dir().join(SWITCH_EXE))?;
     log::line("switch: Explorer launched the unelevated session switch");
     Ok(())
 }
@@ -58,17 +54,16 @@ pub fn run_worker() -> u32 {
     }
     let guard = dir.join("explorust-guard.exe");
     let exe = dir.join("explorust.exe");
-    let mut supervisor = None;
+    let worker = dir.join(SWITCH_EXE);
     let result = ui::working_cancellable(
         tr("Passage à explorust", "Switching to explorust"),
         tr(
             "explorust attend la fin des opérations de fichiers de l’Explorateur Windows.",
             "explorust waits for File Explorer to finish its file operations.",
         ),
-        |cancel| switch(&guard, &exe, cancel, &mut supervisor),
+        |cancel| switch(&worker, &guard, &exe, cancel),
     );
-    let code = show(result);
-    supervisor.map_or(code, |thread| thread.join().unwrap_or(1))
+    show(result)
 }
 
 enum Outcome {
@@ -143,10 +138,10 @@ fn show(result: Result<Outcome, String>) -> u32 {
 }
 
 fn switch(
+    worker: &Path,
     guard: &Path,
     exe: &Path,
     cancel: &ui::Cancel,
-    supervisor: &mut Option<JoinHandle<u32>>,
 ) -> Result<Outcome, String> {
     let _lock = install::lock()?;
     let expected = format!("\"{}\"", guard.display());
@@ -160,15 +155,15 @@ fn switch(
         return Err("no Explorer taskbar in this session".into());
     };
     let explorer_process = Child::monitor(pid)?;
-    let guard_pid = std::process::id();
-    let stamp = reopen::guard_stamp(guard_pid)
-        .ok_or("could not identify this guard for the Files handoff")?;
+    let worker_pid = std::process::id();
+    let stamp = reopen::guard_stamp(worker_pid)
+        .ok_or("could not identify the switch worker for the Files handoff")?;
     let (mut watcher, previous) = loop {
         wait_for_file_operations(tray, pid, cancel)?;
         if cancel_requested(cancel) {
             return Ok(cancelled());
         }
-        let Some(watcher) = watcher::Watcher::prepare(guard, stamp, tray, pid, cancel)? else {
+        let Some(watcher) = watcher::Watcher::prepare(worker, stamp, tray, pid, cancel)? else {
             return Ok(cancelled());
         };
         // Just collect the legacy guard's handle. The previous guard still watches Explorer
@@ -185,16 +180,11 @@ fn switch(
             watcher::Desktop::Vacated => {}
         }
         release_previous_guard(previous)?;
-        thread::Builder::new()
-            .name("supervise".into())
-            .spawn(|| crate::run_shell(None, true))
-            .map_err(|e| format!("start supervision: {e}"))
-            .and_then(|thread| {
-                log::line(&format!("switch: guard pid {guard_pid} took over the session"));
-                wait_for_verdict(exe, supervisor.insert(thread))?;
-                watcher.accept()?;
-                Ok(Outcome::Running)
-            })
+        let supervisor = Child::spawn(guard, &format!("--live {worker_pid} {stamp}"))?;
+        log::line(&format!("switch: guard pid {} took over the session", supervisor.pid));
+        wait_for_verdict(exe, &supervisor)?;
+        watcher.accept()?;
+        Ok(Outcome::Running)
     });
     match started {
         Ok(outcome) => Ok(outcome),
@@ -225,13 +215,6 @@ fn cancelled() -> Outcome {
     } else {
         postponed()
     }
-}
-
-/// Cancel a preparation or wait out a committed handoff before deleting this user's Shell value.
-pub fn lock_for_restore() -> Result<install::Lock, String> {
-    let cancel = Event::named(CANCEL_FOR_RESTORE)?;
-    cancel.signal()?;
-    install::lock_for(240_000)
 }
 
 fn wait_for_file_operations(tray: HWND, pid: u32, cancel: &ui::Cancel) -> Result<(), String> {
@@ -280,10 +263,10 @@ fn previous_guard(explorer: u32, guard: &Path) -> Result<Option<PreviousGuard>, 
     if !guard_present()? {
         return Ok(None);
     }
-    if Event::open_for_signal(supervise::WATCHES_EXPLORER_HANDOFF).is_ok() {
+    if Event::open_for_signal(WATCHES_EXPLORER_HANDOFF).is_ok() {
         return Ok(Some(PreviousGuard::WatchingHandoff));
     }
-    if let Ok(request) = Event::open_for_signal(supervise::RELEASE_EXPLORER) {
+    if let Ok(request) = Event::open_for_signal(RELEASE_EXPLORER) {
         return Ok(Some(PreviousGuard::Release(request)));
     }
     // Old builds have no handoff event. Keep a handle to the verified Explorer parent while it
@@ -332,14 +315,14 @@ fn release_previous_guard(previous: Option<PreviousGuard>) -> Result<(), String>
     Ok(())
 }
 
-fn wait_for_verdict(exe: &Path, supervisor: &JoinHandle<u32>) -> Result<(), String> {
+fn wait_for_verdict(exe: &Path, supervisor: &Child) -> Result<(), String> {
     let started = Instant::now();
     loop {
         if let Some((_, pid)) = taskbar::explorer_window() {
             let _ = Event::set_existing(FALLBACK_EVENT);
             return Err(format!("Explorer pid {pid} took back the taskbar"));
         }
-        if supervisor.is_finished() {
+        if supervisor.ended() {
             return Err("supervision ended before the build verdict".into());
         }
         if !Event::is_signalled(FALLBACK_EVENT)

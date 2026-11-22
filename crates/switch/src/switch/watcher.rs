@@ -1,8 +1,10 @@
 //! Keep an independent process alive from Explorer preparation through the build verdict.
 
 use super::{explorer, reopen_list};
-use crate::proc::{Child, Event, wait_any};
-use crate::{account, install, log, manage, reopen, taskbar};
+use guard::launch_timing::FALLBACK_EVENT;
+use guard::proc::{Child, Event, wait_any};
+use guard::switch_events::{EXITING_EXPLORER, SWITCH_EXE, switch_event};
+use guard::{account, bring_back_explorer, install, log, reopen, taskbar, ui};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
@@ -11,9 +13,6 @@ const PREPARE_BUDGET: Duration = Duration::from_secs(15);
 const RESTORED: u32 = 2;
 const POSTPONED: u32 = 3;
 const FAILED: u32 = 1;
-
-/// The previous supervisor only relinquishes Explorer after its process exits during a switch.
-pub const EXITING_EXPLORER: &str = r"Local\explorust-switch-exiting-explorer";
 
 struct Signals {
     prepared: Event,
@@ -26,7 +25,7 @@ struct Signals {
 
 impl Signals {
     fn open(stamp: u64) -> Result<Self, String> {
-        let get = |suffix| Event::named(&format!(r"Local\explorust-switch-{stamp}-{suffix}"));
+        let get = |name| Event::named(&switch_event(stamp, name));
         Ok(Self {
             prepared: get("prepared")?,
             exit: get("exit")?,
@@ -54,11 +53,11 @@ pub struct Watcher {
 
 impl Watcher {
     pub fn prepare(
-        guard: &Path,
+        worker: &Path,
         stamp: u64,
         tray: HWND,
         explorer_pid: u32,
-        cancel: &crate::ui::Cancel,
+        cancel: &ui::Cancel,
     ) -> Result<Option<Self>, String> {
         let signals = Signals::open(stamp)?;
         let args = format!(
@@ -67,7 +66,7 @@ impl Watcher {
             tray.0 as usize,
         );
         let mut watcher = Self {
-            child: Child::spawn(guard, &args)?,
+            child: Child::spawn(worker, &args)?,
             signals,
             stamp,
             committed: false,
@@ -182,7 +181,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         || !account::is_session_user()
         || reopen::guard_stamp(owner) != Some(stamp)
         || !taskbar::image_path(owner).is_some_and(|image| {
-            image.eq_ignore_ascii_case(&installed.join("explorust-guard.exe").to_string_lossy())
+            image.eq_ignore_ascii_case(&installed.join(SWITCH_EXE).to_string_lossy())
         })
     {
         return Err("the switch watcher has no valid unelevated switch owner".into());
@@ -192,7 +191,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
     }
     let signals = Signals::open(stamp)?;
     let retiring = Child::monitor(explorer_pid)?;
-    log::line(&format!("switch: watcher reading Explorer folders for guard pid {owner}"));
+    log::line(&format!("switch: watcher reading Explorer folders for switch pid {owner}"));
     let folders = explorer::open_folders()?;
     let paths: Vec<_> = folders.iter().map(|(_, path)| path.clone()).collect();
     let snapshot = snapshot_path(stamp);
@@ -200,7 +199,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         .map_err(|e| format!("save Explorer recovery snapshot: {e}"))?;
     reopen::save(&log::dir(), stamp, &paths).map_err(|e| format!("save Files handoff: {e}"))?;
     log::line(&format!(
-        "switch: watcher ready for guard pid {owner}, saved {} Explorer folder windows",
+        "switch: watcher ready for switch pid {owner}, saved {} Explorer folder windows",
         folders.len()
     ));
     signals.prepared.signal()?;
@@ -228,13 +227,14 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         ) {
             Some(0) => return Ok(0),
             Some(1) => log::line("switch: watcher received a rollback request"),
-            Some(2) => log::line("switch: watcher saw the switch guard exit before takeover"),
+            Some(2) => log::line("switch: watcher saw the switch worker exit before takeover"),
             _ => {
-                log::line("switch: watcher timed out waiting for the switch guard");
+                log::line("switch: watcher timed out waiting for the switch worker");
                 owner_process.kill();
             }
         }
     }
+    signals.rollback.signal()?;
     drop(exiting);
     clear_snapshot(stamp);
     restore_desktop(&installed.join("explorust.exe"), Some(&retiring), &folders)?;
@@ -280,7 +280,7 @@ fn restore_desktop(exe: &Path, retiring: Option<&Child>, folders: &[(isize, Stri
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         while installed(pid) {
-            if Event::set_existing(crate::supervise::FALLBACK_EVENT).is_ok() {
+            if Event::set_existing(FALLBACK_EVENT).is_ok() {
                 break;
             }
             if Instant::now() >= deadline {
@@ -294,7 +294,7 @@ fn restore_desktop(exe: &Path, retiring: Option<&Child>, folders: &[(isize, Stri
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    let status = manage::bring_back_explorer()?;
+    let status = bring_back_explorer()?;
     log::line(&format!("switch: restored Windows: {status}"));
     explorer::restore_folders(folders);
     Ok(())

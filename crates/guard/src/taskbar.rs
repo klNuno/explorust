@@ -81,7 +81,7 @@ pub fn explorer_window() -> Option<(HWND, u32)> {
     trays().into_iter().find(|(_, pid)| is_explorer(*pid))
 }
 
-pub(crate) fn is_explorer(pid: u32) -> bool {
+pub fn is_explorer(pid: u32) -> bool {
     image_path(pid).is_some_and(|path| path.eq_ignore_ascii_case(&crate::supervise::explorer_path().to_string_lossy()))
 }
 

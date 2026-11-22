@@ -142,7 +142,12 @@ fn restore_user() -> Result<String, String> {
 
 /// Serializes the user cleanup and return to Explorer with a live handoff.
 pub fn restore_session() -> (Result<String, String>, Result<String, String>) {
-    let _lock = match crate::switch::lock_for_restore() {
+    let lock = || {
+        let cancel = proc::Event::named(crate::switch_events::CANCEL_FOR_RESTORE)?;
+        cancel.signal()?;
+        install::lock_for(240_000)
+    };
+    let _lock = match lock() {
         Ok(lock) => lock,
         Err(e) => return (Err(e), Err("not tried".into())),
     };

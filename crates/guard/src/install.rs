@@ -26,8 +26,9 @@ const STORES: [&str; 2] = ["Root", "TrustedPublisher"];
 /// some host builds start beside explorust.exe, the toast listener's helper with its sparse
 /// package (`package.rs`), the UI-access keyboard hook, the file index service and the default
 /// handlers (image viewer, Task Manager for Win+X).
-const FILES: [&str; 12] = [
+const FILES: [&str; 13] = [
     "explorust-guard.exe",
+    crate::switch_events::SWITCH_EXE,
     "explorust.exe",
     "explorust-open.exe",
     "nickel-windows-app-probe.exe",
