@@ -110,7 +110,7 @@ struct Bar {
     hover_v: Vec<f32>,
     press_v: Vec<f32>,
     last_step: Instant,
-    focus: Option<usize>,
+    focus: Option<pins::Focus>,
     clock: (String, String),
     work: Option<WorkArea>,
     hooks: Vec<HWINEVENTHOOK>,
@@ -574,10 +574,17 @@ impl Bar {
         let n = self.groups.len() + 1;
         self.hover_v.resize(n, 0.0);
         self.press_v.resize(n, 0.0);
-        if self.focus.is_some_and(|f| f >= n) {
-            self.focus = Some(n - 1);
+        if let Some(slot) = self.focus_slot() {
+            // Refresh the key as well as the slot when a pin learns its app identity.
+            self.focus = Some(pins::Focus::at(slot, &self.groups, &self.pins));
+        } else {
+            self.focus = None;
         }
         self.load_icons();
+    }
+
+    fn focus_slot(&self) -> Option<usize> {
+        self.focus.as_ref()?.slot(&self.groups, &self.pins)
     }
 
     fn receive_pins(&mut self) {
@@ -698,7 +705,8 @@ impl Bar {
         self.layout_right();
         let Some(scene) = self.scene.as_ref() else { return };
         let mut slots = Vec::with_capacity(self.groups.len() + 1);
-        slots.push(Slot { key: None, pinned: false, running: false, active: false, flashing: false, hover: self.hover_v[0], press: self.press_v[0], focused: self.focus == Some(0), progress: None, overlay: None });
+        let focus = self.focus_slot();
+        slots.push(Slot { key: None, pinned: false, running: false, active: false, flashing: false, hover: self.hover_v[0], press: self.press_v[0], focused: focus == Some(0), progress: None, overlay: None });
         let phase = self.progress_t0.elapsed().as_secs_f32();
         for (i, g) in self.groups.iter().enumerate() {
             let progress = g.wins.iter().find_map(|w| self.taskband.progress.get(w).filter(|p| p.shown()).copied());
@@ -713,7 +721,7 @@ impl Bar {
                 flashing: g.flashing,
                 hover: self.hover_v[i + 1],
                 press: self.press_v[i + 1],
-                focused: self.focus == Some(i + 1),
+                focused: focus == Some(i + 1),
             });
         }
         let hicons = self.side.visible_hicons();
@@ -862,7 +870,8 @@ impl Bar {
             return;
         }
         let Some(g) = self.groups.get(i - 1).cloned() else { return };
-        if g.pin.is_some_and(|p| self.pins[p].item.is_none()) {
+        let pin = g.pin.and_then(|p| self.pins[p].item.as_ref());
+        if g.pin.is_some() && pin.is_none() {
             return;
         }
         let action = self.model.click(&g, new_instance);
@@ -871,14 +880,13 @@ impl Bar {
             Action::Activate(h) => self.effects.push(Effect::Activate(HWND(h as _))),
             Action::Minimize(h) => self.effects.push(Effect::Minimize(HWND(h as _))),
             Action::Launch => {
-                let explorer = g.key == "microsoft.windows.explorer" || g.key.ends_with("\\explorer.exe");
+                let explorer = g.key == "microsoft.windows.explorer" || g.key.ends_with("\\explorer.exe")
+                    || pin.is_some_and(|pin| pin.file_explorer);
                 if explorer {
                     // Starting explorer.exe would make it the shell: File Explorer is our Files part.
                     self.effects.push(Effect::Post(bus::Command::FilesOpen));
-                } else if let Some(p) = g.pin {
-                    if let Some(item) = &self.pins[p].item {
-                        self.effects.push(Effect::Launch(Launch::Pidl(item.pidl.clone())));
-                    }
+                } else if let Some(pin) = pin {
+                    self.effects.push(Effect::Launch(pin.launch.clone()));
                 } else if !g.key.contains('\\') {
                     let id = self.ids.get(&g.key).cloned().unwrap_or_else(|| g.key.clone());
                     self.effects.push(Effect::Launch(Launch::Aumid(id)));
@@ -1198,13 +1206,14 @@ impl Bar {
                         self.pins.push(Pin {
                             source: None,
                             key: g.key.clone(),
-                            item: Some(PinData { name: item.name, pidl: item.pidl, icon }),
+                            item: Some(PinData { name: item.name, launch: Launch::Pidl(item.pidl), file_explorer: false, icon }),
                         });
                         self.model.pins.push(g.key.clone());
                         log::line(&format!("pinned {} (this session; Taskband not written)", g.key));
                     }
                 }
-                self.dirty();
+                self.rebuild();
+                self.paint();
             }
             jump::Pick::Recent(n) => {
                 if let Some(path) = recent.get(n) {
@@ -1261,7 +1270,7 @@ impl Bar {
             }
             false => {
                 self.tray_focus = None;
-                self.focus = Some(if self.groups.is_empty() { 0 } else { 1 });
+                self.focus = Some(pins::Focus::at(usize::from(!self.groups.is_empty()), &self.groups, &self.pins));
                 self.effects.push(Effect::FocusBar);
                 self.paint();
             }
@@ -1299,15 +1308,15 @@ impl Bar {
         if let Some(f) = self.tray_focus {
             return self.on_tray_key(f, vk);
         }
-        let Some(f) = self.focus else { return false };
+        let Some(f) = self.focus_slot() else { return false };
         if vk == VK_APPS.0 {
             self.effects.push(if f == 0 { Effect::WinX } else { Effect::JumpList(f) });
             return true;
         }
         let n = self.groups.len() + 1;
         match vk {
-            v if v == VK_LEFT.0 => self.focus = Some((f + n - 1) % n),
-            v if v == VK_RIGHT.0 => self.focus = Some((f + 1) % n),
+            v if v == VK_LEFT.0 => self.focus = Some(pins::Focus::at((f + n - 1) % n, &self.groups, &self.pins)),
+            v if v == VK_RIGHT.0 => self.focus = Some(pins::Focus::at((f + 1) % n, &self.groups, &self.pins)),
             v if v == VK_RETURN.0 || v == VK_SPACE.0 => {
                 self.focus = None;
                 self.activate_slot(f, false);

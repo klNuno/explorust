@@ -7,7 +7,8 @@ use windows::Win32::Foundation::{CloseHandle, HWND};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Storage::EnhancedStorage::{PKEY_AppUserModel_ID, PKEY_Link_TargetParsingPath};
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
-use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile, STGM_READ};
 use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RegGetValueW};
 use windows::Win32::System::Threading::{
@@ -16,10 +17,12 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::Win32::UI::Shell::{
-    FOLDERID_AppsFolder, IShellItem, IShellItem2, KF_FLAG_DEFAULT, SHCreateItemFromIDList, SHCreateItemInKnownFolder,
-    SHParseDisplayName, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_FILESYSPATH, SIGDN_NORMALDISPLAY,
+    FOLDERID_AppsFolder, FOLDERID_UserPinned, GPFIDL_DEFAULT, ILIsParent, IShellItem, IShellItem2, IShellLinkW,
+    KF_FLAG_DEFAULT, KF_FLAG_DONT_VERIFY, SHCreateItemFromIDList, SHCreateItemInKnownFolder,
+    SHGetKnownFolderPath, SHGetPathFromIDListEx, SHParseDisplayName, SIGDN_DESKTOPABSOLUTEPARSING,
+    SIGDN_FILESYSPATH, SIGDN_NORMALDISPLAY, SLGP_RAWPATH, ShellLink,
 };
-use windows_core::{PCWSTR, PWSTR};
+use windows_core::{Interface, PCWSTR, PWSTR};
 use std::{collections::HashSet, path::Path};
 
 /// A taskbar pin: its identity, display name, PIDL (to launch it) and shell item (for its icon).
@@ -29,6 +32,92 @@ pub struct PinItem {
     pub name: String,
     pub pidl: Vec<u8>,
     pub item: IShellItem,
+}
+
+pub struct LocalShortcut {
+    pub path: String,
+    pub name: String,
+    pub explorer: bool,
+}
+
+/// The standard local TaskBar shortcut directory, used before asking providers for pin properties.
+pub struct LocalPinFolder(Vec<u8>);
+
+impl LocalPinFolder {
+    pub fn taskbar() -> Option<Self> {
+        let path = take(unsafe { SHGetKnownFolderPath(&FOLDERID_UserPinned, KF_FLAG_DONT_VERIFY, None) })?;
+        let path = Path::new(&path).join("TaskBar");
+        if !fixed_drive(&path) {
+            return None;
+        }
+        Some(Self(parse_pidl(path.to_str()?)?))
+    }
+
+    pub fn contains(&self, pidl: &[u8]) -> bool {
+        if !crate::taskband::valid_pidl(pidl) {
+            return false;
+        }
+        // SAFETY: both PIDLs have been validated and live through the call.
+        unsafe { ILIsParent(self.0.as_ptr().cast(), pidl.as_ptr().cast(), true).as_bool() }
+    }
+}
+
+/// Load only the local shortcut file. Its target can be offline and is never resolved here.
+pub fn local_shortcut(pidl: &[u8]) -> Option<LocalShortcut> {
+    if !crate::taskband::valid_pidl(pidl) {
+        return None;
+    }
+    let mut path = vec![0u16; 32_768];
+    // SAFETY: valid PIDL and writable output buffer.
+    if !unsafe { SHGetPathFromIDListEx(pidl.as_ptr().cast(), &mut path, GPFIDL_DEFAULT) }.as_bool() {
+        return None;
+    }
+    let path = String::from_utf16(path.split(|&u| u == 0).next()?).ok()?;
+    let path = Path::new(&path);
+    if !fixed_drive(path) {
+        return None;
+    }
+    let original = crate::taskband::shortcut_name(path.file_name()?.to_str()?)?;
+    let shortcut = path.with_file_name(original);
+    let shortcut = shortcut.to_str()?;
+    let wide = wide(shortcut);
+    // SAFETY: load the saved link without calling Resolve, and read its stored target and AppID.
+    let explorer = unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let file: IPersistFile = link.cast().ok()?;
+        file.Load(PCWSTR(wide.as_ptr()), STGM_READ).ok()?;
+
+        let mut target = [0u16; 260];
+        let exe_is_explorer = link.GetPath(&mut target, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32).is_ok()
+            && String::from_utf16_lossy(target.split(|&u| u == 0).next().unwrap_or_default())
+                .rsplit(['\\', '/']).next().is_some_and(|exe| exe.eq_ignore_ascii_case("explorer.exe"));
+        let id = link.cast::<IPropertyStore>().ok().and_then(|store| {
+            let value = store.GetValue(&PKEY_AppUserModel_ID).ok()?;
+            take(PropVariantToStringAlloc(&value))
+        });
+        exe_is_explorer || id.is_some_and(|id| id.eq_ignore_ascii_case("Microsoft.Windows.Explorer"))
+    };
+    Some(LocalShortcut { path: shortcut.to_string(), name: Path::new(original).file_stem()?.to_str()?.to_string(), explorer })
+}
+
+fn fixed_drive(path: &Path) -> bool {
+    let Some(prefix) = path.to_str().and_then(|path| path.as_bytes().get(..3)) else { return false };
+    if !prefix[0].is_ascii_alphabetic() || &prefix[1..] != b":\\" {
+        return false;
+    }
+    const DRIVE_FIXED: u32 = 3;
+    let root = [u16::from(prefix[0]), b':' as u16, b'\\' as u16, 0];
+    // SAFETY: root is a null-terminated drive prefix.
+    unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) == DRIVE_FIXED }
+}
+
+/// Bind a validated absolute PIDL on the current COM apartment.
+pub fn item_from_pidl(pidl: &[u8]) -> Option<IShellItem> {
+    if !crate::taskband::valid_pidl(pidl) {
+        return None;
+    }
+    // SAFETY: the PIDL buffer is valid and lives for the call.
+    unsafe { SHCreateItemFromIDList(pidl.as_ptr().cast()) }.ok()
 }
 
 /// The pins of the taskbar in their order, from the Taskband blob.
