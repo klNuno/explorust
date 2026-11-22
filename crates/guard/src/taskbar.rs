@@ -2,7 +2,7 @@
 //! watchdog asks explorust's; the fallback and the uninstall wait for explorer's before they say
 //! Windows is back.
 
-use crate::policy::{ANSWER_WITHIN, Probe};
+use crate::policy::{ANSWER_WITHIN, Probe, RecoveryTray};
 use crate::proc::Child;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -100,6 +100,17 @@ pub fn owns_tray(pid: u32) -> bool {
 /// True when some taskbar window exists, whoever owns it.
 pub fn any() -> bool {
     !trays().is_empty()
+}
+
+pub fn recovery_tray(launched: Option<u32>) -> RecoveryTray {
+    let trays = trays();
+    if trays.is_empty() {
+        RecoveryTray::Missing
+    } else if trays.iter().all(|&(_, owner)| Some(owner) == launched) {
+        RecoveryTray::Launched
+    } else {
+        RecoveryTray::Other
+    }
 }
 
 pub enum Start {

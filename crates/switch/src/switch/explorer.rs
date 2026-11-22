@@ -195,33 +195,34 @@ unsafe fn active_folder(browser: &IWebBrowser2) -> windows::core::Result<String>
 }
 
 /// Returns false when the desktop exit has to wait for a new file operation.
-pub fn exit_desktop(
+pub fn post_exit(
     tray: HWND,
     pid: u32,
     arm: impl FnOnce() -> Result<(), String>,
-    posted: impl FnOnce() -> Result<(), String>,
 ) -> Result<bool, String> {
     if taskbar::explorer_window() != Some((tray, pid)) {
         return Err("Explorer's taskbar changed while preparing to switch".into());
     }
+    // Separate folders can take seconds to close. Check again at the posting boundary.
+    if file_operations() {
+        log::line("switch: a file operation started before Exit Explorer");
+        return Ok(false);
+    }
+    arm()?;
+    // SAFETY: this is the taskbar's Exit Explorer command, with no pointer arguments.
+    unsafe { PostMessageW(Some(tray), EXIT_EXPLORER, WPARAM(0), LPARAM(0)) }
+        .map_err(|e| format!("request Exit Explorer: {e}"))?;
+    Ok(true)
+}
+
+pub fn wait_for_exit(pid: u32) -> Result<(), String> {
     let desktop_owners: Vec<_> = windows(w!("Progman"))
         .into_iter()
         .map(|(_, owner)| owner)
         .filter(|&owner| taskbar::is_explorer(owner))
         .chain([pid])
         .collect();
-    arm()?;
-    // Keep this check beside PostMessage. Separate folders can take seconds to close.
-    if file_operations() {
-        log::line("switch: a file operation started before Exit Explorer");
-        return Ok(false);
-    }
     let started = Instant::now();
-    // SAFETY: this is the taskbar's Exit Explorer command, with no pointer arguments.
-    unsafe { PostMessageW(Some(tray), EXIT_EXPLORER, WPARAM(0), LPARAM(0)) }
-        .map_err(|e| format!("request Exit Explorer: {e}"))?;
-    posted()?;
-    log::line(&format!("switch: requested Exit Explorer for pid {pid}"));
     loop {
         if let Some((_, owner)) = taskbar::explorer_window()
             && owner != pid
@@ -241,7 +242,7 @@ pub fn exit_desktop(
                 "switch: Explorer desktop exited after {} ms (background Explorer pids: {pids:?})",
                 started.elapsed().as_millis()
             ));
-            return Ok(true);
+            return Ok(());
         }
         if started.elapsed() >= EXIT_BUDGET {
             if desktop_exited {

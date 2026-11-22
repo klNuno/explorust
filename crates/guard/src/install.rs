@@ -221,6 +221,14 @@ pub fn recovery_lock_for(timeout_ms: u32) -> Result<Lock, String> {
     named_lock(crate::switch_events::RECOVERY_MUTEX, timeout_ms, "the independent desktop recovery is still running")
 }
 
+pub fn folder_close_lock(owner: u32, hwnd: isize) -> Result<Lock, String> {
+    named_lock(
+        &format!(r"Local\explorust-switch-folder-close-{owner}-{hwnd}"),
+        0,
+        "this Explorer window already has a pending close",
+    )
+}
+
 fn named_lock(name: &str, timeout_ms: u32, busy: &str) -> Result<Lock, String> {
     // SAFETY: a named mutex; the handle moves into the Lock.
     unsafe {

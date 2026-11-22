@@ -4,7 +4,7 @@
 //! signed-in user's own process). The order keeps a way back at every step: on install, the Apps
 //! entry exists before the Shell value; on removal, the Shell value is gone before any file.
 
-use crate::policy::{ExplorerRecovery, Recovery};
+use crate::policy::{ExplorerRecovery, Recovery, RecoveryTray};
 use crate::{account, apps, folders, install, log, package, proc, reg, supervise, taskbar};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -204,10 +204,11 @@ fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
             && retiring.is_none_or(proc::Child::ended)
             && proc::Event::set_existing(supervise::FALLBACK_EVENT).is_ok();
         requested |= guard_waiting;
+        let launched = launch.as_ref().map(|child| child.pid);
         match recovery.step(
             started.elapsed(),
             ready,
-            taskbar::any(),
+            taskbar::recovery_tray(launched),
             guard_waiting,
             launch.as_ref().is_none_or(proc::Child::ended),
         ) {
@@ -217,18 +218,24 @@ fn restore_desktop(retiring: Option<&proc::Child>) -> Result<String, String> {
             Recovery::Exhausted => {
                 return Err(last_error.unwrap_or_else(|| "Explorer recovery ended without an answering taskbar".into()));
             }
-            Recovery::Start if !taskbar::any() => {
+            Recovery::Start if taskbar::recovery_tray(launched) != RecoveryTray::Other => {
                 // Explorer must run unelevated as the shell.
                 if install::elevated() {
                     return Err("no shell runs: start explorer.exe from Task Manager".into());
                 }
                 if let Some(child) = &launch {
-                    say(&format!("restore: retrying after Explorer pid {} did not produce an answering taskbar", child.pid));
-                    // This is our launcher, with no taskbar. A hung one can otherwise take
-                    // the next Explorer launch as a forward and prevent it from starting.
-                    if !child.ended() && !taskbar::any() {
+                    if !child.ended() {
+                        // Check once more before stopping our own launcher. It might have
+                        // acquired a responsive tray while the previous probe was timing out.
+                        if taskbar::explorer_except(retiring_pid).is_some()
+                            || taskbar::recovery_tray(launched) == RecoveryTray::Other
+                        {
+                            continue;
+                        }
+                        say(&format!("restore: stopping unresponsive recovery Explorer pid {}", child.pid));
                         child.kill();
                     }
+                    say(&format!("restore: retrying after Explorer pid {} did not produce an answering taskbar", child.pid));
                 }
                 if taskbar::any() {
                     continue;

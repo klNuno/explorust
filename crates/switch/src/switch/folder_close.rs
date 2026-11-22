@@ -1,7 +1,7 @@
 //! Keep each WM_CLOSE receipt alive through rollback, even if the watcher exits.
 
 use super::{
-    close_progress::{Close, CloseProgress},
+    close_progress::{Close, close_state},
     explorer,
     reopen_list::Folder,
     watcher::{Signals, read_snapshot},
@@ -9,20 +9,13 @@ use super::{
 use guard::proc::{Child, Event, wait_any};
 use guard::switch_events::{SWITCH_EXE, switch_event};
 use guard::{account, install, log, reopen, taskbar};
-use std::cell::Cell;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetPropW, MSG, PM_NOREMOVE, PeekMessageW, RemovePropW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
     SendMessageCallbackW, SendMessageTimeoutW, SetPropW, WM_CLOSE, WM_NULL,
 };
 use windows::core::HSTRING;
-
-const ACTIVE_CLOSES: &str = r"Local\explorust-switch-folder-closes";
-
-pub fn pending() -> bool {
-    Event::open_for_wait(ACTIVE_CLOSES).is_ok()
-}
 
 fn receipt_name(stamp: u64, hwnd: isize) -> String {
     switch_event(stamp, &format!("folder-{hwnd}"))
@@ -81,12 +74,12 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
         return Err("no valid unelevated switch watcher".into());
     }
     let signals = Signals::open(stamp)?;
-    let _pending = Event::named(ACTIVE_CLOSES)?;
     let settled = Event::open_for_signal(&receipt_name(stamp, hwnd))?;
     let folder = read_snapshot(stamp)?
         .into_iter()
         .find(|folder| folder.hwnd == hwnd)
         .ok_or("folder not in the switch snapshot")?;
+    let _receipt = install::folder_close_lock(folder.owner, hwnd)?;
     if !explorer::folder_windows().contains(&(hwnd, folder.owner)) {
         return Ok(());
     }
@@ -104,26 +97,23 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     {
         return Ok(());
     }
-    window.request_close()?;
-    log::line(&format!(
-        "switch: requested close of Explorer folder HWND {hwnd:#x} in pid {}",
-        folder.owner
-    ));
-    let started = Instant::now();
-    let mut progress = CloseProgress::default();
-    // Explorer may reply before it actually destroys the folder. Keep observing the original
-    // window after the reply, even when the watcher has already started rollback.
+    let request = window.request_close();
+    if request.is_ok() {
+        log::line(&format!(
+            "switch: requested close of Explorer folder HWND {hwnd:#x} in pid {}",
+            folder.owner
+        ));
+    }
+    // Track the original HWND through rollback. An acknowledgment from its message pump
+    // cannot confirm destruction or that Explorer has abandoned the request.
     loop {
         if signals.completed.signalled() {
             return Ok(());
         }
-        match progress.observe(started.elapsed(), window.close_reply(), window.exists()) {
-            Close::Kept => {
-                log::line(&format!(
-                    "switch: Explorer acknowledged the close but kept folder HWND {hwnd:#x}"
-                ));
-                return Ok(());
-            }
+        // SAFETY: PeekMessage dispatches the reply callback on the owning thread.
+        let _ = unsafe { PeekMessageW(&mut MSG::default(), None, 0, 0, PM_NOREMOVE) };
+        match close_state(request.is_ok(), window.exists()) {
+            Close::Abandoned => return request,
             Close::Destroyed => break,
             Close::Pending => {}
         }
@@ -137,17 +127,31 @@ fn track(arguments: impl Iterator<Item = String>) -> Result<(), String> {
         if signals.windows_ready.signalled()
             || (watcher_process.ended() && owner_process.ended() && taskbar::explorer().is_some())
         {
-            explorer::reopen_folder(&folder.path);
-            return Ok(());
+            return reopen_after_rollback(&folder.path);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-thread_local! { static REPLIED: Cell<bool> = const { Cell::new(false) }; }
+unsafe extern "system" fn acknowledged(_: HWND, _: u32, _: usize, _: LRESULT) {}
 
-unsafe extern "system" fn replied(_: HWND, _: u32, _: usize, _: LRESULT) {
-    REPLIED.set(true);
+fn reopen_after_rollback(path: &str) -> Result<(), String> {
+    let _recovery = install::recovery_lock_for(300_000)?;
+    let installed = install::dir();
+    // Another switch can succeed after this HWND is gone, while this receipt waits to reopen it.
+    if taskbar::explorust(&installed.join("explorust.exe")).is_some() {
+        let status = std::process::Command::new(installed.join("explorust-open.exe"))
+            .arg(path)
+            .status()
+            .map_err(|e| format!("could not reopen folder {path} in Files: {e}"))?;
+        if !status.success() {
+            return Err(format!("could not reopen folder {path} in Files: {status}"));
+        }
+        log::line(&format!("switch: reopened Explorer folder {path} in Files"));
+    } else {
+        explorer::reopen_folder(path);
+    }
+    Ok(())
 }
 
 /// Windows can reuse an HWND. The property is attached only to this window instance.
@@ -187,15 +191,9 @@ impl TrackedWindow {
     }
 
     fn request_close(&self) -> Result<(), String> {
-        // SAFETY: WM_CLOSE has no pointer arguments, and the callback depends only on thread-local state.
-        unsafe { SendMessageCallbackW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0), Some(replied), 0) }
+        // SAFETY: WM_CLOSE has no pointer arguments. The send returns before Explorer handles it.
+        unsafe { SendMessageCallbackW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0), Some(acknowledged), 0) }
             .map_err(|e| format!("request Explorer folder close: {e}"))
-    }
-
-    fn close_reply(&self) -> bool {
-        // SAFETY: PeekMessageW dispatches the callback on the sending thread.
-        let _ = unsafe { PeekMessageW(&mut MSG::default(), None, 0, 0, PM_NOREMOVE) };
-        REPLIED.get()
     }
 }
 

@@ -1,6 +1,10 @@
 //! Keep an independent process alive from Explorer preparation through the build verdict.
 
-use super::{explorer, folder_close, reopen_list::{self, Folder}};
+use super::{
+    exit_state::{ExitState, exit_state},
+    explorer, folder_close,
+    reopen_list::{self, Folder},
+};
 use guard::launch_timing::FALLBACK_EVENT;
 use guard::proc::{Child, Event, wait_any};
 use guard::switch_events::{CANCEL_FOR_RESTORE, EXITING_EXPLORER, SWITCH_EXE, switch_event};
@@ -17,6 +21,9 @@ const FAILED: u32 = 1;
 pub(super) struct Signals {
     prepared: Event,
     exit: Event,
+    post_desktop: Event,
+    exit_intent: Event,
+    exit_cancelled: Event,
     exiting: Event,
     exited: Event,
     accepted: Event,
@@ -31,6 +38,9 @@ impl Signals {
         Ok(Self {
             prepared: get("prepared")?,
             exit: get("exit")?,
+            post_desktop: get("post-desktop")?,
+            exit_intent: get("exit-intent")?,
+            exit_cancelled: get("exit-cancelled")?,
             exiting: get("exiting")?,
             exited: get("exited")?,
             accepted: get("accepted")?,
@@ -38,6 +48,10 @@ impl Signals {
             rollback: get("rollback")?,
             windows_ready: get("windows-ready")?,
         })
+    }
+
+    fn desktop_exit(&self) -> ExitState {
+        exit_state(self.exit_intent.signalled(), self.exiting.signalled(), self.exit_cancelled.signalled())
     }
 }
 
@@ -94,16 +108,46 @@ impl Watcher {
         Ok(None)
     }
 
-    pub fn vacate_desktop(&mut self) -> Result<Desktop, String> {
+    pub fn vacate_desktop(&mut self, tray: HWND, pid: u32) -> Result<Desktop, String> {
+        let exiting = Event::named(EXITING_EXPLORER)?;
         self.signals.exit.signal()?;
         self.committed = true;
+        let started = Instant::now();
         let limit = PREPARE_BUDGET + explorer::EXIT_BUDGET * 2 + Duration::from_secs(5);
-        match wait_any(&[self.signals.exited.0, self.child.handle], Some(limit.as_millis() as u32)) {
-            Some(0) => Ok(Desktop::Vacated),
-            Some(_) if self.child.exit_code() == POSTPONED => Ok(Desktop::Postponed),
-            Some(_) if self.child.exit_code() == RESTORED => Ok(Desktop::Restored),
-            Some(_) => Err("the independent switch watcher could not close Explorer".into()),
-            None => Err("the independent switch watcher did not report Explorer's exit".into()),
+        let status = wait_any(&[self.child.handle, self.signals.post_desktop.0], Some(limit.as_millis() as u32));
+        if status == Some(1) {
+            // The worker posts the desktop message. If the watcher is killed here, the
+            // surviving worker still knows whether its own PostMessage call succeeded.
+            let result = explorer::post_exit(tray, pid, || {
+                if self.child.ended() || self.signals.rollback.signalled() || Event::is_signalled(CANCEL_FOR_RESTORE) {
+                    return Err("the switch ended before Exit Explorer".into());
+                }
+                exiting.signal()?;
+                self.signals.exit_intent.signal()
+            });
+            if result == Ok(true) {
+                self.signals.exiting.signal()?;
+                log::line(&format!("switch: worker posted Exit Explorer for pid {pid}"));
+            } else {
+                self.signals.exit_cancelled.signal()?;
+                if let Err(error) = result {
+                    log::line(&format!("switch: {error}"));
+                }
+            }
+            let remaining = limit.saturating_sub(started.elapsed()).as_millis() as u32;
+            if wait_any(&[self.signals.exited.0, self.child.handle], Some(remaining)) == Some(0)
+                && !self.child.ended()
+            {
+                return Ok(Desktop::Vacated);
+            }
+        }
+        if !self.child.ended() {
+            return Err("the independent switch watcher did not report Explorer's exit".into());
+        }
+        match self.child.exit_code() {
+            POSTPONED => Ok(Desktop::Postponed),
+            RESTORED => Ok(Desktop::Restored),
+            _ => Err("the independent switch watcher could not close Explorer".into()),
         }
     }
 
@@ -134,10 +178,10 @@ impl Watcher {
         self.committed
     }
 
-    pub fn recover(&self, exe: &Path, explorer: &Child) -> Result<(), String> {
+    pub fn recover(&self, exe: &Path, tray: HWND, explorer: &Child) -> Result<(), String> {
         let _lock = install::recovery_lock_for(0)?;
         let refreshed = read_snapshot(self.stamp);
-        recover(self.stamp, &self.signals, exe, explorer, refreshed.as_deref().unwrap_or(&self.folders))
+        recover(self.stamp, &self.signals, exe, tray, explorer, refreshed.as_deref().unwrap_or(&self.folders))
     }
 }
 
@@ -236,18 +280,26 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
             let _ = std::fs::remove_file(&snapshot);
         })?;
     };
-    let started = (|| {
+    let started = (|| -> Result<bool, String> {
         let paths: Vec<_> = folders.iter().map(|folder| folder.path.clone()).collect();
         reopen::save(&log::dir(), stamp, &paths).map_err(|e| format!("save Files handoff: {e}"))?;
         if !close_folders(&folders, explorer_pid, owner, stamp, abandoned)? {
             return Ok(false);
         }
-        explorer::exit_desktop(tray, explorer_pid, || {
-            if abandoned() {
-                return Err("the switch ended before Exit Explorer".into());
+        if abandoned() {
+            return Err("the switch ended before Exit Explorer".into());
+        }
+        signals.post_desktop.signal()?;
+        let events = [signals.exiting.0, signals.exit_cancelled.0, owner_process.handle, signals.rollback.0];
+        match wait_any(&events, None) {
+            Some(0) => {
+                log::line(&format!("switch: requested Exit Explorer for pid {explorer_pid}"));
+                explorer::wait_for_exit(explorer_pid)?;
+                Ok(true)
             }
-            exiting.signal()
-        }, || signals.exiting.signal())
+            Some(1) => Ok(false),
+            _ => Err("the switch worker did not confirm the desktop exit request".into()),
+        }
     })();
     if matches!(started, Ok(true)) && signals.exited.signal().is_ok() {
         match wait_any(
@@ -274,7 +326,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
     }
     signals.rollback.signal()?;
     drop(exiting);
-    recover(stamp, &signals, &installed.join("explorust.exe"), &retiring, &folders)?;
+    recover(stamp, &signals, &installed.join("explorust.exe"), tray, &retiring, &folders)?;
     drop(recovery);
     if started == Ok(false) {
         return Ok(POSTPONED);
@@ -340,10 +392,24 @@ pub(super) fn read_snapshot(stamp: u64) -> Result<Vec<Folder>, String> {
         .map_err(|e| format!("read Explorer recovery snapshot: {e}"))
 }
 
-fn recover(stamp: u64, signals: &Signals, exe: &Path, original: &Child, folders: &[Folder]) -> Result<(), String> {
+fn recover(stamp: u64, signals: &Signals, exe: &Path, tray: HWND, original: &Child, folders: &[Folder]) -> Result<(), String> {
     clear_snapshot(stamp);
     if !signals.windows_ready.signalled() {
-        let retiring = signals.exiting.signalled().then_some(original);
+        let retiring = match signals.desktop_exit() {
+            ExitState::Unsent => None,
+            ExitState::Posted => Some(original),
+            ExitState::Uncertain => {
+                log::line("switch: desktop exit outcome is uncertain after the worker stopped");
+                // A queued exit can still close the original after it answers a probe. If it
+                // still owns the tray, finish the same request only after a fresh transfer check.
+                if taskbar::explorer_window() == Some((tray, original.pid))
+                    && !explorer::post_exit(tray, original.pid, || Ok(()))?
+                {
+                    return Err("cannot confirm Exit Explorer while a file operation is running".into());
+                }
+                Some(original)
+            }
+        };
         restore_desktop(exe, retiring)?;
         if retiring.is_some() || original.ended() {
             explorer::restore_desktop_folders(folders, original.pid);

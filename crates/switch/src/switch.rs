@@ -1,6 +1,7 @@
 //! Hand the current desktop from Explorer to explorust without ending the logon session.
 
 mod close_progress;
+mod exit_state;
 mod explorer;
 pub(crate) mod folder_close;
 mod reopen_list;
@@ -153,10 +154,6 @@ fn switch(
     if taskbar::explorust(exe).is_some() {
         return Ok(Outcome::AlreadyRunning);
     }
-    if folder_close::pending() {
-        log::line("switch: waiting for a folder close from the previous switch; postponed");
-        return Ok(postponed());
-    }
     let Some((tray, pid)) = taskbar::explorer_window() else {
         return Err("no Explorer taskbar in this session".into());
     };
@@ -179,7 +176,7 @@ fn switch(
             break (watcher, previous);
         }
     };
-    let started = watcher.vacate_desktop().and_then(|desktop| {
+    let started = watcher.vacate_desktop(tray, pid).and_then(|desktop| {
         match desktop {
             watcher::Desktop::Postponed => return Ok(postponed()),
             watcher::Desktop::Restored => return Ok(Outcome::Windows),
@@ -201,7 +198,7 @@ fn switch(
                     return Err("the switch stopped while preparing Explorer".into());
                 }
                 log::line(&format!("switch: {e}; restoring Windows directly"));
-                watcher.recover(exe, &explorer_process)?;
+                watcher.recover(exe, tray, &explorer_process)?;
             }
             Ok(Outcome::Windows)
         }
