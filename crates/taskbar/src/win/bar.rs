@@ -130,6 +130,8 @@ struct Bar {
     /// Auto-hide slide: 0 hidden, 1 shown, where it goes, and when the last frame ran.
     shown: f32,
     want_shown: bool,
+    /// The first frame was drawn and `bus::PAINTED_PROP` is set for the shell's start check.
+    painted: bool,
     slide_at: Instant,
     /// Start of the indeterminate progress animation.
     progress_t0: Instant,
@@ -354,6 +356,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             taskband,
             shown: if settings.autohide { 0.0 } else { 1.0 },
             want_shown: !settings.autohide,
+            painted: false,
             slide_at: Instant::now(),
             progress_t0: Instant::now(),
             settings,
@@ -365,8 +368,6 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             b.rebuild();
             b.paint();
         });
-        // Tells the shell's start check the bar is up, also when auto-hide keeps it hidden.
-        let _ = SetPropW(hwnd, &HSTRING::from(bus::PAINTED_PROP), Some(HANDLE(1 as _)));
         log::line("initial taskbar paint returned; starting pin resolution");
         pin_worker::start(hwnd, (G::ICON * dpi as f32 / 96.0).round() as i32, &pin_inbox);
         SetTimer(Some(hwnd), TIMER_CLOCK, shelldata::clock::ms_to_next_minute() as u32, None);
@@ -774,8 +775,12 @@ impl Bar {
             Theme::new(false, (r, g, b))
         });
         let theme = dark_theme.as_ref().unwrap_or(&self.theme);
-        if let Err(e) = scene.draw(theme, &slots, &self.clock, &right, self.settings.align_left) {
-            log::line(&format!("draw failed: {e}"));
+        match scene.draw(theme, &slots, &self.clock, &right, self.settings.align_left) {
+            Err(e) => log::line(&format!("draw failed: {e}")),
+            // Tells the shell's start check the bar is up, also when auto-hide keeps it hidden.
+            // SAFETY: a property on our own window.
+            Ok(()) if !self.painted => self.painted = unsafe { SetPropW(self.hwnd, &HSTRING::from(bus::PAINTED_PROP), Some(HANDLE(1 as _))) }.is_ok(),
+            Ok(()) => {}
         }
         // SAFETY: timers on our own window.
         unsafe {
