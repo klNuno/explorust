@@ -18,7 +18,7 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_LWIN,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, GetClassNameW, GetCursorPos, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsZoomed, KillTimer, SetForegroundWindow, SetTimer, ShowWindow, SW_SHOW, WS_CAPTION};
+use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, GetClassNameW, GetCursorPos, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsZoomed, KillTimer, SetForegroundWindow, SetTimer, ShowWindow, SW_SHOW, WS_CAPTION, WS_THICKFRAME};
 
 pub const TIMER_TIP: usize = 3;
 const TIP_DELAY_MS: u32 = 500;
@@ -448,7 +448,12 @@ fn is_fullscreen(fg: HWND, monitor: RECT, bar: HWND) -> bool {
         if GetWindowRect(fg, &mut r).is_err() {
             return false;
         }
-        IsZoomed(fg).as_bool() && GetWindowLongW(fg, GWL_STYLE) as u32 & WS_CAPTION.0 == WS_CAPTION.0
+        let style = GetWindowLongW(fg, GWL_STYLE) as u32;
+        crate::settings::maximized_framed(
+            IsZoomed(fg).as_bool(),
+            style & WS_CAPTION.0 == WS_CAPTION.0,
+            style & WS_THICKFRAME.0 != 0,
+        )
     };
     if !crate::settings::fullscreen_cover(to_rect(r), to_rect(monitor), maximized_framed) {
         return false;

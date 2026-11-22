@@ -122,6 +122,11 @@ pub fn fullscreen_cover(window: Rect, monitor: Rect, maximized_framed: bool) -> 
     !maximized_framed && window.covers(&monitor)
 }
 
+/// A maximized app can draw its own caption and keep only the native resize frame.
+pub fn maximized_framed(maximized: bool, caption: bool, resize_frame: bool) -> bool {
+    maximized && (caption || resize_frame)
+}
+
 /// Ease-out of the slide, `t` in 0..=1.
 pub fn ease_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -205,5 +210,14 @@ mod tests {
         assert!(!fullscreen_cover(monitor, monitor, true));
         assert!(fullscreen_cover(monitor, monitor, false));
         assert!(!fullscreen_cover(Rect::new(0, 0, 1280, 798), monitor, false));
+    }
+
+    #[test]
+    fn maximized_resize_frame_does_not_need_a_caption() {
+        let monitor = Rect::new(0, 0, 1280, 800);
+        let custom_frame = maximized_framed(true, false, true);
+        assert!(!fullscreen_cover(monitor, monitor, custom_frame));
+        assert!(!maximized_framed(true, false, false));
+        assert!(!maximized_framed(false, true, true));
     }
 }
