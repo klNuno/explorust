@@ -55,12 +55,13 @@ fn say(msg: &str) {
 }
 
 fn main() {
-    // SAFETY: lets a console caller see the output; harmless without one.
-    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     let arg = std::env::args().nth(1).unwrap_or_default();
+    if arg != "--switch" {
+        // SAFETY: lets a console caller see the output; harmless without one.
+        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
     let code = match arg.as_str() {
         "" => run_shell(None, false),
-        "--live-switch" => run_shell(None, true),
         "--adopt" => match std::env::args().nth(2).and_then(|p| p.parse().ok()) {
             Some(pid) => run_shell(Some((pid, std::env::args().nth(3))), false),
             None => {
@@ -72,7 +73,6 @@ fn main() {
         "--restore" => manage::restore(),
         "--setup" => setup::run(),
         "--switch" => switch::run(),
-        "--switch-session" => switch::session(),
         "--uninstall" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             let has = |f: &str| rest.iter().any(|a| a == f);

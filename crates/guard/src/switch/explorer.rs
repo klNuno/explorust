@@ -2,11 +2,12 @@
 
 use super::reopen_list;
 use crate::{log, taskbar};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
-    CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
-    IServiceProvider,
+    CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize, IServiceProvider,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -14,11 +15,15 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Shell::{
-    IFolderView, IPersistFolder2, IShellBrowser, IShellItem, IShellWindows, IWebBrowser2, SHCreateItemFromIDList,
-    SID_STopLevelBrowser, SIGDN_DESKTOPABSOLUTEPARSING, ShellWindows,
+    CSIDL_DESKTOP, IFolderView, IPersistFolder2, IShellBrowser, IShellDispatch2,
+    IShellFolderViewDual, IShellItem, IShellWindows, IWebBrowser2, SHCreateItemFromIDList,
+    SID_STopLevelBrowser, SIGDN_DESKTOPABSOLUTEPARSING, SVGIO_BACKGROUND, SWC_DESKTOP,
+    SWFO_NEEDDISPATCH, ShellWindows,
 };
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE};
-use windows::core::{Interface, PCWSTR, w};
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowExW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+};
+use windows::core::{BSTR, Interface, PCWSTR, w};
 
 const EXIT_EXPLORER: u32 = 0x5B4;
 
@@ -40,9 +45,12 @@ pub fn processes() -> Result<Vec<Process>, String> {
     let mut session = 0;
     // SAFETY: the snapshot is owned, and outputs are live for each call.
     unsafe {
-        ProcessIdToSessionId(std::process::id(), &mut session).map_err(|e| format!("read the Windows session: {e}"))?;
-        let snapshot =
-            Snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).map_err(|e| format!("list processes: {e}"))?);
+        ProcessIdToSessionId(std::process::id(), &mut session)
+            .map_err(|e| format!("read the Windows session: {e}"))?;
+        let snapshot = Snapshot(
+            CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+                .map_err(|e| format!("list processes: {e}"))?,
+        );
         let mut entry = PROCESSENTRY32W {
             dwSize: size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
@@ -55,9 +63,12 @@ pub fn processes() -> Result<Vec<Process>, String> {
                 .iter()
                 .position(|&c| c == 0)
                 .unwrap_or(entry.szExeFile.len());
-            if String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case("explorer.exe") {
+            if String::from_utf16_lossy(&entry.szExeFile[..len])
+                .eq_ignore_ascii_case("explorer.exe")
+            {
                 let mut process_session = 0;
-                if ProcessIdToSessionId(entry.th32ProcessID, &mut process_session).is_ok() && process_session == session
+                if ProcessIdToSessionId(entry.th32ProcessID, &mut process_session).is_ok()
+                    && process_session == session
                 {
                     out.push(Process {
                         pid: entry.th32ProcessID,
@@ -102,6 +113,14 @@ fn folder_windows() -> Vec<(HWND, u32)> {
 
 struct Apartment;
 
+impl Apartment {
+    fn new() -> windows::core::Result<Self> {
+        // SAFETY: this guard balances CoInitializeEx once its thread is finished with COM.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() }?;
+        Ok(Self)
+    }
+}
+
 impl Drop for Apartment {
     fn drop(&mut self) {
         // SAFETY: paired with this thread's successful CoInitializeEx.
@@ -109,20 +128,60 @@ impl Drop for Apartment {
     }
 }
 
+/// Ask the desktop Explorer to launch the installed switch in its own user context.
+pub fn launch_switch(guard: &Path) -> Result<(), String> {
+    if taskbar::explorer_window().is_none() {
+        return Err("no Explorer taskbar in this session".into());
+    }
+    let path = BSTR::from(guard.to_string_lossy().as_ref());
+    let Some(dir) = guard.parent() else {
+        return Err("the installed guard has no working directory".into());
+    };
+    let result = (|| {
+        let _apartment = Apartment::new()?;
+        // SAFETY: all automation methods run on this COM apartment, with live arguments.
+        unsafe {
+            let list: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+            let mut hwnd = 0;
+            let desktop = list.FindWindowSW(
+                &VARIANT::from(CSIDL_DESKTOP as i32),
+                &VARIANT::default(),
+                SWC_DESKTOP,
+                &mut hwnd,
+                SWFO_NEEDDISPATCH,
+            )?;
+            let browser: IShellBrowser = desktop
+                .cast::<IServiceProvider>()?
+                .QueryService(&SID_STopLevelBrowser)?;
+            let folder: IShellFolderViewDual = browser
+                .QueryActiveShellView()?
+                .GetItemObject(SVGIO_BACKGROUND)?;
+            let app: IShellDispatch2 = folder.Application()?.cast()?;
+            app.ShellExecute(
+                &path,
+                &VARIANT::from(BSTR::from("--switch")),
+                &VARIANT::from(BSTR::from(dir.to_string_lossy().as_ref())),
+                &VARIANT::from(BSTR::from("open")),
+                &VARIANT::from(1),
+            )
+        }
+    })();
+    result.map_err(|e| format!("launch the switch through Explorer: {e}"))
+}
+
 pub fn open_folders() -> Result<Vec<String>, String> {
     let open = folder_windows();
     if open.is_empty() {
         return Ok(Vec::new());
     }
+    let _apartment = Apartment::new().map_err(|e| format!("initialize ShellWindows COM: {e}"))?;
     // SAFETY: the worker owns the apartment and drops all interfaces before uninitializing it.
     unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
-            .ok()
-            .map_err(|e| format!("initialize ShellWindows COM: {e}"))?;
-        let _apartment = Apartment;
-        let list: IShellWindows =
-            CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER).map_err(|e| format!("get ShellWindows: {e}"))?;
-        let count = list.Count().map_err(|e| format!("count ShellWindows: {e}"))?;
+        let list: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)
+            .map_err(|e| format!("get ShellWindows: {e}"))?;
+        let count = list
+            .Count()
+            .map_err(|e| format!("count ShellWindows: {e}"))?;
         let mut entries = Vec::new();
         for i in 0..count {
             let Ok(browser) = list
@@ -136,9 +195,17 @@ pub fn open_folders() -> Result<Vec<String>, String> {
                 continue;
             }
             match active_folder(&browser) {
-                Ok(folder) if !folder.is_empty() && !folder.contains('\0') => entries.push((hwnd.0, folder)),
-                Ok(_) => log::line(&format!("switch: folder window {:#x} has no parsing name", hwnd.0)),
-                Err(e) => log::line(&format!("switch: cannot read folder window {:#x}: {e}", hwnd.0)),
+                Ok(folder) if !folder.is_empty() && !folder.contains('\0') => {
+                    entries.push((hwnd.0, folder))
+                }
+                Ok(_) => log::line(&format!(
+                    "switch: folder window {:#x} has no parsing name",
+                    hwnd.0
+                )),
+                Err(e) => log::line(&format!(
+                    "switch: cannot read folder window {:#x}: {e}",
+                    hwnd.0
+                )),
             }
         }
         if folder_windows()
@@ -206,7 +273,9 @@ pub fn exit(tray: HWND, pid: u32) -> Result<(), String> {
         }
         if started.elapsed() >= Duration::from_secs(30) {
             let pids: Vec<_> = running.iter().map(|process| process.pid).collect();
-            return Err(format!("Explorer did not exit within 30 s (remaining pids {pids:?})"));
+            return Err(format!(
+                "Explorer did not exit within 30 s (remaining pids {pids:?})"
+            ));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
