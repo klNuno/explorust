@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub use launch_timing::FALLBACK_EVENT;
+pub const RELEASE_EXPLORER: &str = r"Local\explorust-guard-release-explorer";
 
 enum End {
     /// Something went wrong: explorer takes over and the user is told.
@@ -32,7 +33,7 @@ const RELOAD: u32 = 5;
 const PROBLEM: u32 = 6;
 
 /// `adopt`: the pid of a running explorust whose guard died; it is watched instead of starting one.
-pub fn run(adopt: Option<(u32, Option<String>)>) -> u32 {
+pub fn run(adopt: Option<(u32, Option<String>)>, live: bool) -> u32 {
     let fallback = match Event::named(FALLBACK_EVENT) {
         Ok(e) => e,
         Err(e) => {
@@ -55,22 +56,25 @@ pub fn run(adopt: Option<(u32, Option<String>)>) -> u32 {
         }
     } else {
         log::line(&format!("guard start: windows {build}, shell {}", exe.display()));
-        if hotkey::shift_held() {
+        if !live && hotkey::shift_held() {
             log::line("Shift held at logon: plain explorer");
             return explorer_forever(None);
         }
-        // A logon counts by its outcome: only one that ended without a problem clears the streak.
-        if !reg::last_logon_had_problem() && reg::problem_streak() != 0 {
-            log::line("the last logon ended without a problem: problem streak reset");
-            reg::set_problem_streak(0);
-        }
-        reg::set_logon_had_problem(false);
-        let streak = reg::problem_streak();
-        if at_logon(streak) == AtLogon::TurnOff {
-            return explorer_forever(Some(turn_off(&format!("explorust ran into a problem at {streak} sign-ins in a row"))));
+        if !live {
+            // A logon counts by its outcome: only one that ended without a problem clears the streak.
+            if !reg::last_logon_had_problem() && reg::problem_streak() != 0 {
+                log::line("the last logon ended without a problem: problem streak reset");
+                reg::set_problem_streak(0);
+            }
+            reg::set_logon_had_problem(false);
+            let streak = reg::problem_streak();
+            if at_logon(streak) == AtLogon::TurnOff {
+                return explorer_forever(Some(turn_off(&format!("explorust ran into a problem at {streak} sign-ins in a row"))));
+            }
         }
         if !exe.exists() {
-            return explorer_forever(Some(turn_off(&format!("{} is missing", exe.display()))));
+            let why = format!("{} is missing", exe.display());
+            return explorer_forever(Some(if live { Notice::Problem(why) } else { turn_off(&why) }));
         }
     }
     loop {
@@ -112,6 +116,10 @@ pub fn run(adopt: Option<(u32, Option<String>)>) -> u32 {
             End::Problem(why) => why,
         };
         let _ = fallback.signal();
+        if live {
+            log::line(&format!("problem after a live switch: {why}; plain explorer for this session"));
+            return explorer_forever(Some(Notice::Problem(why)));
+        }
         let streak = reg::problem_streak() + 1;
         reg::set_problem_streak(streak);
         reg::set_logon_had_problem(true);
@@ -380,12 +388,16 @@ pub fn explorer_path() -> PathBuf {
 /// counts; after 3 in a row the user is told once how to start it by hand, and the guard keeps
 /// trying, waiting longer between tries (up to a minute). `notice` shows once a taskbar answers.
 fn explorer_forever(notice: Option<Notice>) -> u32 {
+    let release = Event::named(RELEASE_EXPLORER).ok();
     folders::handler(false);
     let mut notice = notice;
     let path = explorer_path();
     let mut failures = 0u32;
     let mut told = false;
     loop {
+        if Event::is_signalled(RELEASE_EXPLORER) {
+            return released_explorer();
+        }
         if failures > 0 {
             if failures >= 3 && !told {
                 told = true;
@@ -430,7 +442,13 @@ fn explorer_forever(notice: Option<Notice>) -> u32 {
         let up = Instant::now();
         match Child::open(pid) {
             Ok(shell) => {
-                wait_any(&[shell.handle], None);
+                if let Some(event) = &release {
+                    if wait_any(&[event.0, shell.handle], None) == Some(0) {
+                        return released_explorer();
+                    }
+                } else {
+                    wait_any(&[shell.handle], None);
+                }
                 log::line(&format!("explorer pid {pid} ended after {} s, code {:#x}", up.elapsed().as_secs(), shell.exit_code()));
             }
             Err(e) => log::line(&format!("explorer pid {pid}: {e}")),
@@ -442,6 +460,11 @@ fn explorer_forever(notice: Option<Notice>) -> u32 {
         }
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+fn released_explorer() -> u32 {
+    log::line("guard: released Explorer for a live switch");
+    0
 }
 
 /// Starts explorer.exe, three tries 2 s apart.

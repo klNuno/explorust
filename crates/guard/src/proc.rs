@@ -7,10 +7,10 @@ use std::path::Path;
 use crate::log;
 use windows::Win32::Foundation::{CloseHandle, ERROR_ELEVATION_REQUIRED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, EVENT_MODIFY_STATE, GetExitCodeProcess, GetProcessId,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, EVENT_MODIFY_STATE, GetExitCodeProcess, GetProcessId,
     INFINITE,
     OpenEventW, OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE, ResetEvent, STARTUPINFOW, SYNCHRONIZATION_SYNCHRONIZE, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
+    PROCESS_TERMINATE, PROCESS_CREATION_FLAGS, ResetEvent, ResumeThread, STARTUPINFOW, SYNCHRONIZATION_SYNCHRONIZE, SetEvent, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::core::{HSTRING, PCWSTR, PWSTR};
@@ -25,34 +25,38 @@ pub struct Child {
 
 impl Child {
     pub fn spawn(exe: &Path, args: &str) -> Result<Child, String> {
+        let (child, thread) = match Self::create(exe, args, PROCESS_CREATION_FLAGS(0)) {
+            Ok(process) => process,
+            Err(e) if e.code() == ERROR_ELEVATION_REQUIRED.to_hresult() => return Self::shell_execute(exe, args),
+            Err(e) => return Err(format!("CreateProcess {}: {e}", exe.display())),
+        };
+        // SAFETY: the thread handle is not needed.
+        let _ = unsafe { CloseHandle(thread) };
+        Ok(child)
+    }
+
+    fn create(exe: &Path, args: &str, flags: PROCESS_CREATION_FLAGS) -> windows::core::Result<(Child, HANDLE)> {
         let mut cmd: Vec<u16> = format!("\"{}\" {args}", exe.display()).encode_utf16().chain(Some(0)).collect();
         let si = STARTUPINFOW { cb: size_of::<STARTUPINFOW>() as u32, ..Default::default() };
         let mut pi = PROCESS_INFORMATION::default();
         let app = HSTRING::from(exe.as_os_str());
         let cwd = exe.parent().map(|p| HSTRING::from(p.as_os_str()));
         // SAFETY: cmd is a mutable NUL-terminated buffer as CreateProcessW requires.
-        let made = unsafe {
+        unsafe {
             CreateProcessW(
                 &app,
                 Some(PWSTR(cmd.as_mut_ptr())),
                 None,
                 None,
                 false,
-                CREATE_UNICODE_ENVIRONMENT,
+                CREATE_UNICODE_ENVIRONMENT | flags,
                 None,
                 cwd.as_ref().map(|c| windows::core::PCWSTR(c.as_ptr())).unwrap_or(windows::core::PCWSTR::null()),
                 &si,
                 &mut pi,
             )
-        };
-        match made {
-            Ok(()) => {}
-            Err(e) if e.code() == ERROR_ELEVATION_REQUIRED.to_hresult() => return Self::shell_execute(exe, args),
-            Err(e) => return Err(format!("CreateProcess {}: {e}", exe.display())),
-        }
-        // SAFETY: the thread handle is not needed.
-        let _ = unsafe { CloseHandle(pi.hThread) };
-        Ok(Child { handle: pi.hProcess, pid: pi.dwProcessId })
+        }?;
+        Ok((Child { handle: pi.hProcess, pid: pi.dwProcessId }, pi.hThread))
     }
 
     /// The uiAccess path: ShellExecuteEx asks the AppInfo service, which starts the exe with UI
@@ -115,6 +119,44 @@ impl Child {
                 log::line(&format!("terminate pid {}: {e}; quit event: {asked:?}", self.pid));
             }
             WaitForSingleObject(self.handle, 10_000);
+        }
+    }
+}
+
+/// Allows the session switch to write a handoff for this exact guard before it begins startup.
+pub struct SuspendedChild {
+    child: Option<Child>,
+    thread: HANDLE,
+}
+
+impl SuspendedChild {
+    pub fn spawn(exe: &Path, args: &str) -> Result<Self, String> {
+        let (child, thread) = Child::create(exe, args, CREATE_SUSPENDED)
+            .map_err(|e| format!("CreateProcess {}: {e}", exe.display()))?;
+        Ok(Self { child: Some(child), thread })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.as_ref().unwrap().pid
+    }
+
+    pub fn start(mut self) -> Result<Child, String> {
+        // SAFETY: the primary thread belongs to the suspended child.
+        if unsafe { ResumeThread(self.thread) } == u32::MAX {
+            return Err(format!("resume the guard: {}", windows::core::Error::from_thread()));
+        }
+        Ok(self.child.take().unwrap())
+    }
+}
+
+impl Drop for SuspendedChild {
+    fn drop(&mut self) {
+        // SAFETY: the child, if present, has never run its primary thread.
+        unsafe {
+            if let Some(child) = &self.child {
+                let _ = TerminateProcess(child.handle, 1);
+            }
+            let _ = CloseHandle(self.thread);
         }
     }
 }

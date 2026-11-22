@@ -16,7 +16,7 @@ fn programs() -> PathBuf {
 pub const SETTINGS_EXE: &str = "explorust-settings.exe";
 
 /// Localized name, target arguments and description. An empty argument targets Settings.
-fn shortcuts() -> [(&'static str, &'static str, &'static str); 3] {
+fn shortcuts() -> [(&'static str, &'static str, &'static str); 4] {
     [
         (
             tr("Revenir à Windows (désinstaller explorust)", "Back to Windows (uninstall explorust)"),
@@ -33,6 +33,11 @@ fn shortcuts() -> [(&'static str, &'static str, &'static str); 3] {
                 "Remplace explorust par l'Explorateur Windows jusqu'à la prochaine ouverture de session.",
                 "Replaces explorust with Windows Explorer until the next sign-in.",
             ),
+        ),
+        (
+            tr("Passer à explorust", "Switch to explorust"),
+            "--switch",
+            tr("Passe sur explorust sans fermer la session.", "Switches to explorust without signing out."),
         ),
         (
             tr("Paramètres d'explorust", "explorust settings"),

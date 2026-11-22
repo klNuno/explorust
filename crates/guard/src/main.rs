@@ -13,6 +13,7 @@
 //! - `--status`: print the Shell value, the Windows build and the last good build.
 //! - `--adopt <pid>`: started by explorust when its guard died; supervises that explorust.
 //! - `--setup`: interactive installation or an update of the running shell (`setup`).
+//! - `--switch`: switch this session from Explorer to the installed shell.
 //! - `--uninstall [--yes|--quiet]`: the user's way back (`uninstall`), asks Windows for rights.
 //!   `--machine [--for <sid>]` is its elevated half.
 
@@ -32,10 +33,13 @@ mod policy;
 mod prefetch;
 mod proc;
 mod reg;
+#[path = "../../shell/src/reopen.rs"]
+mod reopen;
 mod setup;
 mod setup_mode;
 mod startup_retry;
 mod supervise;
+mod switch;
 mod taskbar;
 mod ui;
 mod uninstall;
@@ -55,9 +59,10 @@ fn main() {
     let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     let arg = std::env::args().nth(1).unwrap_or_default();
     let code = match arg.as_str() {
-        "" => run_shell(None),
+        "" => run_shell(None, false),
+        "--live-switch" => run_shell(None, true),
         "--adopt" => match std::env::args().nth(2).and_then(|p| p.parse().ok()) {
-            Some(pid) => run_shell(Some((pid, std::env::args().nth(3)))),
+            Some(pid) => run_shell(Some((pid, std::env::args().nth(3))), false),
             None => {
                 say("--adopt needs the explorust pid");
                 2
@@ -66,6 +71,8 @@ fn main() {
         "--install" => manage::install(),
         "--restore" => manage::restore(),
         "--setup" => setup::run(),
+        "--switch" => switch::run(),
+        "--switch-session" => switch::session(),
         "--uninstall" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             let has = |f: &str| rest.iter().any(|a| a == f);
@@ -100,19 +107,25 @@ fn main() {
             0
         }
         other => {
-            say(&format!("unknown argument {other}; use --setup, --install, --uninstall, --restore, --fallback or --status"));
+            say(&format!("unknown argument {other}; use --setup, --install, --switch, --uninstall, --restore, --fallback or --status"));
             2
         }
     };
     std::process::exit(code as i32);
 }
 
-fn run_shell(adopt: Option<(u32, Option<String>)>) -> u32 {
+const GUARD_MUTEX: &str = r"Local\explorust-guard";
+
+fn run_shell(adopt: Option<(u32, Option<String>)>, live: bool) -> u32 {
+    if live && taskbar::explorer_window().is_some() {
+        log::line("guard: Explorer still owns the taskbar; switch aborted");
+        return 1;
+    }
     // SAFETY: one guard per session; the mutex lives until the process ends.
-    let _mutex = unsafe { CreateMutexW(None, false, &HSTRING::from(r"Local\explorust-guard")) };
+    let _mutex = unsafe { CreateMutexW(None, false, &HSTRING::from(GUARD_MUTEX)) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         log::line("another guard runs in this session: exiting");
         return 0;
     }
-    supervise::run(adopt)
+    supervise::run(adopt, live)
 }

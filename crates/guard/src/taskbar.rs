@@ -39,7 +39,7 @@ fn answers(h: HWND, within: Duration) -> bool {
     r.0 != 0
 }
 
-fn image_path(pid: u32) -> Option<String> {
+pub fn image_path(pid: u32) -> Option<String> {
     // SAFETY: the handle is closed; the buffer has the length given.
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
@@ -70,6 +70,14 @@ pub fn explorer() -> Option<u32> {
                 && answers(*h, Duration::from_secs(2))
         })
         .map(|(_, pid)| pid)
+}
+
+pub fn explorer_window() -> Option<(HWND, u32)> {
+    trays().into_iter().find(|(_, pid)| is_explorer(*pid))
+}
+
+pub(crate) fn is_explorer(pid: u32) -> bool {
+    image_path(pid).is_some_and(|path| path.eq_ignore_ascii_case(&crate::supervise::explorer_path().to_string_lossy()))
 }
 
 /// The installed shell's taskbar owner. A dev shell launched elsewhere would reload its own exe.

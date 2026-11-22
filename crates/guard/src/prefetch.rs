@@ -1,4 +1,4 @@
-//! Start the signed-in user's optional symbol warm-up after installation commits.
+//! Launch from the interactive shell's token, including the optional symbol warm-up after install.
 
 use crate::{account, proc::Child};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -80,14 +80,23 @@ pub fn start(exe: &Path, elevated: bool) -> Result<(), String> {
 }
 
 fn spawn_unelevated(exe: &Path) -> Result<Child, String> {
+    let mut pid = 0;
+    // SAFETY: query this session's registered shell.
+    if unsafe { GetWindowThreadProcessId(GetShellWindow(), Some(&mut pid)) } == 0 {
+        return Err("could not find the signed-in user's desktop shell".into());
+    }
+    spawn_as_shell(pid, exe, ARG)
+}
+
+pub fn spawn_as_shell(pid: u32, exe: &Path, args: &str) -> Result<Child, String> {
     let working_directory = working_directory(exe)?;
     let name = HSTRING::from(exe.as_os_str());
     let cwd = HSTRING::from(working_directory.as_os_str());
-    let mut cmd: Vec<u16> = format!("\"{}\" {ARG}", exe.display())
+    let mut cmd: Vec<u16> = format!("\"{}\" {args}", exe.display())
         .encode_utf16()
         .chain([0])
         .collect();
-    let parent = desktop_shell()?;
+    let parent = desktop_shell(pid)?;
     let parent = HANDLE(parent.as_raw_handle());
     let token = process_token(parent)?;
     let token = HANDLE(token.as_raw_handle());
@@ -106,12 +115,12 @@ fn spawn_unelevated(exe: &Path) -> Result<Child, String> {
         let mut bytes = 0;
         let _ = InitializeProcThreadAttributeList(None, 1, None, &mut bytes);
         if bytes == 0 {
-            return Err("could not size the prefetch process attributes".into());
+            return Err("could not size the desktop process attributes".into());
         }
         let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
         let attrs = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
         InitializeProcThreadAttributeList(Some(attrs), 1, None, &mut bytes)
-            .map_err(|e| format!("initialize prefetch attributes: {e}"))?;
+            .map_err(|e| format!("initialize desktop process attributes: {e}"))?;
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         startup.lpAttributeList = attrs;
@@ -127,7 +136,7 @@ fn spawn_unelevated(exe: &Path) -> Result<Child, String> {
                 None,
                 None,
             )
-            .map_err(|e| format!("set the desktop shell as prefetch parent: {e}"))?;
+            .map_err(|e| format!("set the desktop shell as parent: {e}"))?;
             CreateEnvironmentBlock(&mut environment, Some(token), false)
                 .map_err(|e| format!("signed-in user's environment: {e}"))?;
             CreateProcessW(
@@ -142,7 +151,7 @@ fn spawn_unelevated(exe: &Path) -> Result<Child, String> {
                 &startup.StartupInfo,
                 &mut process,
             )
-            .map_err(|e| format!("start prefetch as the signed-in user: {e}"))
+            .map_err(|e| format!("start {} as the signed-in user: {e}", exe.display()))
         })();
         if !environment.is_null() {
             let _ = DestroyEnvironmentBlock(environment);
@@ -157,13 +166,9 @@ fn spawn_unelevated(exe: &Path) -> Result<Child, String> {
     }
 }
 
-fn desktop_shell() -> Result<OwnedHandle, String> {
-    let mut pid = 0;
-    // SAFETY: query this session's registered shell and take ownership of the opened handle.
+fn desktop_shell(pid: u32) -> Result<OwnedHandle, String> {
+    // SAFETY: take ownership of the opened handle.
     unsafe {
-        if GetWindowThreadProcessId(GetShellWindow(), Some(&mut pid)) == 0 {
-            return Err("could not find the signed-in user's desktop shell".into());
-        }
         let handle = OpenProcess(
             PROCESS_CREATE_PROCESS | PROCESS_QUERY_LIMITED_INFORMATION,
             false,
