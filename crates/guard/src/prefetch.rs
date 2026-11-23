@@ -1,13 +1,11 @@
 //! Start the signed-in user's optional symbol warm-up after installation commits.
 
-use crate::{account, proc::Child};
+use crate::{account, account::token_elevated, proc::Child};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE},
-    Security::{
-        GetTokenInformation, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-    },
+    Security::{TOKEN_DUPLICATE, TOKEN_QUERY},
     System::{
         Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
         Threading::{
@@ -182,21 +180,4 @@ fn process_token(process: HANDLE) -> Result<OwnedHandle, String> {
             .map_err(|e| format!("open process token: {e}"))?;
         Ok(OwnedHandle::from_raw_handle(raw.0))
     }
-}
-
-fn token_elevated(token: HANDLE) -> Result<bool, String> {
-    let mut elevation = TOKEN_ELEVATION::default();
-    let mut len = 0;
-    // SAFETY: elevation is returned into a correctly sized buffer.
-    unsafe {
-        GetTokenInformation(
-            token,
-            TokenElevation,
-            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
-            size_of::<TOKEN_ELEVATION>() as u32,
-            &mut len,
-        )
-    }
-    .map_err(|e| format!("process token elevation: {e}"))?;
-    Ok(elevation.TokenIsElevated != 0)
 }

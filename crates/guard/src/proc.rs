@@ -85,7 +85,15 @@ impl Child {
 
     /// Takes over a running process (an explorust whose guard died) as if this guard had started it.
     pub fn open(pid: u32) -> Result<Child, String> {
-        let access = PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+        Self::open_with(pid, PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION)
+    }
+
+    /// Opens a process handle only for waiting until it exits.
+    pub fn monitor(pid: u32) -> Result<Child, String> {
+        Self::open_with(pid, PROCESS_SYNCHRONIZE)
+    }
+
+    fn open_with(pid: u32, access: windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS) -> Result<Child, String> {
         // SAFETY: Windows validates the pid and the requested rights.
         let handle = unsafe { OpenProcess(access, false, pid) }.map_err(|e| format!("open pid {pid}: {e}"))?;
         Ok(Child { handle, pid })
@@ -158,14 +166,20 @@ impl Event {
         unsafe { ResetEvent(self.0) }.map_err(|e| e.to_string())
     }
 
-    pub fn is_signalled(name: &str) -> bool {
+    pub fn open_for_wait(name: &str) -> Result<Event, String> {
         // SAFETY: the returned handle, when present, is closed by the owner.
         unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) }
-            .is_ok_and(|handle| {
-                let event = Self(handle);
-                // SAFETY: the event handle is live and the wait returns immediately.
-                unsafe { WaitForSingleObject(event.0, 0) == WAIT_OBJECT_0 }
-            })
+            .map(Event)
+            .map_err(|e| format!("{name}: {e}"))
+    }
+
+    pub fn signalled(&self) -> bool {
+        // SAFETY: the event handle is live and the wait returns immediately.
+        unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+    }
+
+    pub fn is_signalled(name: &str) -> bool {
+        Self::open_for_wait(name).is_ok_and(|event| event.signalled())
     }
 }
 

@@ -13,7 +13,7 @@ use windows::Win32::Security::Cryptography::{
     CertDeleteCertificateFromStore, CertFindCertificateInStore, CertOpenStore, CertFreeCertificateContext, HCERTSTORE,
     PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::Win32::UI::Shell::IsUserAnAdmin;
@@ -26,8 +26,9 @@ const STORES: [&str; 2] = ["Root", "TrustedPublisher"];
 /// some host builds start beside explorust.exe, the toast listener's helper with its sparse
 /// package (`package.rs`), the UI-access keyboard hook, the file index service and the default
 /// handlers (image viewer, Task Manager for Win+X).
-const FILES: [&str; 12] = [
+const FILES: [&str; 13] = [
     "explorust-guard.exe",
+    crate::switch_events::SWITCH_EXE,
     "explorust.exe",
     "explorust-open.exe",
     "nickel-windows-app-probe.exe",
@@ -195,7 +196,7 @@ fn clean_leftovers(to: &Path) {
     }
 }
 
-/// One installer or uninstaller at a time on this machine; released on drop.
+/// A named mutex owned by this thread, released on drop.
 pub struct Lock(HANDLE);
 
 impl Drop for Lock {
@@ -209,15 +210,48 @@ impl Drop for Lock {
 }
 
 pub fn lock() -> Result<Lock, String> {
+    named_lock(r"Global\explorust-setup", 0, "another explorust install or uninstall is running")
+}
+
+pub fn user_setup_lock() -> Result<Lock, String> {
+    named_lock(r"Local\explorust-user-setup", 0, "another explorust install or uninstall is running in this session")
+}
+
+pub fn switch_lock_for(timeout_ms: u32) -> Result<Lock, String> {
+    named_lock(crate::switch_events::SWITCH_MUTEX, timeout_ms, "another switch is running in this session")
+}
+
+pub fn recovery_lock_for(timeout_ms: u32) -> Result<Lock, String> {
+    try_recovery_lock_for(timeout_ms)?
+        .ok_or_else(|| "the independent desktop recovery is still running".into())
+}
+
+pub fn try_recovery_lock_for(timeout_ms: u32) -> Result<Option<Lock>, String> {
+    try_named_lock(crate::switch_events::RECOVERY_MUTEX, timeout_ms)
+}
+
+pub fn try_folder_close_lock(owner: u32, hwnd: isize) -> Result<Option<Lock>, String> {
+    try_named_lock(&format!(r"Local\explorust-switch-folder-close-{owner}-{hwnd}"), 0)
+}
+
+fn named_lock(name: &str, timeout_ms: u32, busy: &str) -> Result<Lock, String> {
+    try_named_lock(name, timeout_ms)?.ok_or_else(|| busy.into())
+}
+
+fn try_named_lock(name: &str, timeout_ms: u32) -> Result<Option<Lock>, String> {
     // SAFETY: a named mutex; the handle moves into the Lock.
     unsafe {
-        let h = CreateMutexW(None, false, &HSTRING::from(r"Global\explorust-setup")).map_err(|e| format!("setup lock: {e}"))?;
-        let w = WaitForSingleObject(h, 0);
-        if w == WAIT_OBJECT_0 || w == WAIT_ABANDONED {
-            Ok(Lock(h))
-        } else {
-            let _ = CloseHandle(h);
-            Err("another explorust install or uninstall is running".into())
+        let h = CreateMutexW(None, false, &HSTRING::from(name)).map_err(|e| format!("{name}: {e}"))?;
+        match WaitForSingleObject(h, timeout_ms) {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(Lock(h))),
+            result => {
+                let error = (result != WAIT_TIMEOUT).then(|| GetLastError());
+                let _ = CloseHandle(h);
+                match error {
+                    Some(error) => Err(format!("wait for {name}: {error:?}")),
+                    None => Ok(None),
+                }
+            }
         }
     }
 }

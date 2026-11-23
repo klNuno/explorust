@@ -15,8 +15,8 @@ fn programs() -> PathBuf {
 
 pub const SETTINGS_EXE: &str = "explorust-settings.exe";
 
-/// Localized name, target arguments and description. An empty argument targets Settings.
-fn shortcuts() -> [(&'static str, &'static str, &'static str); 3] {
+/// Localized name, action and description for each shortcut.
+fn shortcuts() -> [(&'static str, &'static str, &'static str); 4] {
     [
         (
             tr("Revenir à Windows (désinstaller explorust)", "Back to Windows (uninstall explorust)"),
@@ -33,6 +33,11 @@ fn shortcuts() -> [(&'static str, &'static str, &'static str); 3] {
                 "Remplace explorust par l'Explorateur Windows jusqu'à la prochaine ouverture de session.",
                 "Replaces explorust with Windows Explorer until the next sign-in.",
             ),
+        ),
+        (
+            tr("Passer à explorust", "Switch to explorust"),
+            "--switch",
+            tr("Passe sur explorust sans fermer la session.", "Switches to explorust without signing out."),
         ),
         (
             tr("Paramètres d'explorust", "explorust settings"),
@@ -71,6 +76,7 @@ pub fn register(guard: &Path) -> Result<String, String> {
     let quiet = format!("\"{g}\" --uninstall --quiet");
     let location = dir.display().to_string();
     let settings = dir.join(SETTINGS_EXE);
+    let switch = dir.join(crate::switch_events::SWITCH_EXE);
     let icon = format!("\"{}\",0", settings.display());
     let entry = reg::set_uninstall_entry(
         &[
@@ -97,7 +103,12 @@ pub fn register(guard: &Path) -> Result<String, String> {
         }
     }
     for (name, args, desc) in shortcuts() {
-        let target = if args.is_empty() { &settings } else { guard };
+        let target = match args {
+            "" => &settings,
+            "--switch" if switch.is_file() => &switch,
+            "--switch" => continue,
+            _ => guard,
+        };
         match make_link(&folder.join(format!("{name}.lnk")), target, args, desc, &settings) {
             Ok(()) => made += 1,
             Err(e) => errors.push(e),

@@ -4,9 +4,11 @@
 //! signed-in user's own process). The order keeps a way back at every step: on install, the Apps
 //! entry exists before the Shell value; on removal, the Shell value is gone before any file.
 
-use crate::{account, apps, folders, install, log, package, proc, reg, supervise, taskbar};
+use crate::policy::{self, DESKTOP_RECOVERY_LIMIT, RestoreLocks};
+use crate::switch_events::{CANCEL_FOR_RESTORE, EXITING_EXPLORER};
+use crate::{account, apps, desktop_recovery, folders, install, log, package, proc, reg, taskbar, uninstall};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Exit codes shared by `--install`, `--setup` and `--uninstall`.
 pub const FAILED: u32 = 1;
@@ -25,8 +27,15 @@ fn say(msg: &str) {
 /// `--install`: elevated, the machine part then this user's; not elevated (a dev run), only the
 /// Shell value pointing to this exe.
 pub fn install() -> u32 {
-    let lock = match install::lock() {
-        Ok(l) => l,
+    let _user = match install::user_setup_lock() {
+        Ok(lock) => lock,
+        Err(e) => {
+            say(&format!("install: {e}"));
+            return BUSY;
+        }
+    };
+    let _switch = match install::switch_lock_for(0) {
+        Ok(lock) => lock,
         Err(e) => {
             say(&format!("install: {e}"));
             return BUSY;
@@ -45,6 +54,17 @@ pub fn install() -> u32 {
         say("install: elevated as another account; sign in with an administrator account and install from there");
         return OTHER_ACCOUNT;
     }
+    let lock = if elevated {
+        match install::lock() {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                say(&format!("install: {e}"));
+                return BUSY;
+            }
+        }
+    } else {
+        None
+    };
     // Anything already there (even a damaged install other accounts may use) is not undone on a
     // failure: only a machine with no trace of explorust is.
     let fresh = !install::dir().exists() && !reg::has_uninstall_entry() && reg::machine_users().is_empty();
@@ -129,7 +149,7 @@ fn undo_machine() {
 /// This user's half, in this user's own process: Ok once the Shell value is gone (or was never
 /// there); the rest only warns. The notification package goes later (`remove_package`), once
 /// explorer is back: its removal can take half a minute.
-pub fn restore_user() -> Result<String, String> {
+fn restore_user() -> Result<String, String> {
     let shell = reg::delete_shell().map_err(|e| format!("the Shell value stays: {e}"))?;
     folders::handler(false);
     folders::viewer(&install::dir(), false);
@@ -138,6 +158,83 @@ pub fn restore_user() -> Result<String, String> {
     let r = format!("Shell value {}", if shell { "deleted" } else { "absent" });
     say(&format!("restore: {r}"));
     Ok(r)
+}
+
+pub enum RestoreMode {
+    Repair,
+    Uninstall { quiet: bool },
+    FinishUninstall,
+}
+
+pub enum SessionDesktop {
+    Ready(String),
+    UninstallPending,
+}
+
+/// Serializes the user cleanup and return to Explorer with a live handoff.
+pub fn restore_session(mode: RestoreMode) -> (Result<String, String>, Result<SessionDesktop, String>) {
+    let started = Instant::now();
+    let lock = || {
+        let user = loop {
+            match install::user_setup_lock() {
+                Ok(lock) => break lock,
+                Err(_) if matches!(mode, RestoreMode::FinishUninstall)
+                    && started.elapsed() < Duration::from_secs(5) =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let cancel = proc::Event::named(CANCEL_FOR_RESTORE)?;
+        if matches!(mode, RestoreMode::FinishUninstall) && reg::shell().is_some() {
+            return Err("the user installed a shell while uninstall was pending".into());
+        }
+        cancel.signal()?;
+        say("restore: requested Windows desktop");
+        Ok((user, cancel))
+    };
+    let _locks = match lock() {
+        Ok(lock) => lock,
+        Err(e) => return (Err(e), Err("not tried".into())),
+    };
+    let user = restore_user();
+    if user.is_err() {
+        return (user, Err("not tried".into()));
+    }
+    let mut deadline = Instant::now() + DESKTOP_RECOVERY_LIMIT;
+    let back = loop {
+        if matches!(mode, RestoreMode::FinishUninstall) && taskbar::explorer_file_operations() {
+            deadline = Instant::now() + DESKTOP_RECOVERY_LIMIT;
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        let locks = policy::try_restore_locks(install::switch_lock_for, install::recovery_lock_for);
+        let pending = match locks {
+            RestoreLocks::Acquired(switch, recovery) if !proc::Event::is_signalled(EXITING_EXPLORER) => {
+                let result = bring_back_explorer();
+                drop(recovery);
+                drop(switch);
+                if result.is_ok() && !matches!(mode, RestoreMode::Repair) {
+                    remove_package();
+                }
+                break result.map(SessionDesktop::Ready);
+            }
+            RestoreLocks::Acquired(..) => "Explorer's exit is pending".into(),
+            RestoreLocks::Pending(error) => error,
+        };
+        match mode {
+            RestoreMode::Uninstall { quiet } => {
+                say(&format!("restore: finishing uninstall after the switch cancels ({pending})"));
+                break uninstall::finish_detached(quiet).map(|()| SessionDesktop::UninstallPending);
+            }
+            RestoreMode::FinishUninstall if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => break Err(format!("desktop recovery is already in progress: {pending}")),
+        }
+    };
+    (user, back)
 }
 
 /// This user's notification helper package; a failure only warns (it does nothing without the
@@ -152,30 +249,12 @@ pub fn remove_package() {
 /// Brings explorer's taskbar back now and says so only once it answers. A running guard does it
 /// (it ends explorust and keeps explorer up); with no guard and no taskbar, explorer starts here.
 pub fn bring_back_explorer() -> Result<String, String> {
-    if let Some(pid) = taskbar::explorer() {
-        return Ok(format!("explorer's taskbar already answers (pid {pid})"));
+    let result = desktop_recovery::restore_desktop(&install::dir().join("explorust.exe"), None)
+        .map(|desktop| desktop.description);
+    match &result {
+        Ok(status) | Err(status) => say(&format!("restore: {status}")),
     }
-    let r = match proc::Event::set_existing(supervise::FALLBACK_EVENT) {
-        Ok(()) => match taskbar::wait_any_explorer(Duration::from_secs(45)) {
-            Some(pid) => Ok(format!("the guard brought explorer back (pid {pid})")),
-            None => Err("the guard was asked to bring explorer back, but its taskbar is not up after 45 s".into()),
-        },
-        Err(_) if taskbar::any() => Err("a taskbar runs without its guard: sign out and in again to finish".into()),
-        // Started from an elevated process, explorer would run elevated as the shell.
-        Err(_) if install::elevated() => Err("no shell runs: start explorer.exe from Task Manager".into()),
-        Err(_) => match proc::Child::spawn(&supervise::explorer_path(), "") {
-            Ok(child) => match taskbar::wait_explorer(&child, Duration::from_secs(45)) {
-                taskbar::Start::Up(pid) => Ok(format!("explorer started (pid {pid})")),
-                _ => Err("explorer started but its taskbar did not come".into()),
-            },
-            Err(e) => Err(format!("explorer did not start: {e}")),
-        },
-    };
-    say(&format!("restore: {}", match &r {
-        Ok(s) => s.clone(),
-        Err(e) => e.clone(),
-    }));
-    r
+    result
 }
 
 /// The machine half, elevated. Kept (Ok(false)) while another account's Shell value still points to
@@ -230,14 +309,23 @@ pub fn restore_machine(session_sid: Option<&str>) -> Result<bool, String> {
 /// the machine when elevated. 0 only when every step worked.
 pub fn restore() -> u32 {
     let mine = !install::elevated() || account::is_session_user();
-    let user = if mine { restore_user().map(|_| ()) } else { Ok(()) };
-    let back = bring_back_explorer();
+    let (user, back) = if mine {
+        let (user, desktop) = restore_session(RestoreMode::Repair);
+        let back = desktop.and_then(|status| match status {
+            SessionDesktop::Ready(description) => Ok(description),
+            SessionDesktop::UninstallPending => Err("desktop recovery is pending".into()),
+        });
+        (user, back)
+    } else {
+        let back = install::recovery_lock_for(0).and_then(|_lock| bring_back_explorer());
+        (Ok(String::new()), back)
+    };
     // Only once the shell is off for good and explorer answers: the package is explorust's.
     if mine && user.is_ok() && back.is_ok() {
         remove_package();
     }
     let machine = match (&user, &back, install::elevated()) {
-        (Ok(()), Ok(_), true) => restore_machine(None).map(|_| ()),
+        (Ok(_), Ok(_), true) => restore_machine(None).map(|_| ()),
         (Err(_), _, true) => Err("files kept: the Shell value is still there".to_string()),
         (_, Err(_), true) => Err("files kept: explorer is not back yet; sign out and in, then run it again".to_string()),
         (_, _, false) => {
@@ -248,7 +336,7 @@ pub fn restore() -> u32 {
         }
     };
     let mut code = 0;
-    for (what, r) in [("user", user), ("explorer", back.clone().map(|_| ())), ("machine", machine)] {
+    for (what, r) in [("user", user.map(|_| ())), ("explorer", back.clone().map(|_| ())), ("machine", machine)] {
         if let Err(e) = r {
             say(&format!("restore failed ({what}): {e}"));
             code = FAILED;

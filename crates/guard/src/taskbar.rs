@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL,
+    FindWindowExW, GetShellWindow, GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL,
 };
 use windows::core::{PWSTR, w};
 
@@ -32,14 +32,14 @@ fn trays() -> Vec<(HWND, u32)> {
     out
 }
 
-fn answers(h: HWND, within: Duration) -> bool {
+pub fn answers(h: HWND, within: Duration) -> bool {
     let mut out = 0usize;
     // SAFETY: a bounded send of a message every window accepts.
     let r = unsafe { SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, within.as_millis() as u32, Some(&mut out)) };
     r.0 != 0
 }
 
-fn image_path(pid: u32) -> Option<String> {
+pub fn image_path(pid: u32) -> Option<String> {
     // SAFETY: the handle is closed; the buffer has the length given.
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
@@ -63,13 +63,34 @@ pub fn probe(pid: u32) -> Probe {
 
 /// The pid of an explorer.exe whose taskbar answers, if any.
 pub fn explorer() -> Option<u32> {
+    explorer_except(None)
+}
+
+pub fn explorer_except(retiring: Option<u32>) -> Option<u32> {
     trays()
         .into_iter()
         .find(|(h, pid)| {
-            image_path(*pid).is_some_and(|path| path.rsplit('\\').next().is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe")))
+            retiring != Some(*pid)
+                && image_path(*pid).is_some_and(|path| path.rsplit('\\').next().is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe")))
                 && answers(*h, Duration::from_secs(2))
         })
         .map(|(_, pid)| pid)
+}
+
+pub fn explorer_window() -> Option<(HWND, u32)> {
+    explorer_window_except(None)
+}
+
+pub fn explorer_window_except(excluded: Option<u32>) -> Option<(HWND, u32)> {
+    trays().into_iter().find(|(_, pid)| Some(*pid) != excluded && is_explorer(*pid))
+}
+
+pub fn explorer_window_for(pid: u32) -> Option<HWND> {
+    tray_for(pid).filter(|_| is_explorer(pid))
+}
+
+pub fn is_explorer(pid: u32) -> bool {
+    image_path(pid).is_some_and(|path| path.eq_ignore_ascii_case(&crate::supervise::explorer_path().to_string_lossy()))
 }
 
 /// The installed shell's taskbar owner. A dev shell launched elsewhere would reload its own exe.
@@ -80,13 +101,34 @@ pub fn explorust(exe: &Path) -> Option<u32> {
     })
 }
 
+/// A registered desktop can have an owner before its taskbar appears.
+fn desktop_window_owner() -> Option<u32> {
+    let mut pid = 0;
+    // SAFETY: only query the PID of the desktop window Windows currently publishes.
+    unsafe { GetWindowThreadProcessId(GetShellWindow(), Some(&mut pid)) };
+    (pid != 0).then_some(pid)
+}
+
+pub fn tray_for(pid: u32) -> Option<HWND> {
+    trays().into_iter().find_map(|(window, owner)| (owner == pid).then_some(window))
+}
+
 pub fn owns_tray(pid: u32) -> bool {
-    trays().into_iter().any(|(_, owner)| owner == pid)
+    tray_for(pid).is_some()
 }
 
 /// True when some taskbar window exists, whoever owns it.
 pub fn any() -> bool {
     !trays().is_empty()
+}
+
+pub fn desktop_owner() -> Option<u32> {
+    desktop_window_owner().or_else(|| trays().first().map(|&(_, pid)| pid))
+}
+
+pub fn explorer_file_operations() -> bool {
+    // SAFETY: this is only a lookup on the current desktop.
+    unsafe { FindWindowExW(None, None, w!("OperationStatusWindow"), None).is_ok() }
 }
 
 pub enum Start {
@@ -117,20 +159,6 @@ pub fn wait_explorer(child: &Child, limit: Duration) -> Start {
         }
         if t0.elapsed() >= limit {
             return Start::Timeout;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
-/// Waits up to `limit` for any explorer taskbar.
-pub fn wait_any_explorer(limit: Duration) -> Option<u32> {
-    let t0 = Instant::now();
-    loop {
-        if let Some(pid) = explorer() {
-            return Some(pid);
-        }
-        if t0.elapsed() >= limit {
-            return None;
         }
         std::thread::sleep(Duration::from_millis(500));
     }

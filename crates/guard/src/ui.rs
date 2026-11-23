@@ -12,12 +12,12 @@ use windows::Win32::UI::Controls::{
     TDF_USE_COMMAND_LINKS, TDM_CLICK_BUTTON, TDM_ENABLE_BUTTON, TDM_SET_PROGRESS_BAR_MARQUEE, TDN_BUTTON_CLICKED, TDN_CREATED, TDN_TIMER,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    HWND_TOPMOST, IDNO, IDOK, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    HWND_TOPMOST, IDCANCEL, IDNO, IDOK, IDYES, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
     MB_YESNOCANCEL,
     GetWindowRect, MESSAGEBOX_STYLE, MessageBoxW, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowPos,
 };
 use windows::core::{HRESULT, HSTRING, PCWSTR, s, w};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// True when Windows shows its menus in French.
 pub fn french() -> bool {
@@ -128,10 +128,42 @@ pub fn choose(icon: Icon, main: &str, content: &str, buttons: &[(i32, &str)], ca
 
 /// Runs `work` on a worker thread while a dialog with a moving progress bar says what is going on,
 /// so a slow step (the notification package can take a minute or two) never looks frozen. The
-/// dialog cannot be closed before `work` ends; it closes itself then. Without task dialogs the work
-/// just runs.
+/// dialog closes when `work` ends. Without task dialogs the work just runs.
 pub fn working<T: Send>(main: &str, content: &str, work: impl FnOnce() -> T + Send) -> T {
-    let done = AtomicBool::new(false);
+    progress(main, content, None, work)
+}
+
+/// The user can cancel while the worker is waiting. Once the worker commits the change the
+/// dialog keeps showing progress until it ends.
+#[derive(Default)]
+pub struct Cancel(AtomicU8);
+
+const CANCELLABLE: u8 = 0;
+const CANCELLED: u8 = 1;
+const COMMITTED: u8 = 2;
+
+impl Cancel {
+    pub fn requested(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == CANCELLED
+    }
+
+    pub fn commit(&self) -> bool {
+        self.0.compare_exchange(CANCELLABLE, COMMITTED, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
+}
+
+pub fn working_cancellable<T: Send>(main: &str, content: &str, work: impl FnOnce(&Cancel) -> T + Send) -> T {
+    let cancel = Cancel::default();
+    progress(main, content, Some(&cancel), || work(&cancel))
+}
+
+struct Progress<'a> {
+    done: AtomicBool,
+    cancel: Option<&'a Cancel>,
+}
+
+fn progress<T: Send>(main: &str, content: &str, cancel: Option<&Cancel>, work: impl FnOnce() -> T + Send) -> T {
+    let progress = Progress { done: AtomicBool::new(false), cancel };
     std::thread::scope(|scope| {
         let job = scope.spawn(|| {
             // Set on drop, so a panic in `work` still closes the dialog.
@@ -141,7 +173,7 @@ pub fn working<T: Send>(main: &str, content: &str, work: impl FnOnce() -> T + Se
                     self.0.store(true, Ordering::SeqCst);
                 }
             }
-            let _done = Done(&done);
+            let _done = Done(&progress.done);
             work()
         });
         if let Some(td) = task_dialog() {
@@ -151,16 +183,16 @@ pub fn working<T: Send>(main: &str, content: &str, work: impl FnOnce() -> T + Se
             let cfg = TASKDIALOGCONFIG {
                 cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
                 dwFlags: TASKDIALOG_FLAGS(TDF_SHOW_MARQUEE_PROGRESS_BAR.0 | TDF_CALLBACK_TIMER.0),
-                dwCommonButtons: TDCBF_OK_BUTTON,
+                dwCommonButtons: if cancel.is_some() { TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON } else { TDCBF_OK_BUTTON },
                 pszWindowTitle: PCWSTR(title.as_ptr()),
                 pszMainInstruction: PCWSTR(main_w.as_ptr()),
                 pszContent: PCWSTR(content_w.as_ptr()),
                 pfCallback: Some(on_progress),
-                lpCallbackData: &done as *const AtomicBool as isize,
+                lpCallbackData: &progress as *const Progress<'_> as isize,
                 ..Default::default()
             };
             crate::log::line(&format!("dialog: {main} (progress)"));
-            // SAFETY: the strings and `done` outlive the call, which returns before the scope ends.
+            // SAFETY: the strings and `progress` outlive the call.
             let hr = unsafe { td(&cfg, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
             if hr.is_err() {
                 crate::log::line(&format!("progress dialog failed ({hr:?})"));
@@ -171,19 +203,27 @@ pub fn working<T: Send>(main: &str, content: &str, work: impl FnOnce() -> T + Se
 }
 
 /// The progress dialog: marquee and a greyed OK at first, then OK clicked by itself once the work
-/// is done; a click or Escape before that is ignored.
-unsafe extern "system" fn on_progress(hwnd: HWND, msg: TASKDIALOG_NOTIFICATIONS, _: WPARAM, _: LPARAM, data: isize) -> HRESULT {
-    // SAFETY: `data` is the `AtomicBool` that `working` keeps alive for the whole dialog.
-    let done = unsafe { &*(data as *const AtomicBool) }.load(Ordering::SeqCst);
+/// is done. Cancel requests are passed to the worker until it commits.
+unsafe extern "system" fn on_progress(hwnd: HWND, msg: TASKDIALOG_NOTIFICATIONS, button: WPARAM, _: LPARAM, data: isize) -> HRESULT {
+    // SAFETY: `progress` stays alive for the whole dialog.
+    let progress = unsafe { &*(data as *const Progress<'_>) };
+    let done = progress.done.load(Ordering::SeqCst);
     // SAFETY: messages to the dialog's own window.
     unsafe {
         if msg == TDN_CREATED {
             raise(hwnd);
             SendMessageW(hwnd, TDM_SET_PROGRESS_BAR_MARQUEE.0 as u32, Some(WPARAM(1)), Some(LPARAM(30)));
             SendMessageW(hwnd, TDM_ENABLE_BUTTON.0 as u32, Some(WPARAM(IDOK.0 as usize)), Some(LPARAM(0)));
-        } else if msg == TDN_TIMER && done {
-            SendMessageW(hwnd, TDM_CLICK_BUTTON.0 as u32, Some(WPARAM(IDOK.0 as usize)), Some(LPARAM(0)));
+        } else if msg == TDN_TIMER {
+            if done {
+                SendMessageW(hwnd, TDM_CLICK_BUTTON.0 as u32, Some(WPARAM(IDOK.0 as usize)), Some(LPARAM(0)));
+            } else if progress.cancel.is_some_and(|cancel| cancel.0.load(Ordering::SeqCst) != CANCELLABLE) {
+                SendMessageW(hwnd, TDM_ENABLE_BUTTON.0 as u32, Some(WPARAM(IDCANCEL.0 as usize)), Some(LPARAM(0)));
+            }
         } else if msg == TDN_BUTTON_CLICKED && !done {
+            if button.0 == IDCANCEL.0 as usize && let Some(cancel) = progress.cancel {
+                let _ = cancel.0.compare_exchange(CANCELLABLE, CANCELLED, Ordering::SeqCst, Ordering::SeqCst);
+            }
             return HRESULT(1);
         }
     }

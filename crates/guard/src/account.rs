@@ -4,13 +4,50 @@
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-use windows::Win32::Security::{GetTokenInformation, LookupAccountSidW, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser};
+use windows::Win32::Security::{GetTokenInformation, LookupAccountSidW, SID_NAME_USE, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser};
 use windows::Win32::System::RemoteDesktop::{
     WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_INFO_CLASS, WTSDomainName, WTSFreeMemory, WTSQuerySessionInformationW,
     WTSUserName,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::core::{PCWSTR, PWSTR};
+
+pub fn token_elevated(token: HANDLE) -> Result<bool, String> {
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut len = 0;
+    // SAFETY: elevation is returned into a correctly sized buffer.
+    unsafe {
+        GetTokenInformation(
+            token, TokenElevation, Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            size_of::<TOKEN_ELEVATION>() as u32, &mut len,
+        )
+    }
+    .map_err(|e| format!("process token elevation: {e}"))?;
+    Ok(elevation.TokenIsElevated != 0)
+}
+
+/// Inspect the desktop owner's token using query access only.
+pub fn check_unelevated_process(pid: u32) -> Result<(), String> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    // SAFETY: both returned handles move into OwnedHandle.
+    let token = unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|e| format!("open Explorer desktop process {pid}: {e}"))?;
+        let _process = OwnedHandle::from_raw_handle(process.0);
+        let mut token = HANDLE::default();
+        OpenProcessToken(process, TOKEN_QUERY, &mut token)
+            .map_err(|e| format!("query Explorer desktop token: {e}"))?;
+        OwnedHandle::from_raw_handle(token.0)
+    };
+    let token = HANDLE(token.as_raw_handle());
+    if token_elevated(token)? {
+        return Err("Explorer's desktop runs elevated".into());
+    }
+    if own_sid().is_none_or(|sid| token_sid(token).as_deref() != Some(sid.as_str())) {
+        return Err("Explorer's desktop belongs to a different account".into());
+    }
+    Ok(())
+}
 
 /// Aligned storage for TOKEN_USER and the SID it points to.
 fn token_user(token: HANDLE) -> Option<Vec<usize>> {
