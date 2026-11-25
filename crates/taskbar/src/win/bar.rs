@@ -369,6 +369,10 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         BAR.with(|b| *b.borrow_mut() = Some(bar));
         if let Err(e) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
             log::line(&format!("session notifications unavailable: {e}"));
+        } else {
+            // Read after registration so transitions after the snapshot are delivered to us.
+            let session = notification_state::Session::registered();
+            with_bar(|b| b.notification_session = session);
         }
         with_bar(|b| {
             b.fullscreen_changed(fg);
@@ -1481,10 +1485,10 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             let state = BAR.with(|bar| {
                 let bar = bar.try_borrow().ok()?;
                 let bar = bar.as_ref()?;
-                Some((bar.notification_session.inactive(), bar.monitor))
+                Some((bar.notification_session, bar.monitor))
             });
-            let (inactive, bounds) = state.unwrap_or_else(|| (false, primary_monitor()));
-            let notification = notification_state::query(inactive, || {
+            let (session, bounds) = state.unwrap_or_else(|| (Default::default(), primary_monitor()));
+            let notification = notification_state::query(session.inactive(), || {
                 // SAFETY: a foreground snapshot also handles a closed app with no successor.
                 let fg = unsafe { GetForegroundWindow() };
                 fullscreen::covered_monitors(fg).contains(&fullscreen::monitor_at(&bounds))

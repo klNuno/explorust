@@ -1,6 +1,10 @@
 //! The `Shell_TrayWnd` query sent by shell32's `SHQueryUserNotificationState`.
 
 use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::System::RemoteDesktop::{
+    WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK, WTSActive, WTSFreeMemory,
+    WTSINFOEXW, WTSQuerySessionInformationW, WTSSessionInfoEx,
+};
 use windows::Win32::System::Threading::{
     OpenEventW, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
 };
@@ -13,33 +17,74 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_CONNECT, WTS_REMOTE_DISCONNECT,
     WTS_SESSION_LOCK, WTS_SESSION_LOGOFF, WTS_SESSION_LOGON, WTS_SESSION_UNLOCK,
 };
-use windows_core::{BOOL, Owned, w};
+use windows_core::{BOOL, Owned, PWSTR, w};
 
 pub const QUERY: u32 = 0x04ef;
 
-#[derive(Default)]
-pub struct Session {
+#[derive(Clone, Copy, Default)]
+pub struct Session(Option<SessionState>);
+
+#[derive(Clone, Copy)]
+struct SessionState {
     locked: bool,
     disconnected: bool,
 }
 
 impl Session {
+    pub fn registered() -> Self {
+        Self(SessionState::read())
+    }
+
     pub fn changed(&mut self, event: u32) {
+        let Some(state) = self.0.as_mut() else { return };
         match event {
-            WTS_SESSION_LOCK => self.locked = true,
-            WTS_SESSION_UNLOCK => self.locked = false,
+            WTS_SESSION_LOCK => state.locked = true,
+            WTS_SESSION_UNLOCK => state.locked = false,
             WTS_CONSOLE_DISCONNECT | WTS_REMOTE_DISCONNECT | WTS_SESSION_LOGOFF => {
-                self.disconnected = true
+                state.disconnected = true
             }
             WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT | WTS_SESSION_LOGON => {
-                self.disconnected = false
+                state.disconnected = false
             }
             _ => {}
         }
     }
 
-    pub fn inactive(&self) -> bool {
-        self.locked || self.disconnected
+    pub fn inactive(self) -> bool {
+        self.0.or_else(SessionState::read).is_some_and(|state| state.locked || state.disconnected)
+    }
+}
+
+impl SessionState {
+    fn read() -> Option<Self> {
+        let mut buffer = PWSTR::null();
+        let mut bytes = 0;
+        // SAFETY: WTS allocates the returned buffer. Read the documented level 1 structure
+        // only when the buffer is large enough, then free the buffer with WTSFreeMemory.
+        let info = unsafe {
+            WTSQuerySessionInformationW(
+                None, WTS_CURRENT_SESSION, WTSSessionInfoEx, &mut buffer, &mut bytes,
+            ).ok()?;
+            if buffer.is_null() {
+                return None;
+            }
+            let info = if bytes as usize >= size_of::<WTSINFOEXW>() {
+                let info = buffer.0.cast::<WTSINFOEXW>().read_unaligned();
+                (info.Level == 1).then(|| info.Data.WTSInfoExLevel1)
+            } else {
+                None
+            };
+            WTSFreeMemory(buffer.0.cast());
+            info?
+        };
+        let disconnected = info.SessionState != WTSActive;
+        let locked = match info.SessionFlags as u32 {
+            WTS_SESSIONSTATE_LOCK => true,
+            WTS_SESSIONSTATE_UNLOCK => false,
+            _ if disconnected => false,
+            _ => return None,
+        };
+        Some(Self { locked, disconnected })
     }
 }
 
@@ -115,5 +160,28 @@ fn directdraw_exclusive() -> bool {
         }
         let _ = ReleaseMutex(*gate);
         exclusive
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a locked Windows session"]
+    fn session_started_while_locked_is_inactive() {
+        assert!(Session::default().inactive());
+        let registered = Session::registered();
+        assert!(registered.0.is_some());
+        assert!(registered.inactive());
+    }
+
+    #[test]
+    fn reconnecting_does_not_clear_a_lock() {
+        let mut session = Session(Some(SessionState { locked: true, disconnected: true }));
+        session.changed(WTS_REMOTE_CONNECT);
+        assert!(session.inactive());
+        session.changed(WTS_SESSION_UNLOCK);
+        assert!(!session.inactive());
     }
 }
