@@ -94,14 +94,14 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
                         // SAFETY: this thread successfully entered background mode above.
                         let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) };
                     }
-                    repaired?;
+                    let corrections = repaired?;
                     let journal = v.journal()?;
                     cursor.next = position.next();
                     if cursor.journal != journal.UsnJournalID || !(journal.FirstUsn.max(journal.LowestValidUsn)..=journal.NextUsn).contains(&cursor.next) {
                         return Err(ERROR_INVALID_DATA.into());
                     }
                     position.clear_link_retries(&vol.table);
-                    log::line(&format!("{letter}: MFT reconciled: {} names in {} ms", vol.table.read().len(), clock.elapsed().as_millis()));
+                    log::line(&format!("{letter}: MFT reconciled: {corrections} name corrections in {} ms", clock.elapsed().as_millis()));
                     // The old snapshot retains its boot identifier if the worker stops before
                     // this atomic replacement. Any writes during the scan are replayed from next.
                     cursor.boot = cache::boot();

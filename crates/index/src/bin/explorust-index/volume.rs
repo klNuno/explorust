@@ -400,7 +400,7 @@ impl Volume {
         Ok(())
     }
 
-    pub fn reconcile(&self, table: &RwLock<Table>, sequences: &mut Vec<u16>, pruned: &mut Vec<u64>) -> windows_core::Result<()> {
+    pub fn reconcile(&self, table: &RwLock<Table>, sequences: &mut Vec<u16>, pruned: &mut Vec<u64>) -> windows_core::Result<usize> {
         if let Some(highest) = self.highest_mft_record() {
             table.write().cover_mft_records(highest);
         }

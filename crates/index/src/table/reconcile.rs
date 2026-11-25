@@ -12,10 +12,12 @@ pub fn reconcile<E>(
     sequences: &mut Vec<u16>,
     pruned: &mut Vec<u64>,
     mut enumerate: impl FnMut(bool, &mut dyn FnMut(&[Record])) -> Result<(), E>,
-) -> Result<(), E> {
+) -> Result<usize, E> {
     table.write().prune_roots.clear();
     pruned.clear();
     let mut seen = vec![0u64; sequences.len().div_ceil(WORD_BITS)];
+    let mut corrections = 0;
+    let mut directory_edits = Vec::new();
 
     // Record order is unrelated to directory depth. Refresh directories first so the second
     // pass can skip names still inside WinSxS and recover files whose directories moved out.
@@ -38,8 +40,18 @@ pub fn reconcile<E>(
                         seen.resize(word + 1, 0);
                     }
                     seen[word] |= 1 << (i % WORD_BITS);
+                    let (live, offsets) = (names.live, names.starts.len());
                     apply(&mut names, r, dir, sequences[i], pruned);
                     sequences[i] = r.seq;
+                    // Replacing a name appends an offset, while exposing or hiding one
+                    // changes the live count. Compaction runs only outside this batch.
+                    if (live, offsets) != (names.live, names.starts.len()) {
+                        if dir {
+                            directory_edits.push((i, names.live <= live));
+                        } else {
+                            corrections += 1;
+                        }
+                    }
                 }
                 RwLockWriteGuard::unlock_fair(names);
             }
@@ -53,7 +65,7 @@ pub fn reconcile<E>(
             }
         })?;
         if directories {
-            settle_directories(table, &seen);
+            corrections += settle_directories(table, &seen, std::mem::take(&mut directory_edits));
         }
     }
 
@@ -64,11 +76,9 @@ pub fn reconcile<E>(
         let mut names = table.write();
         for i in start..(start + BATCH).min(records) {
             if !was_seen(&seen, i) {
-                if names
-                    .slots
-                    .get(i)
-                    .is_some_and(|slot| slot.name != NONE || slot.parent == NONE)
-                {
+                if let Some(slot) = names.slots.get(i)
+                    && (slot.name != NONE || slot.parent == NONE) {
+                    corrections += usize::from(slot.name != NONE);
                     names.remove(i as u32);
                 }
                 if let Some(sequence) = sequences.get_mut(i) {
@@ -86,7 +96,7 @@ pub fn reconcile<E>(
             break;
         }
     }
-    Ok(())
+    Ok(corrections)
 }
 
 fn was_seen(seen: &[u64], i: usize) -> bool {
@@ -94,25 +104,35 @@ fn was_seen(seen: &[u64], i: usize) -> bool {
         .is_some_and(|word| word & (1 << (i % WORD_BITS)) != 0)
 }
 
-fn settle_directories(table: &RwLock<Table>, seen: &[u64]) {
+fn settle_directories(table: &RwLock<Table>, seen: &[u64], mut edits: Vec<(usize, bool)>) -> usize {
+    // Count a directory after pruning so a temporarily restored name that remains pruned
+    // does not register as an offline change.
+    edits.sort_unstable_by_key(|&(record, _)| record);
+    let mut edits = edits.into_iter().peekable();
+    let mut corrections = 0;
     let slots = table.read().slots.len();
     for start in (0..slots).step_by(BATCH) {
         let mut names = table.write();
         for i in start..(start + BATCH).min(slots) {
+            let before = edits.next_if(|&(record, _)| record == i);
             let slot = names.slots.at(i);
             if slot.name == NONE || slot.name & DIR == 0 || !was_seen(seen, i) {
+                corrections += usize::from(before.is_some_and(|(_, named)| named));
                 continue;
             }
             if names.walk_pruned(i as u32) {
+                corrections += usize::from(before.is_none_or(|(_, named)| named));
                 names.remove(i as u32);
                 names.slots.set(i, PRUNED);
             } else {
+                corrections += usize::from(before.is_some());
                 let noisy = names.walk_noisy(i as u32);
                 names.meta.set_noisy((slot.name & IDX) as usize, noisy);
             }
         }
         RwLockWriteGuard::unlock_fair(names);
     }
+    corrections
 }
 
 fn apply(names: &mut Table, r: &Record, dir: bool, old_sequence: u16, pruned: &mut Vec<u64>) {
@@ -147,7 +167,7 @@ mod tests {
         let mut result = None;
         usn::parse(
             &usn::encode(
-                rec.into(),
+                u64::from(rec) | (7 << 48),
                 parent.into(),
                 0,
                 0,
@@ -166,13 +186,16 @@ mod tests {
         table.upsert(22, ROOT, "deleted.txt", false, false, 0);
         table.upsert(30, ROOT, "WinSxS", true, false, 0);
         table.upsert(31, 30, "unpruned.txt", false, false, 0);
+        table.upsert(40, ROOT, "Windows", true, false, 0);
+        table.upsert(41, 40, "WinSxS", true, false, 0);
+        table.upsert(42, 41, "Manifest", true, false, 0);
         let mut bytes = Vec::new();
         let cursor = SnapshotCursor {
             journal: 7,
             next: 42,
             boot: [1; 16],
         };
-        Snapshot::write(&mut bytes, &table, cursor, &[7; 32], &[31]).unwrap();
+        Snapshot::write(&mut bytes, &table, cursor, &[7; 43], &[31]).unwrap();
         let snapshot = Snapshot::read_if(&bytes[..], bytes.len() as u64, |_| true)
             .unwrap()
             .unwrap();
@@ -184,12 +207,16 @@ mod tests {
             record(25, ROOT, "created.txt", false),
             record(30, ROOT, "Visible", true),
             record(31, 30, "unpruned.txt", false),
+            record(40, ROOT, "Windows", true),
+            record(41, 40, "WinSxS", true),
+            record(42, 41, "Manifest", true),
         ];
-        reconcile(&table, &mut sequences, &mut pruned, |_, apply| {
+        let corrections = reconcile(&table, &mut sequences, &mut pruned, |_, apply| {
             apply(&records);
             Ok::<_, ()>(())
         })
         .unwrap();
+        assert_eq!(corrections, 5);
         let table = table.read();
         assert_eq!(table.state(22), RecState::Free);
         assert_eq!(table.path(20, "C:\\").as_deref(), Some("C:\\after.txt"));
@@ -199,6 +226,7 @@ mod tests {
             Some("C:\\Visible\\unpruned.txt")
         );
         assert_eq!(sequences[22], 0);
+        assert_eq!(table.state(42), RecState::Pruned);
         assert!(pruned.is_empty());
     }
 
