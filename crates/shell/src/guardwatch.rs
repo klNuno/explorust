@@ -2,7 +2,7 @@
 //! nothing would bring explorer back on a crash and the escape hotkey would be gone, so explorust
 //! starts a new supervisor that adopts it and watches that one.
 
-use crate::log;
+use crate::{events, log, switch_events::BOOTSTRAP_ACTIVE};
 use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows::Win32::Foundation::CloseHandle;
@@ -33,6 +33,10 @@ fn watch(mut pid: u32, staged_event: Option<String>) {
                 }
                 Err(e) => log::line(&format!("guard pid {pid}: {e}")),
             }
+        }
+        if events::Owned::is_signalled(BOOTSTRAP_ACTIVE) {
+            // The unpackaged guard owns recovery when this supervisor dies.
+            return;
         }
         let Ok(exe) = &guard else { return };
         let me = std::process::id().to_string();

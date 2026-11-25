@@ -46,13 +46,6 @@ const FILES: [&str; 15] = [
     crate::apps::SETTINGS_EXE,
 ];
 
-pub fn supervisor(guard: &Path) -> PathBuf {
-    if option_env!("EXPLORUST_PACKAGE_BUILD").is_some() {
-        guard.with_file_name(SUPERVISOR_EXE)
-    } else {
-        guard.to_owned()
-    }
-}
 /// The MFT/USN index (`crates/index`), registered as the service `explorust-index`.
 const INDEX: &str = "explorust-index.exe";
 const SERVICE: &str = "explorust-index";

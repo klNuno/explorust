@@ -60,6 +60,10 @@ mod startup;
 mod startup_retry;
 #[cfg(any(target_os = "windows", test))]
 mod startup_rules;
+#[cfg(target_os = "windows")]
+#[path = "../../guard/src/switch_events.rs"]
+#[allow(dead_code)]
+mod switch_events;
 
 #[cfg(target_os = "windows")]
 fn main() {

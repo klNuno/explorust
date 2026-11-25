@@ -35,8 +35,9 @@ const RELOAD: u32 = 5;
 const PROBLEM: u32 = 6;
 
 /// `adopt`: the pid of a running explorust whose guard died; it is watched instead of starting one.
-pub fn run(adopt: Option<(u32, Option<String>)>, mut rollback: Option<Event>) -> u32 {
+pub fn run(adopt: Option<(u32, Option<String>)>, mut rollback: Option<Event>, explorer_ready: Option<&Event>) -> u32 {
     let live = rollback.is_some();
+    let explorer = |notice| explorer_forever(notice, explorer_ready);
     let fallback = match Event::named(FALLBACK_EVENT) {
         Ok(e) => e,
         Err(e) if live => {
@@ -45,7 +46,7 @@ pub fn run(adopt: Option<(u32, Option<String>)>, mut rollback: Option<Event>) ->
         }
         Err(e) => {
             log::line(&format!("guard: {e}; starting explorer"));
-            return explorer_forever(None);
+            return explorer(None);
         }
     };
     // Create the fallback event before checking rollback. A watcher starting recovery can
@@ -70,7 +71,7 @@ pub fn run(adopt: Option<(u32, Option<String>)>, mut rollback: Option<Event>) ->
         log::line(&format!("guard start: windows {build}, shell {}", exe.display()));
         if !live && hotkey::shift_held() {
             log::line("Shift held at logon: plain explorer");
-            return explorer_forever(None);
+            return explorer(None);
         }
         if !live {
             // A logon counts by its outcome: only one that ended without a problem clears the streak.
@@ -81,12 +82,12 @@ pub fn run(adopt: Option<(u32, Option<String>)>, mut rollback: Option<Event>) ->
             reg::set_logon_had_problem(false);
             let streak = reg::problem_streak();
             if at_logon(streak) == AtLogon::TurnOff {
-                return explorer_forever(Some(turn_off(&format!("explorust ran into a problem at {streak} sign-ins in a row"))));
+                return explorer(Some(turn_off(&format!("explorust ran into a problem at {streak} sign-ins in a row"))));
             }
         }
         if !exe.exists() {
             let why = format!("{} is missing", exe.display());
-            return explorer_forever(Some(if live { Notice::Problem(why) } else { turn_off(&why) }));
+            return explorer(Some(if live { Notice::Problem(why) } else { turn_off(&why) }));
         }
     }
     loop {
@@ -114,7 +115,7 @@ pub fn run(adopt: Option<(u32, Option<String>)>, mut rollback: Option<Event>) ->
             End::Fallback(why) => {
                 let _ = fallback.signal();
                 log::line(&format!("fallback: {why}"));
-                return explorer_forever(None);
+                return explorer(None);
             }
             End::GraphicsLost => {
                 let now = Instant::now();
@@ -131,16 +132,16 @@ pub fn run(adopt: Option<(u32, Option<String>)>, mut rollback: Option<Event>) ->
         let _ = fallback.signal();
         if live {
             log::line(&format!("problem after a live switch: {why}; plain explorer for this session"));
-            return explorer_forever(Some(Notice::Problem(why)));
+            return explorer(Some(Notice::Problem(why)));
         }
         let streak = reg::problem_streak() + 1;
         reg::set_problem_streak(streak);
         reg::set_logon_had_problem(true);
         log::line(&format!("problem: {why}; plain explorer for this session (problem logons in a row: {streak})"));
         if streak >= MAX_STREAK {
-            return explorer_forever(Some(turn_off(&format!("{why} (a problem at {streak} sign-ins in a row)"))));
+            return explorer(Some(turn_off(&format!("{why} (a problem at {streak} sign-ins in a row)"))));
         }
-        return explorer_forever(Some(Notice::Problem(why)));
+        return explorer(Some(Notice::Problem(why)));
     }
 }
 
@@ -407,7 +408,7 @@ pub fn explorer_path() -> PathBuf {
 /// counts; after 3 in a row the user is told once how to start it by hand, and the guard keeps
 /// trying, waiting longer between tries (up to a minute). `notice` shows once a taskbar answers.
 /// The escape hotkey is released first.
-pub(crate) fn explorer_forever(notice: Option<Notice>) -> u32 {
+pub(crate) fn explorer_forever(notice: Option<Notice>, mut explorer_ready: Option<&Event>) -> u32 {
     // Explorer has its own shortcuts: the escape to it has no use now and is given back.
     hotkey::release();
     let release = Event::named(RELEASE_EXPLORER).ok();
@@ -459,6 +460,11 @@ pub(crate) fn explorer_forever(notice: Option<Notice>) -> u32 {
                 }
             }
         };
+        if let Some(event) = explorer_ready.take() {
+            if let Err(error) = event.signal() {
+                log::line(&format!("guard: could not report Explorer ready: {error}"));
+            }
+        }
         if let Some(n) = notice.take() {
             notice::show_later(n);
         }
