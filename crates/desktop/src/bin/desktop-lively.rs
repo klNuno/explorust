@@ -1,12 +1,16 @@
 //! desktop-lively.exe: a guest test that does what Lively Wallpaper does to put its window behind
 //! the desktop icons (`WinDesktopCore.cs`, `SetupDesktopLayer` and `TryAttachToDesktop`): send
 //! 0x052C to Progman, find the WorkerW, parent a colored window there, keep it `secs` seconds.
-//! `desktop-lively [progman|workerw] [secs] [RRGGBB]`: `progman` is Lively's default on the raised
-//! desktop (a layered child of Progman just under SHELLDLL_DefView), `workerw` its "WorkerW parent"
-//! setting (a child of the WorkerW). The window tree before and after goes to `desktop-lively.log`
-//! beside the exe.
+//! `desktop-lively [progman|workerw] [secs] [RRGGBB] [gdi|flip|composition]`: `progman` is Lively's
+//! default on the raised desktop (just under SHELLDLL_DefView), `workerw` its "WorkerW parent"
+//! setting. The GPU modes use the window styles of Wallpaper Engine's video renderer and a DXGI
+//! swap chain, presented to the HWND or via DirectComposition. Logs go to `desktop-lively.log`.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+#[cfg(target_os = "windows")]
+#[path = "lively/flip.rs"]
+mod flip;
 
 #[cfg(target_os = "windows")]
 fn main() {
@@ -18,7 +22,8 @@ fn main() {
     let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
     let rgb = args.get(2).and_then(|s| u32::from_str_radix(s, 16).ok()).unwrap_or(0xC0_20_80);
     let mut log = Vec::new();
-    win::run(&mode, secs, rgb, &mut log);
+    let render = args.get(3).map_or("gdi", String::as_str);
+    win::run(&mode, secs, rgb, render, &mut log);
     win::flush(&mut log);
 }
 
@@ -34,13 +39,16 @@ mod win {
         SetTextColor, TRANSPARENT, TextOutW,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Shell::SHQueryUserNotificationState;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW, FindWindowW,
         GW_CHILD, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetClientRect, GetSystemMetrics, GetWindow,
-        GetWindowLongPtrW, GetWindowRect, GetWindowTextW, LWA_ALPHA, MSG, PM_REMOVE, PeekMessageW, RegisterClassExW,
+        GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, LWA_ALPHA,
+        MSG, PM_REMOVE, PeekMessageW, RegisterClassExW,
         SM_CXSCREEN, SM_CYSCREEN, SMTO_NORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
         SW_SHOWNA, SendMessageTimeoutW, SetLayeredWindowAttributes, SetParent, ShowWindow, SetWindowLongPtrW, SetWindowPos, TranslateMessage,
-        WM_PAINT, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+        WM_PAINT, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+        WS_EX_TOOLWINDOW, WS_POPUP,
     };
     use windows_core::{BOOL, w};
 
@@ -61,14 +69,21 @@ mod win {
         unsafe {
             let n = GetWindowTextW(h, &mut t) as usize;
             let _ = GetWindowRect(h, &mut r);
+            let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+            let mut layer = String::new();
+            if ex & WS_EX_LAYERED.0 as isize != 0 {
+                let (mut key, mut alpha, mut flags) = (COLORREF(0), 0, Default::default());
+                if GetLayeredWindowAttributes(h, Some(&mut key), Some(&mut alpha), Some(&mut flags)).is_ok() {
+                    layer = format!(" layer flags {:#x} alpha {alpha} key {:#08x}", flags.0, key.0);
+                }
+            }
             out.push(format!(
-                "{}{:?} {} \"{}\" style {:#x} ex {:#x} rect {},{} {}x{}",
+                "{}{:?} {} \"{}\" style {:#x} ex {ex:#x} rect {},{} {}x{}{layer}",
                 "  ".repeat(depth),
                 h.0,
                 class(h),
                 String::from_utf16_lossy(&t[..n]),
                 GetWindowLongPtrW(h, GWL_STYLE),
-                GetWindowLongPtrW(h, GWL_EXSTYLE),
                 r.left,
                 r.top,
                 r.right - r.left,
@@ -136,7 +151,7 @@ mod win {
         log.clear();
     }
 
-    pub fn run(mode: &str, secs: u64, rgb: u32, log: &mut Vec<String>) {
+    pub fn run(mode: &str, secs: u64, rgb: u32, render: &str, log: &mut Vec<String>) {
         // SAFETY: the test's own window, created, parented, pumped and destroyed here.
         unsafe {
             COLOR.store(rgb, std::sync::atomic::Ordering::Relaxed);
@@ -146,6 +161,7 @@ mod win {
             };
             let raised_layout = GetWindowLongPtrW(progman, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP.0 as isize != 0;
             log.push(format!("mode {mode}; Progman {:?}, WS_EX_NOREDIRECTIONBITMAP {raised_layout}", progman.0));
+            log.push(format!("SHQueryUserNotificationState: {:?}", SHQueryUserNotificationState().map(|state| state.0)));
             log.push("tree before:".into());
             describe(progman, 0, log);
             let t = Instant::now();
@@ -165,6 +181,14 @@ mod win {
                 log.push("FAIL: no DefView or WorkerW".into());
                 return;
             };
+            if matches!(render, "flip" | "composition") {
+                let parent = if mode == "workerw" { workerw } else { progman };
+                let after = (parent == progman).then_some(defview);
+                if let Err(error) = run_gpu(progman, parent, after, secs, rgb, render, log) {
+                    log.push(format!("FAIL: {render} probe setup or presentation: {error}"));
+                }
+                return;
+            }
 
             let inst = GetModuleHandleW(None).unwrap_or_default();
             let wc = WNDCLASSEXW {
@@ -246,5 +270,78 @@ mod win {
             let _ = DestroyWindow(h);
             log.push(format!("done, {} paints, window destroyed", PAINTS.load(std::sync::atomic::Ordering::Relaxed)));
         }
+    }
+
+    fn run_gpu(
+        progman: HWND, parent: HWND, after: Option<HWND>, secs: u64, rgb: u32, render: &str,
+        log: &mut Vec<String>,
+    ) -> windows_core::Result<()> {
+        // SAFETY: this thread owns the probe window and its renderer. The parent is discovered
+        // above, and the primary screen bounds are mapped into its client coordinates.
+        unsafe {
+            let inst = GetModuleHandleW(None)?;
+            let name = w!("desktop-lively-flip");
+            let wc = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(flip_proc),
+                hInstance: inst.into(),
+                lpszClassName: name,
+                ..Default::default()
+            };
+            if RegisterClassExW(&wc) == 0 {
+                return Err(windows_core::Error::from_thread());
+            }
+            let (width, height) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            let mut bounds = [POINT::default(), POINT { x: width, y: height }];
+            MapWindowPoints(None, Some(parent), &mut bounds);
+            let hwnd = CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED,
+                name,
+                name,
+                WS_CHILD,
+                bounds[0].x,
+                bounds[0].y,
+                width,
+                height,
+                Some(parent),
+                None,
+                Some(inst.into()),
+                None,
+            )?;
+            let result = (|| {
+                SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
+                let flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE;
+                if let Some(after) = after {
+                    SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, flags)?;
+                }
+                let _ = ShowWindow(hwnd, SW_SHOWNA);
+                let renderer = crate::flip::Renderer::new(
+                    hwnd, width as u32, height as u32, rgb, render == "composition",
+                )?;
+                log.push(format!("{render} window {:?} parented to {} {:?}", hwnd.0, class(parent), parent.0));
+                describe(progman, 0, log);
+                let first = renderer.present()?;
+                log.push(format!("{render} present {:#010x}; expect #{rgb:06X} at {},{}", first.0, width / 2, height / 2));
+                flush(log);
+                let end = Instant::now() + Duration::from_secs(secs);
+                let mut msg = MSG::default();
+                while Instant::now() < end {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    let _ = renderer.present()?;
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+                Ok(())
+            })();
+            let _ = DestroyWindow(hwnd);
+            result
+        }
+    }
+
+    unsafe extern "system" fn flip_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        // SAFETY: the flip window uses only the default window handling.
+        unsafe { DefWindowProcW(h, msg, wp, lp) }
     }
 }

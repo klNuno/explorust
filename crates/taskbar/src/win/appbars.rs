@@ -2,16 +2,20 @@
 //! results written back into the sender's shared memory, ABN_ notifications, and the work area
 //! the taskbar and the docked bars leave.
 
-use super::log;
+use super::{fullscreen, log};
 use crate::appbar::{self as ab, AppBars, Message, Rect};
+use std::collections::HashSet;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::UI::Shell::{SHLockShared, SHUnlockShared};
 use windows::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW};
 
 pub struct AppBarHost {
     pub bars: AppBars,
-    /// The fullscreen state last told to the bars.
+    /// Whether the taskbar's own monitor is fullscreen.
     pub fullscreen: bool,
+    fullscreen_monitors: Vec<HMONITOR>,
+    fullscreen_bars: HashSet<isize>,
     logged_raw: bool,
 }
 
@@ -28,7 +32,10 @@ pub fn to_rect(r: RECT) -> Rect {
 
 impl AppBarHost {
     pub fn new() -> AppBarHost {
-        AppBarHost { bars: AppBars::default(), fullscreen: false, logged_raw: false }
+        AppBarHost {
+            bars: AppBars::default(), fullscreen: false, fullscreen_monitors: Vec::new(),
+            fullscreen_bars: HashSet::new(), logged_raw: false,
+        }
     }
 
     pub fn on_copydata(&mut self, data: &[u8], monitor: Rect, taskbar: Rect, reserved: Rect) -> Outcome {
@@ -52,9 +59,13 @@ impl AppBarHost {
     fn handle(&mut self, m: &Message, monitor: Rect, taskbar: Rect, reserved: Rect) -> Outcome {
         let mut out = Outcome::default();
         match m.msg {
-            ab::ABM_NEW => out.result = self.bars.add(m.hwnd, m.callback) as isize,
+            ab::ABM_NEW => {
+                out.result = self.bars.add(m.hwnd, m.callback) as isize;
+                self.notify_fullscreen();
+            }
             ab::ABM_REMOVE => {
                 if self.bars.remove(m.hwnd) {
+                    self.fullscreen_bars.remove(&m.hwnd);
                     out.result = 1;
                     out.work_area = true;
                     self.notify_all(m.hwnd, ab::ABN_POSCHANGED, 0);
@@ -77,7 +88,11 @@ impl AppBarHost {
                 out.result = 1;
             }
             ab::ABM_GETTASKBARPOS => out.result = write_rect(m, taskbar, Some(ab::ABE_BOTTOM)) as isize,
-            ab::ABM_ACTIVATE | ab::ABM_WINDOWPOSCHANGED => out.result = 1,
+            ab::ABM_ACTIVATE => out.result = 1,
+            ab::ABM_WINDOWPOSCHANGED => {
+                self.notify_fullscreen();
+                out.result = 1;
+            }
             ab::ABM_GETAUTOHIDEBAR | ab::ABM_GETAUTOHIDEBAREX => {
                 out.result = self.bars.autohide_bar(m.edge).unwrap_or(0);
             }
@@ -98,15 +113,34 @@ impl AppBarHost {
         }
     }
 
-    /// Tells the bars when a window starts or stops covering the monitor (ABN_FULLSCREENAPP).
-    pub fn set_fullscreen(&mut self, on: bool) -> bool {
+    /// Updates AppBars and returns whether the taskbar's own fullscreen state changed.
+    pub fn set_fullscreen(&mut self, taskbar_monitor: &RECT, monitors: Vec<HMONITOR>) -> bool {
+        let primary = fullscreen::monitor_at(taskbar_monitor);
+        let on = monitors.contains(&primary);
+        self.fullscreen_monitors = monitors;
+        self.notify_fullscreen();
         if on == self.fullscreen {
             return false;
         }
         self.fullscreen = on;
         log::line(&format!("fullscreen app: {on}"));
-        self.notify_all(0, ab::ABN_FULLSCREENAPP, on as isize);
         true
+    }
+
+    fn notify_fullscreen(&mut self) {
+        if self.fullscreen_monitors.is_empty() && self.fullscreen_bars.is_empty() {
+            return;
+        }
+        for bar in self.bars.bars.iter().filter(|bar| bar.callback != 0) {
+            let hwnd = HWND(bar.hwnd as _);
+            // SAFETY: the monitor query and the callback message use the registered window handle.
+            let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+            let on = self.fullscreen_monitors.contains(&monitor);
+            let changed = if on { self.fullscreen_bars.insert(bar.hwnd) } else { self.fullscreen_bars.remove(&bar.hwnd) };
+            if changed {
+                let _ = unsafe { PostMessageW(Some(hwnd), bar.callback, WPARAM(ab::ABN_FULLSCREENAPP as usize), LPARAM(on as isize)) };
+            }
+        }
     }
 
     /// Drops bars whose window died without ABM_REMOVE; true when one went.
@@ -121,6 +155,7 @@ impl AppBarHost {
             .collect();
         for h in &dead {
             self.bars.remove(*h);
+            self.fullscreen_bars.remove(h);
             log::line(&format!("appbar {h:#x} gone"));
         }
         !dead.is_empty()

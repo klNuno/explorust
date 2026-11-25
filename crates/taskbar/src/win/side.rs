@@ -4,7 +4,7 @@
 //! hands it its mouse events, WM_COPYDATA and status messages.
 
 use super::appbars::{AppBarHost, to_rect};
-use super::{context, log};
+use super::{context, fullscreen, log};
 use super::popup::{self, Flyout, Popup};
 use super::status::{Status, Watch};
 use super::trayhost::{self, TrayHost};
@@ -18,7 +18,7 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_LWIN,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, GetClassNameW, GetCursorPos, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsZoomed, KillTimer, SetForegroundWindow, SetTimer, ShowWindow, SW_SHOW, WS_CAPTION, WS_THICKFRAME};
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, KillTimer, SetForegroundWindow, SetTimer, ShowWindow, SW_SHOW};
 
 pub const TIMER_TIP: usize = 3;
 const TIP_DELAY_MS: u32 = 500;
@@ -413,64 +413,11 @@ impl Side {
     /// The foreground changed: tell the AppBars whether a window now covers the monitor.
     pub fn on_foreground(&mut self, fg: HWND, cx: &Ctx) -> Asks {
         let mut a = Asks::default();
-        let full = is_fullscreen(fg, cx.monitor, cx.hwnd);
-        if self.appbars.set_fullscreen(full) {
-            a.topmost = Some(!full);
+        if self.appbars.set_fullscreen(&cx.monitor, fullscreen::covered_monitors(fg)) {
+            a.topmost = Some(!self.appbars.fullscreen);
         }
         a
     }
-}
-
-/// Shell hosts whose full-monitor surfaces (search, Start, the touch keyboard) are part of the
-/// shell, not a fullscreen app, as explorer treats them.
-const SHELL_HOSTS: [&str; 6] = [
-    "searchhost.exe",
-    "startmenuexperiencehost.exe",
-    "shellexperiencehost.exe",
-    "shellhost.exe",
-    "textinputhost.exe",
-    "lockapp.exe",
-];
-
-fn is_fullscreen(fg: HWND, monitor: RECT, bar: HWND) -> bool {
-    if fg.is_invalid() || fg == bar {
-        return false;
-    }
-    let mut class = [0u16; 64];
-    // SAFETY: reads a class name and a rect of the foreground window.
-    let n = unsafe { GetClassNameW(fg, &mut class) };
-    let class = String::from_utf16_lossy(&class[..n.max(0) as usize]);
-    if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "explorust.taskbar.popup") {
-        return false;
-    }
-    let mut r = RECT::default();
-    let maximized_framed = unsafe {
-        if GetWindowRect(fg, &mut r).is_err() {
-            return false;
-        }
-        let style = GetWindowLongW(fg, GWL_STYLE) as u32;
-        crate::settings::maximized_framed(
-            IsZoomed(fg).as_bool(),
-            style & WS_CAPTION.0 == WS_CAPTION.0,
-            style & WS_THICKFRAME.0 != 0,
-        )
-    };
-    if !crate::settings::fullscreen_cover(to_rect(r), to_rect(monitor), maximized_framed) {
-        return false;
-    }
-    let mut pid = 0u32;
-    // SAFETY: reads the owner process id of a window.
-    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
-    // Start, Task View, the desktop and Files are explorust's own windows: never an app.
-    if pid == std::process::id() {
-        return false;
-    }
-    let exe = shelldata::items::process_path(pid).unwrap_or_default();
-    let file = exe.rsplit(['\\', '/']).next().unwrap_or(&exe).to_lowercase();
-    if SHELL_HOSTS.contains(&file.as_str()) {
-        return false;
-    }
-    true
 }
 
 /// Opens Windows' quick settings: the notify part when it answers the bus, else Win+A, which

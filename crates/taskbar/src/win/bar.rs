@@ -7,7 +7,7 @@ use super::actions::{self, Launch};
 use super::pin_worker::{self, PinData, Update};
 use super::scene::{RightView, Scene, Slot};
 use super::side::{self, Asks, Ctx, Side};
-use super::{context, jumplist, menu, popup, settings, trayhost, winx};
+use super::{context, fullscreen, jumplist, menu, popup, settings, trayhost, winx};
 use super::taskband::{self as band, Taskband};
 use crate::settings::{self as S, Settings};
 use super::thumbs::ThumbFlyout;
@@ -16,6 +16,7 @@ use crate::right::Hit;
 use super::{task_lookup, tasks};
 use super::workarea::WorkArea;
 use super::log;
+use super::notification_state;
 use crate::geom::{self as G, Row};
 use crate::model::{Action, Group, Model};
 use crate::pins::{self, Pin};
@@ -32,6 +33,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -94,6 +96,7 @@ enum Effect {
 
 struct Bar {
     hwnd: HWND,
+    notification_session: notification_state::Session,
     cmd: HWND,
     shellhook: u32,
     monitor: RECT,
@@ -182,6 +185,7 @@ fn teardown() {
         unsafe {
             set_taskman(HWND::default());
             let _ = DeregisterShellHookWindow(bar.hwnd);
+            let _ = WTSUnRegisterSessionNotification(bar.hwnd);
             let _ = DestroyWindow(bar.hwnd);
             let _ = DestroyWindow(bar.cmd);
         }
@@ -325,6 +329,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
         let pin_inbox = pin_worker::Inbox::default();
         let bar = Bar {
             hwnd,
+            notification_session: notification_state::Session::default(),
             cmd,
             shellhook,
             monitor,
@@ -362,6 +367,13 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             settings,
         };
         BAR.with(|b| *b.borrow_mut() = Some(bar));
+        if let Err(e) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+            log::line(&format!("session notifications unavailable: {e}"));
+        } else {
+            // Read after registration so transitions after the snapshot are delivered to us.
+            let session = notification_state::Session::registered();
+            with_bar(|b| b.notification_session = session);
+        }
         with_bar(|b| {
             b.fullscreen_changed(fg);
             b.sync_reveal_timer();
@@ -500,7 +512,8 @@ fn run_effect(e: Effect) {
 }
 
 unsafe extern "system" fn on_winevent(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id_object: i32, id_child: i32, _: u32, _: u32) {
-    if id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32 || hwnd.is_invalid() {
+    if id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32
+        || (hwnd.is_invalid() && event != EVENT_SYSTEM_FOREGROUND) {
         return;
     }
     let bar = bar_hwnd();
@@ -1010,6 +1023,8 @@ impl Bar {
                 self.h_px = h;
                 self.scene = Some(s);
                 self.place_slide();
+                // SAFETY: refresh coverage against the new display layout.
+                self.fullscreen_changed(unsafe { GetForegroundWindow() });
                 if self.side.appbars.fullscreen {
                     self.effects.push(Effect::Topmost(false));
                 }
@@ -1051,6 +1066,8 @@ impl Bar {
                 let a = self.side.prune();
                 self.asks(a);
                 self.remove_task(lp.0);
+                // SAFETY: recheck even when the last foreground window closes without a successor.
+                self.fullscreen_changed(unsafe { GetForegroundWindow() });
             }
             HSHELL_WINDOWACTIVATED => self.set_active(h),
             HSHELL_GETMINRECT => return self.min_rect(lp),
@@ -1464,6 +1481,24 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         }
     }
     match msg {
+        notification_state::QUERY => {
+            let state = BAR.with(|bar| {
+                let bar = bar.try_borrow().ok()?;
+                let bar = bar.as_ref()?;
+                Some((bar.notification_session, bar.monitor))
+            });
+            let (session, bounds) = state.unwrap_or_else(|| (Default::default(), primary_monitor()));
+            let notification = notification_state::query(session.inactive(), || {
+                // SAFETY: a foreground snapshot also handles a closed app with no successor.
+                let fg = unsafe { GetForegroundWindow() };
+                fullscreen::covered_monitors(fg).contains(&fullscreen::monitor_at(&bounds))
+            });
+            Some(LRESULT(notification.0 as isize))
+        }
+        WM_WTSSESSION_CHANGE => with_bar(|b| {
+            b.notification_session.changed(wp.0 as u32);
+            LRESULT(0)
+        }),
         WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
         WM_COPYDATA => with_bar(|b| {
             // SAFETY: for WM_COPYDATA, lParam points to a COPYDATASTRUCT valid for this message.
@@ -1534,7 +1569,8 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
             match lp.0 as u32 {
                 EVENT_SYSTEM_FOREGROUND => {
                     b.set_active(h);
-                    b.fullscreen_changed(h);
+                    // SAFETY: the queued event may describe a window that has already lost focus.
+                    b.fullscreen_changed(unsafe { GetForegroundWindow() });
                 }
                 EVENT_OBJECT_LOCATIONCHANGE => {
                     // SAFETY: a queued event can outlive the window's foreground activation.
