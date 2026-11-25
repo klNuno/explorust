@@ -4,7 +4,10 @@
 use crate::hydration::Hydration;
 use crate::{log, metadata, pipe, volume};
 use fsindex::fold;
-use fsindex::proto::{Hit, Reply};
+use fsindex::proto::{self, Hit, Reply, Request};
+use memchr::memmem;
+use std::fs::File;
+use std::io;
 use fsindex::table::{SortKey, Table};
 use parking_lot::RwLock as VolumeLock;
 use std::sync::{Arc, Mutex, RwLock};
@@ -125,6 +128,56 @@ fn answer(vols: &[Arc<Vol>], q: &str, max: u16, scope: Option<&str>) -> (Reply, 
     (Reply { hits: all.into_iter().map(|(_, h)| h).collect(), micros: t.elapsed().as_micros() as u32, names: names as u32 }, covered)
 }
 
+fn pages(pipe: &mut File, request: &Request) -> io::Result<()> {
+    let Some(path) = request.scope.as_deref() else { return Ok(()) };
+    let volume = VOLS.read().ok().and_then(|volumes| {
+        volumes.iter().map(|(_, v)| v).find(|v| path.get(..3).is_some_and(|drive| drive.eq_ignore_ascii_case(&v.root))).cloned()
+    });
+    let Some(volume) = volume else { return proto::write_reply(pipe, &Reply::default(), request.version) };
+    let t = Instant::now();
+    let folded = fold::fold(request.query.trim());
+    if folded.is_empty() || folded.as_bytes().contains(&fsindex::table::SEP) {
+        return proto::write_page(pipe, &Reply::default(), false, false);
+    }
+    let finder = memmem::Finder::new(folded.as_bytes());
+    let (mut scan, names, gaps) = {
+        let table = volume.table.read();
+        let Some(scan) = table.begin_scoped_scan(&volume.root, path) else {
+            drop(table);
+            return proto::write_reply(pipe, &Reply::default(), request.version);
+        };
+        let gaps = scan.gaps(&table, &volume.root);
+        (scan, table.len() as u32, gaps)
+    };
+    let limit = usize::from(request.max.max(1));
+    let mut reply = Reply { hits: Vec::with_capacity(limit), names, micros: 0 };
+    loop {
+        if !pipe::client_present(pipe) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let done = {
+            let table = volume.table.read();
+            scan.step(&table, &volume.root, &finder, limit, &mut reply.hits)
+        };
+        let Some(done) = done else {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        };
+        if done || reply.hits.len() == limit {
+            reply.micros = t.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+            proto::write_page(pipe, &reply, !done || !gaps.is_empty(), false)?;
+            reply.hits.clear();
+        }
+        if done { break }
+    }
+    let mut gaps = gaps.into_iter().peekable();
+    while gaps.peek().is_some() {
+        reply.hits.extend(gaps.by_ref().take(limit).map(|path| Hit { path, folder: true, noisy: false, rank: 0, modified: 0 }));
+        proto::write_page(pipe, &reply, gaps.peek().is_some(), true)?;
+        reply.hits.clear();
+    }
+    Ok(())
+}
+
 /// The volumes being served; a fixed volume that arrives later joins through `rescan`.
 static VOLS: RwLock<Vec<(char, Arc<Vol>)>> = RwLock::new(Vec::new());
 /// Reports each new volume's first load (the startup summary counts them).
@@ -188,5 +241,5 @@ pub fn run(ready: Option<&dyn Fn()>) {
     pipe::serve(Arc::new(move |q: &str, max: u16, scope: Option<&str>| {
         let vols: Vec<Arc<Vol>> = VOLS.read().map(|v| v.iter().map(|(_, v)| v.clone()).collect()).unwrap_or_default();
         answer(&vols, q, max, scope)
-    }));
+    }), pages);
 }

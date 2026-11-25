@@ -6,6 +6,7 @@ use crate::log;
 use crate::volume::{Volume, file_by_id, full_reference, ioctl};
 use fsindex::usn::{ATTR_DIRECTORY, MASK48};
 use std::collections::HashSet;
+use std::ops::Range;
 use std::os::windows::io::AsRawHandle;
 use std::time::Instant;
 use windows::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_NO_MORE_FILES, HANDLE};
@@ -54,7 +55,7 @@ fn hydrate(volume: Volume, sequences: &[u16], hydration: &Hydration) {
         Ok(parents) => {
             let count = parents.len();
             if hydration.finish_links(parents) {
-                log::line(&format!("{letter}: scoped search checked hard links, {count} alias directories need Windows Search"));
+                log::line(&format!("{letter}: scoped search checked hard links, {count} directories contain hard links"));
             }
         }
         Err(e) => log::line(&format!("{letter}: file layout unavailable ({e}), scoped coverage unavailable; reading remaining last write times by ID")),
@@ -84,7 +85,8 @@ fn file_layout(volume: HANDLE, sequences: &[u16], hydration: &Hydration, modifie
     };
     let mut buffer = vec![0u8; 1 << 20];
     let mut dates = Vec::new();
-    let mut parents = Vec::new();
+    let mut names = Vec::new();
+    let mut links = Vec::new();
     let mut alias_parents = HashSet::new();
     while hydration.is_current() {
         let got = match ioctl(volume, FSCTL_QUERY_FILE_LAYOUT, &input, &mut buffer) {
@@ -103,6 +105,7 @@ fn file_layout(volume: HANDLE, sequences: &[u16], hydration: &Hydration, modifie
             return Err(invalid_layout());
         }
         dates.clear();
+        links.clear();
         for i in 0..output.FileEntryCount {
             let entry = header::<FILE_LAYOUT_ENTRY>(bytes, offset).ok_or_else(invalid_layout)?;
             let frn = entry.FileReferenceNumber;
@@ -118,14 +121,25 @@ fn file_layout(volume: HANDLE, sequences: &[u16], hydration: &Hydration, modifie
             if entry.FileAttributes & ATTR_DIRECTORY == 0 && rec >= 16 {
                 let end = if entry.NextFileOffset == 0 { bytes.len() } else { offset + entry.NextFileOffset as usize };
                 let entry_bytes = bytes.get(offset..end).ok_or_else(invalid_layout)?;
-                if !layout_parents(entry_bytes, entry.FirstNameOffset as usize, &mut parents) {
+                if !layout_names(entry_bytes, entry.FirstNameOffset as usize, &mut names) {
                     return Err(invalid_layout());
                 }
-                if parents.len() > 1 {
-                    alias_parents.extend(parents.iter().copied());
+                if names.len() > 1 {
+                    alias_parents.extend(names.iter().map(|(parent, _)| *parent));
+                    if sequences.get(rec as usize) == Some(&((frn >> 48) as u16)) {
+                        let aliases = names.iter().map(|(parent, range)| {
+                            let name: Vec<_> = entry_bytes[range.clone()].chunks_exact(2)
+                                .map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect();
+                            (*parent, String::from_utf16_lossy(&name))
+                        }).collect();
+                        links.push((rec as u32, aliases));
+                    }
                 }
             }
             offset += entry.NextFileOffset as usize;
+        }
+        if !hydration.apply_aliases(links.drain(..)) {
+            break;
         }
         for batch in dates.chunks(BATCH) {
             let Some(n) = hydration.apply(batch) else { break };
@@ -135,9 +149,9 @@ fn file_layout(volume: HANDLE, sequences: &[u16], hydration: &Hydration, modifie
     Ok(alias_parents)
 }
 
-fn layout_parents(bytes: &[u8], mut offset: usize, parents: &mut Vec<u32>) -> bool {
+fn layout_names(bytes: &[u8], mut offset: usize, names: &mut Vec<(u32, Range<usize>)>) -> bool {
     const NAME: usize = std::mem::offset_of!(FILE_LAYOUT_NAME_ENTRY, FileName);
-    parents.clear();
+    names.clear();
     while offset != 0 {
         let Some(prefix) = bytes.get(offset..offset + NAME) else { return false };
         let next = u32::from_le_bytes(prefix[..4].try_into().unwrap()) as usize;
@@ -150,7 +164,7 @@ fn layout_parents(bytes: &[u8], mut offset: usize, parents: &mut Vec<u32>) -> bo
         // A DOS-only 8.3 directory entry is the alternate spelling of a long name.
         if flags & FILE_LAYOUT_NAME_ENTRY_DOS == 0 || flags & FILE_LAYOUT_NAME_ENTRY_PRIMARY != 0 {
             let Ok(parent) = u32::try_from(parent) else { return false };
-            parents.push(parent);
+            names.push((parent, offset + NAME..offset + NAME + length));
         }
         if next == 0 {
             break;

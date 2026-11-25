@@ -23,6 +23,8 @@ pub mod handover;
 pub mod history;
 pub mod layout;
 mod scope;
+#[cfg(any(test, target_os = "windows"))]
+mod search_delivery;
 pub mod text;
 pub mod uri;
 

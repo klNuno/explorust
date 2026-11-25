@@ -14,13 +14,16 @@ use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, GetNamedPipeSer
 /// FILE_APPEND_DATA, which on a pipe is the right to create an instance).
 pub const ACCESS: u32 = 0x0012_008B;
 
+mod paged;
+pub use paged::query_pages;
+
 #[derive(Default)]
 pub struct Client {
     pipe: Option<File>,
 }
 
-fn connect() -> io::Result<File> {
-    let f = OpenOptions::new().read(true).write(true).access_mode(ACCESS).open(crate::PIPE)?;
+fn connect(flags: u32) -> io::Result<File> {
+    let f = OpenOptions::new().read(true).write(true).access_mode(ACCESS).custom_flags(flags).open(crate::PIPE)?;
     let h = HANDLE(f.as_raw_handle());
     let (mut pid, mut session) = (0u32, u32::MAX);
     // SAFETY: queries on a handle owned by `f`, writing into locals (a medium-integrity client
@@ -56,7 +59,7 @@ impl Client {
         let mut last = None;
         for _ in 0..2 {
             if self.pipe.is_none() {
-                self.pipe = Some(connect()?);
+                self.pipe = Some(connect(0)?);
             }
             let Some(p) = self.pipe.as_mut() else { break };
             match write(p).and_then(|()| proto::read_reply_with_coverage(p)) {

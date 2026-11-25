@@ -161,16 +161,16 @@ fn hard_links(volume: HANDLE, frn: u64, buf: &mut Vec<u8>) -> Option<LinkInfo> {
 }
 
 /// Reconciles the one alias we keep for a file. The other names may have disappeared.
-fn set_link(table: &mut Table, rec: u32, info: LinkInfo) -> bool {
-    let Some((parent, name)) = info.names.into_iter().find(|(p, _)| (*p == fsindex::table::ROOT || table.has_name(*p)) && !table.pruned_parent(*p)) else {
+fn set_link(table: &mut Table, rec: u32, info: &LinkInfo) -> bool {
+    let Some((parent, name)) = info.names.iter().find(|(p, _)| (*p == fsindex::table::ROOT || table.has_name(*p)) && !table.pruned_parent(*p)) else {
         table.prune(rec);
         return false;
     };
-    if matches!(table.state(rec), RecState::Named(p, n) if p == parent && n == name) {
+    if matches!(table.state(rec), RecState::Named(p, n) if p == *parent && n == *name) {
         table.set_modified(rec, info.modified);
         return false;
     }
-    table.upsert(rec, parent, &name, false, false, info.modified);
+    table.upsert(rec, *parent, name, false, false, info.modified);
     true
 }
 
@@ -213,7 +213,8 @@ pub fn add_links(volume: HANDLE, frns: &[u64], table: &RwLock<Table>, id: u64) -
         }
         for (rec, links) in found {
             if t.state(rec) == RecState::Pruned && !t.touched_since(rec, since) {
-                added += usize::from(set_link(&mut t, rec, links));
+                added += usize::from(set_link(&mut t, rec, &links));
+                t.set_aliases(rec, links.names);
             }
         }
     }
@@ -394,10 +395,11 @@ impl Volume {
                     t.mark_alias_parents(info.names.iter().map(|&(parent, _)| parent));
                 }
                 if job.repair_name {
-                    set_link(&mut t, rec, info);
+                    set_link(&mut t, rec, &info);
                 } else {
                     t.set_modified(rec, info.modified);
                 }
+                t.set_aliases(rec, info.names);
                 t.finish_link_lookup(rec);
                 if job.recovering() {
                     log::line(&format!("{}: hard link lookup recovered: record {rec}", self.letter));

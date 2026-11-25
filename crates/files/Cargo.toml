@@ -24,6 +24,7 @@ menu = { path = "../menu" }
 fsindex = { path = "../index" }
 windows-core.workspace = true
 windows-collections = "0.3.2"
+windows-future = "0.3.2"
 windows-numerics = "0.3.1"
 windows = { workspace = true, features = [
   "ApplicationModel_DataTransfer", "Storage_Search", "Storage_Streams",

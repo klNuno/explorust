@@ -6,16 +6,23 @@ use crate::log;
 use fsindex::client::ACCESS;
 use fsindex::proto::{self, Reply};
 use std::fs::File;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows::Win32::Security::{GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
-use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT};
+use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_core::{HSTRING, PWSTR};
+
+pub type PageHandler = fn(&mut File, &proto::Request) -> std::io::Result<()>;
+
+pub fn client_present(pipe: &File) -> bool {
+    // The serving thread owns this synchronous instance, with no read/write pending here.
+    unsafe { PeekNamedPipe(HANDLE(pipe.as_raw_handle()), None, 0, None, None, None).is_ok() }
+}
 
 pub type Handler = Arc<dyn Fn(&str, u16, Option<&str>) -> (Reply, bool) + Send + Sync>;
 
@@ -115,7 +122,7 @@ fn create(first: bool) -> Option<HANDLE> {
 }
 
 /// Accepts clients forever.
-pub fn serve(handler: Handler) {
+pub fn serve(handler: Handler, pages: PageHandler) {
     let mut first = true;
     loop {
         let Some(h) = create(first) else {
@@ -138,8 +145,13 @@ pub fn serve(handler: Handler) {
             // SAFETY: the File takes the instance handle and closes it when the client leaves.
             let mut f = unsafe { File::from_raw_handle(raw as _) };
             while let Ok(request) = proto::read_request(&mut f) {
-                let (reply, covered) = hd(&request.query, request.max, request.scope.as_deref());
-                if proto::write_reply_with_coverage(&mut f, &reply, request.version, covered).is_err() {
+                let result = if request.paged {
+                    pages(&mut f, &request)
+                } else {
+                    let (reply, covered) = hd(&request.query, request.max, request.scope.as_deref());
+                    proto::write_reply_with_coverage(&mut f, &reply, request.version, covered)
+                };
+                if result.is_err() {
                     break;
                 }
             }

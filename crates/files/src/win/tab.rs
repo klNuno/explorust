@@ -40,13 +40,13 @@ struct Events {
     hwnd: HWND,
     id: usize,
     results: Option<Rc<ResultsNavigation>>,
-    showing_results: Rc<Cell<bool>>,
+    search_active: Rc<Cell<bool>>,
     started: Cell<Option<Instant>>,
 }
 
 impl IExplorerBrowserEvents_Impl for Events_Impl {
     fn OnNavigationPending(&self, pidl: *const ITEMIDLIST) -> Result<()> {
-        let redirect = self.results.as_ref().map_or_else(|| self.showing_results.get(), |results| {
+        let redirect = self.results.as_ref().map_or_else(|| self.search_active.get(), |results| {
             !(results.filling.get() || results.target.borrow().as_ref().is_some_and(|target| {
                 !pidl.is_null() && unsafe { ILIsEqual(pidl, target.as_ptr()).as_bool() }
             }))
@@ -161,7 +161,7 @@ pub struct Browser {
     pub eb: IExplorerBrowser,
     pub id: usize,
     results: Option<Rc<ResultsNavigation>>,
-    showing_results: Rc<Cell<bool>>,
+    search_active: Rc<Cell<bool>>,
     cookie: u32,
 }
 
@@ -170,16 +170,16 @@ impl Browser {
         static NEXT_BROWSER: AtomicUsize = AtomicUsize::new(1);
         let id = NEXT_BROWSER.fetch_add(1, Ordering::Relaxed);
         let results = searching.then(|| Rc::new(ResultsNavigation::default()));
-        let showing_results = Rc::new(Cell::new(false));
+        let search_active = Rc::new(Cell::new(false));
         unsafe {
             let eb: IExplorerBrowser = CoCreateInstance(&ExplorerBrowser, None, CLSCTX_INPROC_SERVER)?;
             let site: IServiceProvider = Site { hwnd, id, searching }.into();
             eb.SetOptions(EBO_SHOWFRAMES | EBO_NOBORDER | EBO_NOTRAVELLOG)?;
             let fs = FOLDERSETTINGS { ViewMode: FVM_DETAILS.0 as u32, fFlags: FWF_NOWEBVIEW.0 as u32 };
             let events: IExplorerBrowserEvents = Events {
-                hwnd, id, results: results.clone(), showing_results: showing_results.clone(), started: Cell::new(None),
+                hwnd, id, results: results.clone(), search_active: search_active.clone(), started: Cell::new(None),
             }.into();
-            let mut browser = Self { eb, id, results, showing_results, cookie: 0 };
+            let mut browser = Self { eb, id, results, search_active, cookie: 0 };
             IUnknown_SetSite(&browser.eb, &site)?;
             browser.eb.Initialize(hwnd, &rc, Some(&fs))?;
             browser.cookie = browser.eb.Advise(&events)?;
@@ -349,19 +349,27 @@ impl Tab {
         Ok(&self.results.as_ref().unwrap().1)
     }
 
+    /// Route folder navigation through the frame even while a search is still getting its first page.
+    pub fn begin_search(&self) {
+        self.host.search_active.set(true);
+    }
+
     pub fn show_results(&self, active: bool) {
-        self.host.showing_results.set(true);
         self.show(active);
     }
 
     pub fn clear_search(&mut self, active: bool) {
         self.query.clear();
+        self.invalidate_search(active);
+    }
+
+    pub fn invalidate_search(&mut self, active: bool) {
         self.generation = self.generation.wrapping_add(1);
         self.dismiss_results(active);
     }
 
     pub fn dismiss_results(&mut self, active: bool) {
-        self.host.showing_results.set(false);
+        self.host.search_active.set(false);
         if self.results.take().is_some() {
             self.host.set_rect(self.rect.get());
             self.host.show(active);
