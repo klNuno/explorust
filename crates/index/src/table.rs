@@ -8,8 +8,11 @@
 use crate::fold;
 use memchr::memmem;
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
+
+mod scoped;
+pub use scoped::ScopedScan;
 
 pub const SEP: u8 = b'\n';
 /// The root directory's MFT record number on NTFS.
@@ -70,6 +73,9 @@ pub struct Table {
     /// Parents seen with an alias this single-name table cannot guarantee. Keep them through
     /// the current scan so an old observation still routes the scope to Windows Search.
     alias_parents: HashSet<u32>,
+    aliases: BTreeMap<u32, Vec<scoped::Alias>>,
+    initial_link_changes: HashSet<u32>,
+    arena_revision: u64,
     /// A journal change may have introduced a name in any directory until its links are read.
     pending_links: HashSet<u32>,
     /// Files pruned since the last `take_pruned_files`: a hard link of theirs may sit outside
@@ -205,7 +211,25 @@ impl Table {
     }
 
     pub fn require_link_lookup(&mut self, rec: u32) {
+        self.mark_link_change(rec);
         self.pending_links.insert(rec);
+    }
+
+    fn mark_link_change(&mut self, rec: u32) {
+        if !self.initial_links_complete && self.watchers > 0 {
+            self.initial_link_changes.insert(rec);
+        }
+    }
+
+    pub fn set_initial_aliases(&mut self, rec: u32, names: Vec<(u32, String)>) {
+        if !self.initial_link_changes.contains(&rec) {
+            self.set_aliases(rec, names);
+        }
+    }
+
+    pub fn finish_initial_links(&mut self) {
+        self.initial_links_complete = true;
+        self.initial_link_changes = HashSet::new();
     }
 
     pub fn finish_link_lookup(&mut self, rec: u32) {
@@ -369,6 +393,8 @@ impl Table {
     }
 
     pub fn remove(&mut self, rec: u32) {
+        self.mark_link_change(rec);
+        self.aliases.remove(&rec);
         let Some(s) = self.slots.get_mut(rec as usize) else { return };
         if s.name == NONE {
             // A deleted file inside a pruned tree is free, not pruned (a lookup then sees the change).
@@ -400,6 +426,7 @@ impl Table {
     }
 
     fn compact_slice(&mut self, names: usize) -> bool {
+        self.arena_revision = self.arena_revision.wrapping_add(1);
         let mut cursor = self.compaction.take().unwrap_or(Compaction {
             kept: 0,
             next: 0,

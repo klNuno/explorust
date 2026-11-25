@@ -47,13 +47,25 @@ impl Hydration {
     }
 
     #[cfg(target_os = "windows")]
+    pub fn apply_aliases(&self, entries: impl IntoIterator<Item = (u32, Vec<(u32, String)>)>) -> bool {
+        let mut table = self.table.write();
+        if table.id() != self.generation {
+            return false;
+        }
+        for (rec, aliases) in entries {
+            table.set_initial_aliases(rec, aliases);
+        }
+        true
+    }
+
+    #[cfg(target_os = "windows")]
     pub fn finish_links(&self, alias_parents: impl IntoIterator<Item = u32>) -> bool {
         let mut table = self.table.write();
         if table.id() != self.generation {
             return false;
         }
         table.mark_alias_parents(alias_parents);
-        table.initial_links_complete = true;
+        table.finish_initial_links();
         true
     }
 

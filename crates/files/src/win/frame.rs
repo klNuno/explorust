@@ -83,8 +83,25 @@ pub struct Frame {
     tear: Option<usize>,
 }
 
+struct FrameSlot {
+    frame: RefCell<Frame>,
+    search_wake: Cell<bool>,
+}
+
+impl FrameSlot {
+    fn with<R>(&self, hwnd: HWND, f: impl FnOnce(&mut Frame) -> R) -> Option<R> {
+        let mut frame = self.frame.try_borrow_mut().ok()?;
+        let result = f(&mut frame);
+        drop(frame);
+        if self.search_wake.replace(false) {
+            unsafe { let _ = PostMessageW(Some(hwnd), search::MSG_RESULTS, WPARAM(0), LPARAM(0)); }
+        }
+        Some(result)
+    }
+}
+
 thread_local! {
-    static FRAMES: RefCell<Vec<(HWND, Rc<RefCell<Frame>>)>> = const { RefCell::new(Vec::new()) };
+    static FRAMES: RefCell<Vec<(HWND, Rc<FrameSlot>)>> = const { RefCell::new(Vec::new()) };
     static SHARED: RefCell<Option<(Rc<Shared>, &'static Strings)>> = const { RefCell::new(None) };
     static NEW_WINDOW: Cell<Option<HWND>> = const { Cell::new(None) };
     static BROWSES: RefCell<Vec<(HWND, usize, Pidl)>> = const { RefCell::new(Vec::new()) };
@@ -112,15 +129,13 @@ pub fn init(sh: Rc<Shared>, s: &'static Strings, cmd: HWND) {
     }
 }
 
-fn find(hwnd: HWND) -> Option<Rc<RefCell<Frame>>> {
+fn find(hwnd: HWND) -> Option<Rc<FrameSlot>> {
     FRAMES.with(|f| f.borrow().iter().find(|(h, _)| *h == hwnd).map(|(_, r)| r.clone()))
 }
 
 /// Runs `f` on the frame of `hwnd` unless it is already in use further up the stack.
 fn with<R>(hwnd: HWND, f: impl FnOnce(&mut Frame) -> R) -> Option<R> {
-    let rc = find(hwnd)?;
-    let mut fr = rc.try_borrow_mut().ok()?;
-    Some(f(&mut fr))
+    find(hwnd)?.with(hwnd, f)
 }
 
 fn context_clipboard(defview: HWND, view: &IShellView, items: bool) -> Option<menu::ClipboardRoute> {
@@ -245,14 +260,15 @@ pub fn create(place: &Pidl, x: i32, y: i32, parked: bool, reload_folder: Arc<Mut
             select: None,
             tear: None,
         };
-        let rc = Rc::new(RefCell::new(frame));
+        let rc = Rc::new(FrameSlot { frame: RefCell::new(frame), search_wake: Cell::new(false) });
         FRAMES.with(|f| f.borrow_mut().push((hwnd, rc.clone())));
         // The frame becomes the whole window except Windows' resize borders.
         let prepared = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
             .and_then(|()| {
-                let mut fr = rc.borrow_mut();
-                fr.extend_frame();
-                fr.add_tab(place)
+                rc.with(hwnd, |fr| {
+                    fr.extend_frame();
+                    fr.add_tab(place)
+                }).expect("new frame is not borrowed")
             });
         if let Err(error) = prepared {
             let _ = DestroyWindow(hwnd);
@@ -481,6 +497,7 @@ impl Frame {
         self.next_id += 1;
         let t = Tab::new(self.hwnd, id, self.view_rect())?;
         t.browse(place)?;
+        self.suspend_search();
         if let Some(old) = self.tab() {
             old.show(false);
         }
@@ -524,9 +541,7 @@ impl Frame {
         if i >= self.tabs.len() || i == self.active {
             return;
         }
-        if self.search_timer {
-            self.submit_search();
-        }
+        self.suspend_search();
         if let Some(t) = self.tab() {
             t.show(false);
         }
@@ -537,6 +552,7 @@ impl Frame {
         }
         self.address = None;
         self.sync_edit();
+        self.submit_search();
         self.title();
         self.tell_list();
     }
@@ -551,6 +567,10 @@ impl Frame {
             }
             return;
         }
+        let active_closed = i == self.active;
+        if active_closed {
+            self.suspend_search();
+        }
         let t = self.tabs.remove(i);
         self.icons.remove(&t.id);
         drop(t);
@@ -562,6 +582,9 @@ impl Frame {
             t.show(true);
         }
         self.sync_edit();
+        if active_closed {
+            self.submit_search();
+        }
         self.title();
     }
 
@@ -775,6 +798,9 @@ impl Frame {
         if m == Move::Back && self.clear_search() {
             return;
         }
+        if m == Move::Forward && self.tab().is_some_and(|tab| tab.history.can_forward()) {
+            self.clear_search();
+        }
         if let Some(t) = self.tabs.get_mut(self.active) {
             t.invalidate_address();
             t.go(m);
@@ -782,9 +808,6 @@ impl Frame {
     }
 
     fn new_tab(&mut self) {
-        if self.search_timer {
-            self.submit_search();
-        }
         if let Some(home) = shell::home() {
             if let Err(e) = self.add_tab(&home) {
                 log::line(&format!("new tab failed: {e}"));
@@ -1089,18 +1112,31 @@ impl Frame {
         self.search_focus = false;
     }
 
-    fn clear_search(&mut self) -> bool {
-        if let Some(t) = self.tabs.get_mut(self.active).filter(|t| !t.query.is_empty()) {
-            t.clear_search(true);
-            self.search = LineEdit::default();
-            self.search_timer = false;
-            unsafe {
-                let _ = KillTimer(Some(self.hwnd), TIMER_SEARCH);
-            }
-            true
-        } else {
-            false
+    fn cancel_search_work(&mut self) {
+        self.search_timer = false;
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_SEARCH);
         }
+        if let Some(worker) = &self.search_worker {
+            worker.cancel();
+        }
+    }
+
+    fn suspend_search(&mut self) {
+        self.cancel_search_work();
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.invalidate_search(true);
+        }
+    }
+
+    fn clear_search(&mut self) -> bool {
+        if self.tab().is_none_or(|tab| tab.query.is_empty()) {
+            return false;
+        }
+        self.cancel_search_work();
+        self.tabs[self.active].clear_search(true);
+        self.search = LineEdit::default();
+        true
     }
 
     fn search_changed(&mut self) {
@@ -1109,12 +1145,13 @@ impl Frame {
             self.clear_search();
             return;
         }
-        let Some(t) = self.tabs.get_mut(self.active) else { return };
-        if t.query == query {
+        if self.tab().is_none_or(|tab| tab.query == query) {
             return;
         }
-        t.query = query;
-        t.generation = t.generation.wrapping_add(1);
+        self.suspend_search();
+        let tab = &mut self.tabs[self.active];
+        tab.query = query;
+        tab.begin_search();
         self.search_timer = unsafe { SetTimer(Some(self.hwnd), TIMER_SEARCH, SEARCH_DELAY_MS, None) } != 0;
         if !self.search_timer {
             self.submit_search();
@@ -1126,14 +1163,16 @@ impl Frame {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_SEARCH);
         }
-        let Some(t) = self.tab().filter(|t| !t.query.is_empty()) else { return };
-        let Some(folder) = t.history.current().cloned() else { return };
+        let Some(tab) = self.tabs.get_mut(self.active).filter(|tab| !tab.query.is_empty()) else { return };
+        let Some(folder) = tab.history.current().cloned() else { return };
+        tab.invalidate_search(true);
+        tab.begin_search();
         let request = search::Request {
-            tab: t.id,
-            generation: t.generation,
+            tab: tab.id,
+            generation: tab.generation,
             folder,
-            path: t.path.clone(),
-            query: t.query.trim().to_owned(),
+            path: tab.path.clone(),
+            query: tab.query.trim().to_owned(),
         };
         if self.search_worker.is_none() {
             match search::Worker::new(self.hwnd) {
@@ -1147,34 +1186,35 @@ impl Frame {
     }
 
     fn search_results(&mut self) {
-        let Some(worker) = &self.search_worker else { return };
-        for response in worker.take() {
+        if let Some(response) = self.search_worker.as_ref().and_then(search::Worker::take) {
             self.apply_search(response);
         }
     }
 
     fn apply_search(&mut self, response: search::Response) {
-        let active = self.tab().is_some_and(|t| t.id == response.tab);
-        let Some(t) = self.tabs.iter_mut().find(|t| t.id == response.tab && t.generation == response.generation) else {
+        let Some(t) = self.tabs.get_mut(self.active).filter(|t| t.id == response.tab && t.generation == response.generation) else {
             return;
         };
         let result = response.results.and_then(|hits| {
-            let indexed = matches!(hits, search::Results::Indexed(_));
+            let indexed = matches!(hits, search::Results::Indexed { .. });
+            let first = !matches!(hits, search::Results::Indexed { first: false, .. });
             let browser = t.search_browser(indexed)?;
-            search::present(browser, hits)
+            search::present(browser, hits)?;
+            Ok(first)
         });
         match result {
-            Ok(()) => {
-                t.show_results(active);
+            Ok(false) => return,
+            Ok(true) => {
+                t.show_results(true);
                 log::line(&format!("tab {}: search {:?} presented", t.id, t.query));
             }
             Err(e) => {
                 log::line(&format!("tab {}: search {:?} in {:?} failed: {e}", t.id, t.query, t.path));
-                // Discard a view which was only partially initialized.
-                t.dismiss_results(active);
+                t.dismiss_results(true);
+                self.cancel_search_work();
             }
         }
-        if active && self.search_focus {
+        if self.search_focus {
             unsafe { let _ = SetFocus(Some(self.hwnd)); }
         }
         self.draw();
@@ -1569,11 +1609,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_TIMER if wp.0 == TIMER_SEARCH => {
-                with(hwnd, Frame::submit_search);
+                with(hwnd, |f| {
+                    if f.search_timer {
+                        f.submit_search();
+                    }
+                });
                 LRESULT(0)
             }
             search::MSG_RESULTS => {
-                with(hwnd, Frame::search_results);
+                if let Some(slot) = find(hwnd) && slot.with(hwnd, Frame::search_results).is_none() {
+                    // A popup or COM call can dispatch this while the outer handler holds the
+                    // frame. The worker waits for its single pending response to be consumed.
+                    slot.search_wake.set(true);
+                    log::line("search wake deferred while the frame is busy");
+                }
                 LRESULT(0)
             }
             operations::MSG_OPERATION => {
@@ -1592,6 +1641,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_CLOSE => {
                 with(hwnd, |f| {
                     f.operations.take();
+                    f.search_worker.take();
                     f.tabs.clear();
                 });
                 let _ = DestroyWindow(hwnd);
@@ -1603,6 +1653,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 NAVIGATION.with(|pending| pending.borrow_mut().retain(|(window, _, _)| *window != hwnd));
                 if let Some(Some(c)) = with(hwnd, |f| {
                     f.operations.take();
+                    f.search_worker.take();
                     f.reload_folder.lock().unwrap().take();
                     f.sw_cookie.take()
                 }) {

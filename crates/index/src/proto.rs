@@ -3,7 +3,9 @@
 //! (u32), then per hit: flags (u8, bit 0 folder, bit 1 noisy), rank (u8), path length (u16), path.
 //! The high bit of max hits requests V2. A V2 reply sets the high bit of hit count and appends
 //! last write time (u64, FILETIME ticks) to each hit. A V1 service clamps max hits to 200 and
-//! answers in V1; a V1 client only ever requests and receives V1.
+//! answers in V1; a V1 client only ever requests and receives V1. Files requests pages with
+//! a marked scope. Paged replies reuse the V2 hit layout and identify continuation and fallback
+//! folder frames in the count flags. Older services read the whole request and reply uncovered.
 
 use std::io::{self, Read, Write};
 
@@ -17,10 +19,15 @@ const V2_REQUEST: u16 = 1 << 15;
 const V2_REPLY: u32 = 1 << 31;
 const SCOPED_REQUEST: u16 = 1 << 14;
 const COVERED_REPLY: u32 = 1 << 30;
+const PAGED_REPLY: u32 = 1 << 29;
+const PAGE_MORE: u32 = 1 << 28;
+const PAGE_GAPS: u32 = 1 << 27;
+const REPLY_FLAGS: u32 = V2_REPLY | COVERED_REPLY | PAGED_REPLY | PAGE_MORE | PAGE_GAPS;
 // Older scoped services see a scope that cannot match a drive letter and reply uncovered.
 // Keep accepting plain drive paths from their clients, with the same reply layout.
 const ALIAS_AWARE_SCOPE: &str = "aliases:";
-const MAX_HITS: u16 = 200;
+const PAGED_SCOPE: &str = "pages:";
+pub const MAX_HITS: u16 = 200;
 const MAX_QUERY_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,12 +55,20 @@ pub fn write_request(w: &mut impl Write, q: &str, max: u16, version: Version) ->
 }
 
 pub fn write_scoped_request(w: &mut impl Write, q: &str, max: u16, scope: &str) -> io::Result<()> {
+    write_scope(w, q, max, scope, ALIAS_AWARE_SCOPE)
+}
+
+pub fn write_paged_request(w: &mut impl Write, q: &str, scope: &str) -> io::Result<()> {
+    write_scope(w, q, MAX_HITS, scope, PAGED_SCOPE)
+}
+
+fn write_scope(w: &mut impl Write, q: &str, max: u16, scope: &str, marker: &str) -> io::Result<()> {
     // Keeping one old-format frame lets a V1/V2 service consume this request and reply normally.
     // Only new services interpret the scope marker and may mark a response as covered.
-    if scope.is_empty() || ALIAS_AWARE_SCOPE.len() + scope.len() + q.len() + 1 > MAX_QUERY_BYTES || scope.contains('\0') || q.contains('\0') {
+    if scope.is_empty() || marker.len() + scope.len() + q.len() + 1 > MAX_QUERY_BYTES || scope.contains('\0') || q.contains('\0') {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid search scope or query"));
     }
-    let mut payload = ALIAS_AWARE_SCOPE.as_bytes().to_vec();
+    let mut payload = marker.as_bytes().to_vec();
     payload.extend_from_slice(scope.as_bytes());
     payload.push(0);
     payload.extend_from_slice(q.as_bytes());
@@ -74,6 +89,7 @@ pub struct Request {
     pub max: u16,
     pub version: Version,
     pub scope: Option<String>,
+    pub paged: bool,
 }
 
 pub fn read_request(r: &mut impl Read) -> io::Result<Request> {
@@ -88,16 +104,22 @@ pub fn read_request(r: &mut impl Read) -> io::Result<Request> {
     r.read_exact(&mut q)?;
     let version = if max & V2_REQUEST != 0 { Version::V2 } else { Version::V1 };
     let mut query = String::from_utf8_lossy(&q).into_owned();
+    let mut paged = false;
     let scope = if version == Version::V2 && max & SCOPED_REQUEST != 0 {
         let (scope, scoped_query) = query.split_once('\0').filter(|(s, _)| !s.is_empty())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing search scope"))?;
-        let scope = scope.strip_prefix(ALIAS_AWARE_SCOPE).unwrap_or(scope).to_owned();
+        let scope = if let Some(path) = scope.strip_prefix(PAGED_SCOPE) {
+            paged = true;
+            path
+        } else {
+            scope.strip_prefix(ALIAS_AWARE_SCOPE).unwrap_or(scope)
+        }.to_owned();
         query = scoped_query.to_owned();
         Some(scope)
     } else {
         None
     };
-    Ok(Request { query, max: (max & !(V2_REQUEST | SCOPED_REQUEST)).min(MAX_HITS), version, scope })
+    Ok(Request { query, max: (max & !(V2_REQUEST | SCOPED_REQUEST)).min(MAX_HITS), version, scope, paged })
 }
 
 pub fn write_reply(w: &mut impl Write, r: &Reply, version: Version) -> io::Result<()> {
@@ -105,9 +127,18 @@ pub fn write_reply(w: &mut impl Write, r: &Reply, version: Version) -> io::Resul
 }
 
 pub fn write_reply_with_coverage(w: &mut impl Write, r: &Reply, version: Version, covered: bool) -> io::Result<()> {
+    let flags = if version == Version::V2 { V2_REPLY | if covered { COVERED_REPLY } else { 0 } } else { 0 };
+    write_reply_frame(w, r, flags)
+}
+
+pub fn write_page(w: &mut impl Write, r: &Reply, more: bool, gaps: bool) -> io::Result<()> {
+    let flags = V2_REPLY | PAGED_REPLY | if more { PAGE_MORE } else { 0 } | if gaps { PAGE_GAPS } else { 0 };
+    write_reply_frame(w, r, flags)
+}
+
+fn write_reply_frame(w: &mut impl Write, r: &Reply, flags: u32) -> io::Result<()> {
     let mut b = Vec::with_capacity(12 + r.hits.len() * 64);
-    let count = r.hits.len() as u32 | if version == Version::V2 { V2_REPLY } else { 0 }
-        | if covered && version == Version::V2 { COVERED_REPLY } else { 0 };
+    let count = r.hits.len() as u32 | flags;
     b.extend_from_slice(&count.to_le_bytes());
     b.extend_from_slice(&r.micros.to_le_bytes());
     b.extend_from_slice(&r.names.to_le_bytes());
@@ -117,7 +148,7 @@ pub fn write_reply_with_coverage(w: &mut impl Write, r: &Reply, version: Version
         b.push(h.rank);
         b.extend_from_slice(&(p.len() as u16).to_le_bytes());
         b.extend_from_slice(p);
-        if version == Version::V2 {
+        if flags & V2_REPLY != 0 {
             b.extend_from_slice(&h.modified.to_le_bytes());
         }
     }
@@ -130,10 +161,30 @@ pub fn read_reply(r: &mut impl Read) -> io::Result<Reply> {
 }
 
 pub fn read_reply_with_coverage(r: &mut impl Read) -> io::Result<(Reply, bool)> {
+    read_reply_frame(r).map(|(reply, flags)| (reply, flags & (V2_REPLY | COVERED_REPLY) == V2_REPLY | COVERED_REPLY))
+}
+
+pub struct Page {
+    pub reply: Reply,
+    pub more: bool,
+    pub gaps: bool,
+}
+
+pub fn read_page(r: &mut impl Read) -> io::Result<Option<Page>> {
+    read_reply_frame(r).map(|(reply, flags)| {
+        (flags & (V2_REPLY | PAGED_REPLY) == V2_REPLY | PAGED_REPLY).then_some(Page {
+            reply,
+            more: flags & PAGE_MORE != 0,
+            gaps: flags & PAGE_GAPS != 0,
+        })
+    })
+}
+
+fn read_reply_frame(r: &mut impl Read) -> io::Result<(Reply, u32)> {
     let mut h = [0u8; 12];
     r.read_exact(&mut h)?;
     let count = u32::from_le_bytes(h[0..4].try_into().unwrap_or_default());
-    let n = (count & !(V2_REPLY | COVERED_REPLY)) as usize;
+    let n = (count & !REPLY_FLAGS) as usize;
     if n > usize::from(MAX_HITS) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "too many hits"));
     }
@@ -152,7 +203,7 @@ pub fn read_reply_with_coverage(r: &mut impl Read) -> io::Result<(Reply, bool)> 
         }
         hits.push(Hit { path: String::from_utf8_lossy(&p).into_owned(), folder: e[0] & 1 != 0, noisy: e[0] & 2 != 0, rank: e[1], modified: u64::from_le_bytes(modified) });
     }
-    Ok((Reply { hits, micros, names }, count & (V2_REPLY | COVERED_REPLY) == V2_REPLY | COVERED_REPLY))
+    Ok((Reply { hits, micros, names }, count & REPLY_FLAGS))
 }
 
 #[cfg(test)]
@@ -213,6 +264,31 @@ mod tests {
             write_reply_with_coverage(&mut bytes, &reply, version, covered).unwrap();
             assert_eq!(read_reply_with_coverage(&mut bytes.as_slice()).unwrap(), (reply.clone(), expected));
         }
+    }
+
+    #[test]
+    fn paged_client_reads_legacy_uncovered_and_distinguishes_results_from_gaps() {
+        let mut bytes = Vec::new();
+        write_paged_request(&mut bytes, "report", r"D:\Work").unwrap();
+        let legacy_scope = std::str::from_utf8(&bytes[4..]).unwrap().split_once('\0').unwrap().0;
+        assert!(!legacy_scope.get(..3).is_some_and(|root| root.eq_ignore_ascii_case("D:\\")));
+        let request = read_request(&mut bytes.as_slice()).unwrap();
+        assert_eq!(request.scope.as_deref(), Some(r"D:\Work"));
+        assert_eq!(request.query, "report");
+        assert!(request.paged);
+
+        let mut bytes = Vec::new();
+        let reply = Reply { names: 500, ..Reply::default() };
+        write_reply(&mut bytes, &Reply::default(), Version::V1).unwrap();
+        write_page(&mut bytes, &reply, true, false).unwrap();
+        write_page(&mut bytes, &reply, false, true).unwrap();
+        let mut stream = bytes.as_slice();
+        assert!(read_page(&mut stream).unwrap().is_none());
+        let hits = read_page(&mut stream).unwrap().unwrap();
+        assert_eq!((hits.reply, hits.more, hits.gaps), (reply.clone(), true, false));
+        let gaps = read_page(&mut stream).unwrap().unwrap();
+        assert_eq!((gaps.reply, gaps.more, gaps.gaps), (reply, false, true));
+        assert!(stream.is_empty());
     }
 
     #[test]
