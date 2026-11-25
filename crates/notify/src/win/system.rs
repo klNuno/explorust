@@ -37,6 +37,14 @@ fn string(key: &str, value: &str) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..len]))
 }
 
+pub(super) fn shell_notification_access_denied() -> bool {
+    let key = format!(
+        r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\userNotificationListener\{}",
+        crate::msix_identity::FAMILY,
+    );
+    string(&key, "Value").is_some_and(|value| value.eq_ignore_ascii_case("Deny"))
+}
+
 /// The user's settings for toasts from `aumid`.
 pub fn settings(aumid: &str) -> Settings {
     let app = format!(r"{NOTIF}\{aumid}");

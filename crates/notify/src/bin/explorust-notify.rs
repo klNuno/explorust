@@ -1,9 +1,5 @@
-//! explorust-notify.exe: the toast listener's wake-up, the only explorust exe with package
-//! identity (the sparse package of `crates/notify/package`, installed with C:\explorust as its
-//! external location). `UserNotificationListener.NotificationChanged` refuses a process without
-//! identity, so the notify part (inside explorust.exe, which keeps no identity: its children must
-//! not inherit one) activates this helper through the package's AUMID and waits; the helper subscribes to the event and posts
-//! `MSG_WAKE` to the part's window on every change. It exits with its parent.
+//! The shell activates the notification listener through its AUMID. This process subscribes to
+//! Windows notification changes, wakes the shell's toast UI, and exits when the shell ends.
 //! Usage: explorust-notify.exe --parent <pid> --hwnd <command window>; `--toast <text>` (dev)
 //! sends a toast as the package.
 

@@ -19,6 +19,9 @@ pub mod seen;
 #[cfg(target_os = "windows")]
 mod log;
 #[cfg(target_os = "windows")]
+#[path = "../../msix-identity.rs"]
+mod msix_identity;
+#[cfg(target_os = "windows")]
 mod win;
 
 /// Dev probe: writes the WNF state names whose stamp moves (see `win/wnf.rs`).
@@ -51,7 +54,7 @@ pub fn dev_toast(text: &str) -> bool {
     // SAFETY: COM for this dev process's only thread.
     let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
     let r = win::helper::activate(&format!("--toast \"{}\"", text.replace('"', "'")));
-    log::line(&format!("notify-dev: toast through {}: {r:?}", win::helper::AUMID));
+    log::line(&format!("notify-dev: package toast: {r:?}"));
     r.is_ok()
 }
 

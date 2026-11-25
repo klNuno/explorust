@@ -59,7 +59,10 @@ mod win {
     }
 
     pub fn run() -> u32 {
-        if !FILES.iter().any(|(n, _)| *n == "explorust-guard.exe") {
+        if ["explorust-guard.exe", "explorust-supervisor.exe", "explorust-shell.msix"]
+            .iter()
+            .any(|required| !FILES.iter().any(|(name, _)| name == required))
+        {
             return fail("This installer was built without its files (EXPLORUST_PAYLOAD).");
         }
         let dir = match staging() {

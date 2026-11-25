@@ -1,6 +1,6 @@
 //! The guard's keeper. If the guard that started explorust ends (killed from Task Manager, say),
 //! nothing would bring explorer back on a crash and the escape hotkey would be gone, so explorust
-//! starts a new guard that adopts it (`explorust-guard --adopt <pid>`), and watches that one.
+//! starts a new supervisor that adopts it and watches that one.
 
 use crate::log;
 use std::os::windows::process::CommandExt;
@@ -22,6 +22,7 @@ pub fn pid() -> u32 {
 
 fn watch(mut pid: u32, staged_event: Option<String>) {
     let guard = std::env::current_exe().map(|p| p.with_file_name("explorust-guard.exe"));
+    let mut try_packaged = option_env!("EXPLORUST_PACKAGE_BUILD").is_some();
     loop {
         // SAFETY: opens, waits on and closes a handle owned here.
         unsafe {
@@ -35,12 +36,37 @@ fn watch(mut pid: u32, staged_event: Option<String>) {
         }
         let Ok(exe) = &guard else { return };
         let me = std::process::id().to_string();
-        let mut command = std::process::Command::new(exe);
-        command.args(["--adopt", &me]);
-        if let Some(name) = &staged_event {
-            command.arg(name);
-        }
-        match command.creation_flags(CREATE_NO_WINDOW).spawn() {
+        let start = |exe: &std::path::Path| {
+            let mut command = std::process::Command::new(exe);
+            command.args(["--adopt", &me]);
+            if let Some(name) = &staged_event {
+                command.arg(name);
+            }
+            command.creation_flags(CREATE_NO_WINDOW).spawn()
+        };
+        let replacement = if try_packaged {
+            match start(&exe.with_file_name("explorust-supervisor.exe")) {
+                Ok(mut child) => {
+                    // A failed identity check exits before taking over. Use the unbound guard
+                    // if Windows can no longer start the supervisor in this session.
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    if child.try_wait().is_ok_and(|status| status.is_none()) {
+                        Ok(child)
+                    } else {
+                        try_packaged = false;
+                        start(exe)
+                    }
+                }
+                Err(error) => {
+                    log::line(&format!("could not restart the packaged supervisor: {error}"));
+                    try_packaged = false;
+                    start(exe)
+                }
+            }
+        } else {
+            start(exe)
+        };
+        match replacement {
             Ok(child) => {
                 log::line(&format!("guard pid {pid} ended: started guard pid {} to adopt this shell", child.id()));
                 pid = child.id();

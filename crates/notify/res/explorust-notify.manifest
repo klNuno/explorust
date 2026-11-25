@@ -1,7 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity version="1.0.0.0" name="explorust.notify.helper"/>
-  <!-- No msix element: the side by side loader of 26300.9974 refuses the unsigned publisher
-       (OID.2.25.311729368913984317654407730594956997722=1) there, and the exe would not start at
-       all. The identity comes from activating the package's application instead (src/win/helper.rs). -->
+  <!-- Package identity comes from activation through the listener's AUMID. -->
 </assembly>

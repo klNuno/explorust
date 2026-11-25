@@ -190,7 +190,7 @@ fn switch(
         if Event::is_signalled(CANCEL_FOR_RESTORE) {
             return Err("turning off explorust before starting the new shell".into());
         }
-        let supervisor = Child::spawn(guard, &format!("--live {worker_pid} {stamp}"))?;
+        let supervisor = Child::spawn(&install::supervisor(guard), &format!("--live {worker_pid} {stamp}"))?;
         log::line(&format!("switch: guard pid {} took over the session", supervisor.pid));
         wait_for_verdict(exe, &supervisor)?;
         watcher.accept()?;
