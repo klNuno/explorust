@@ -2,7 +2,7 @@
 //! in UTF-8. A reply: hit count (u32), the service's time in microseconds (u32), names indexed
 //! (u32), then per hit: flags (u8, bit 0 folder, bit 1 noisy), rank (u8), path length (u16), path.
 //! The high bit of max hits requests V2. A V2 reply sets the high bit of hit count and appends
-//! last write time (u64, FILETIME ticks) to each hit. A V1 service clamps max hits to 200 and
+//! last write time (u64, FILETIME ticks, at the index's stored precision) to each hit. A V1 service clamps max hits to 200 and
 //! answers in V1; a V1 client only ever requests and receives V1. Files requests pages with
 //! a marked scope. Paged replies reuse the V2 hit layout and identify continuation and fallback
 //! folder frames in the count flags. Older services read the whole request and reply uncovered.

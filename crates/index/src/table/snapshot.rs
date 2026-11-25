@@ -1,12 +1,12 @@
 //! Versioned copy of the settled MFT, before journal updates and background metadata work.
 //! Only the volume worker's private cache uses this format.
 
-use super::{SEP, Slot, Table};
+use super::{PREFIX_WORDS, Records, SEP, Slots, Table};
 use bytemuck::{Pod, cast_slice, cast_slice_mut};
 use crc32fast::Hasher;
 use std::io::{self, Read, Write};
 
-const VERSION: &[u8; 8] = b"EXPMFT01";
+const VERSION: &[u8; 8] = b"EXPMFT04";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotCursor {
@@ -118,12 +118,36 @@ impl Snapshot {
         out.bytes(VERSION)?;
         out.bytes(&cursor.journal.to_le_bytes())?;
         out.bytes(&cursor.next.to_le_bytes())?;
-        out.arena(&names.slots)?;
+        match &names.slots {
+            Slots::Packed(slots) => {
+                out.bytes(&[0])?;
+                out.arena(slots)?;
+            }
+            Slots::Wide(slots) => {
+                out.bytes(&[1])?;
+                out.arena(slots)?;
+            }
+        }
         out.arena(&names.case.marks)?;
         out.arena(&names.fold)?;
+        out.arena(&names.prefixes)?;
         out.arena(&names.starts)?;
-        out.arena(&names.recs)?;
-        out.arena(&names.meta)?;
+        match &names.recs {
+            Records::Packed(records) => {
+                out.bytes(&[0])?;
+                out.arena(records)?;
+            }
+            Records::Wide(records) => {
+                out.bytes(&[1])?;
+                out.arena(records)?;
+            }
+        }
+        out.arena(&names.meta.words)?;
+        out.count(names.meta.outliers.len())?;
+        for (&i, &time) in &names.meta.outliers {
+            out.count(i)?;
+            out.bytes(&time.to_le_bytes())?;
+        }
         out.arena(&names.prune_roots)?;
         out.count(names.case.external.len())?;
         for (&i, bits) in &names.case.external {
@@ -158,12 +182,35 @@ impl Snapshot {
             return Ok(None);
         }
         let mut names = Table::new();
-        names.slots = input.arena::<Slot>()?;
+        names.slots = match input.word()? {
+            [0] => Slots::Packed(input.arena()?),
+            [1] => Slots::Wide(input.arena()?),
+            _ => return Err(invalid()),
+        };
         names.case.marks = input.arena()?;
         names.fold = input.arena()?;
+        names.prefixes = input.arena()?;
+        if !names.prefixes.is_empty() && names.prefixes.len() != PREFIX_WORDS {
+            return Err(invalid());
+        }
         names.starts = input.arena()?;
-        names.recs = input.arena()?;
-        names.meta = input.arena()?;
+        names.recs = match input.word()? {
+            [0] => Records::Packed(input.arena()?),
+            [1] => Records::Wide(input.arena()?),
+            _ => return Err(invalid()),
+        };
+        names.meta.words = input.arena()?;
+        let outliers = input.count()?;
+        if outliers > names.meta.words.len() {
+            return Err(invalid());
+        }
+        for _ in 0..outliers {
+            let i = input.count()?;
+            if i >= names.meta.words.len() {
+                return Err(invalid());
+            }
+            names.meta.outliers.insert(i, u64::from_le_bytes(input.word()?));
+        }
         names.prune_roots = input.arena()?;
         let external = input.count()?;
         if external > names.case.marks.len() {
@@ -183,7 +230,7 @@ impl Snapshot {
         let count = names.recs.len();
         if names.starts.len() != count
             || names.case.marks.len() != count
-            || names.meta.len() != count
+            || names.meta.words.len() != count
             || names.fold.first() != Some(&SEP)
             || names.fold.last() != Some(&SEP)
         {

@@ -1,42 +1,43 @@
 use std::collections::BTreeMap;
 
-const INLINE_BITS: usize = 14;
-const PAIR: u16 = 1 << INLINE_BITS;
-const EXTERNAL: u16 = 1 << 15;
-const POSITION: u16 = (1 << 7) - 1;
+const INLINE_BITS: usize = 6;
+const MASK: u8 = 1 << 7;
+const PAIR: u8 = MASK + (1 << INLINE_BITS);
+const EXTERNAL: u8 = u8::MAX;
 
 /// Most names only need a few case marks near the start. Long mixed-case names keep their
 /// original bitmap separately, and search only reads it when reconstructing a path.
 #[derive(Default)]
 pub(super) struct Case {
-    pub marks: Vec<u16>,
+    pub marks: Vec<u8>,
     pub(super) external: BTreeMap<usize, Box<[u8]>>,
 }
 
 impl Case {
     pub fn mark(&mut self, name: usize, bytes: usize, at: usize) {
         let marks = &mut self.marks[name];
-        if *marks < PAIR {
-            if at < INLINE_BITS {
+        match *marks {
+            0 if at < usize::from(MASK - 1) => {
+                *marks = at as u8 + 1;
+                return;
+            }
+            1..=6 if at < INLINE_BITS => {
+                *marks = MASK | (1 << (*marks - 1)) | (1 << at);
+                return;
+            }
+            1 if at <= usize::from(EXTERNAL - PAIR) => {
+                *marks = PAIR + (at as u8 - 1);
+                return;
+            }
+            MASK..PAIR if at < INLINE_BITS => {
                 *marks |= 1 << at;
                 return;
             }
-            if at < usize::from(POSITION) && marks.count_ones() <= 1 {
-                let first = if *marks == 0 {
-                    0
-                } else {
-                    marks.trailing_zeros() as u16 + 1
-                };
-                *marks = PAIR | ((first << 7) | (at as u16 + 1));
-                return;
-            }
-        } else if *marks < EXTERNAL && *marks >> 7 & POSITION == 0 && at < usize::from(POSITION) {
-            *marks |= (at as u16 + 1) << 7;
-            return;
+            _ => {}
         }
         let bits = self.external.entry(name).or_insert_with(|| {
             let mut bits = vec![0; bytes.div_ceil(8)].into_boxed_slice();
-            for start in 0..bytes.min(usize::from(POSITION)) {
+            for start in 0..bytes.min(usize::from(MASK - 1)) {
                 if inline_change(*marks, start) {
                     bits[start >> 3] |= 1 << (start & 7);
                 }
@@ -61,7 +62,7 @@ impl Case {
     }
 
     pub fn remove(&mut self, name: usize) {
-        if self.marks[name] & EXTERNAL != 0 {
+        if self.marks[name] == EXTERNAL {
             self.external.remove(&name);
         }
     }
@@ -69,7 +70,7 @@ impl Case {
     pub fn compact(&mut self, src: usize, dst: usize) {
         if src != dst {
             self.marks[dst] = self.marks[src];
-            if self.marks[src] & EXTERNAL != 0 {
+            if self.marks[src] == EXTERNAL {
                 let bits = self.external.remove(&src).unwrap();
                 self.external.insert(dst, bits);
             }
@@ -77,7 +78,7 @@ impl Case {
     }
 
     pub fn bytes(&self) -> usize {
-        self.marks.capacity() * size_of::<u16>()
+        self.marks.capacity()
             + self
                 .external
                 .values()
@@ -89,11 +90,11 @@ impl Case {
     }
 }
 
-fn inline_change(marks: u16, at: usize) -> bool {
-    if marks < PAIR {
-        at < INLINE_BITS && marks & (1 << at) != 0
-    } else {
-        let offset = at + 1;
-        offset == usize::from(marks & POSITION) || offset == usize::from(marks >> 7 & POSITION)
+fn inline_change(marks: u8, at: usize) -> bool {
+    match marks {
+        0..MASK => at + 1 == usize::from(marks),
+        MASK..PAIR => at < INLINE_BITS && marks & (1 << at) != 0,
+        PAIR..EXTERNAL => at == 0 || at == usize::from(marks - PAIR) + 1,
+        EXTERNAL => false,
     }
 }

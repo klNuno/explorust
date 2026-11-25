@@ -18,8 +18,9 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
-    CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA, FSCTL_QUERY_FILE_LAYOUT, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
-    MFT_ENUM_DATA_V0, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
+    CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA, FSCTL_GET_NTFS_VOLUME_DATA,
+    FSCTL_QUERY_FILE_LAYOUT, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V0,
+    NTFS_VOLUME_DATA_BUFFER, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows_core::HSTRING;
@@ -324,9 +325,26 @@ impl Volume {
         self.h
     }
 
+    fn highest_mft_record(&self) -> Option<u64> {
+        let mut buffer = [0; size_of::<NTFS_VOLUME_DATA_BUFFER>() + 64];
+        let bytes = ioctl(self.h, FSCTL_GET_NTFS_VOLUME_DATA, &(), &mut buffer).ok()?;
+        if bytes < size_of::<NTFS_VOLUME_DATA_BUFFER>() {
+            return None;
+        }
+        // SAFETY: the ioctl filled at least the fixed prefix, which contains only integers.
+        let data = unsafe { buffer.as_ptr().cast::<NTFS_VOLUME_DATA_BUFFER>().read_unaligned() };
+        u64::try_from(data.MftValidDataLength)
+            .ok()?
+            .checked_div(u64::from(data.BytesPerFileRecordSegment))?
+            .checked_sub(1)
+    }
+
     /// Reads the names up to `high`, keeping the sequence numbers for later metadata lookups.
     pub fn load(&self, high: i64) -> windows_core::Result<Mft> {
         let mut t = Table::new();
+        if let Some(highest) = self.highest_mft_record() {
+            t.cover_mft_records(highest);
+        }
         let mut seqs: Vec<u16> = Vec::new();
         let mut med = MFT_ENUM_DATA_V0 { StartFileReferenceNumber: 0, LowUsn: 0, HighUsn: high };
         let mut buf = vec![0u8; 1 << 20];
