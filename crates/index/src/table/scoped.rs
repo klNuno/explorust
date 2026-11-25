@@ -214,9 +214,6 @@ impl ScopedScan {
                         .slots
                         .get(rec as usize)
                         .filter(|slot| slot.name != NONE);
-                    if table.is_primary_alias(rec, alias.parent, &alias.name) {
-                        continue;
-                    }
                     if !path.ends_with('\\') {
                         path.push('\\');
                     }
@@ -287,6 +284,9 @@ impl ScopedScan {
         if rec == NONE
             || rec == self.scope
             || (self.scope != ROOT && !table.descends_from(rec, self.scope))
+            // The link list owns every retained name of a known multi-name record, including
+            // whichever name the journal currently puts in the primary arena slot.
+            || table.aliases.contains_key(&rec)
         {
             return None;
         }
@@ -381,6 +381,30 @@ mod tests {
         let mut scan = table.begin_scoped_scan("C:\\", r"C:\Work\WinSxS").unwrap();
         assert_eq!(scan.gaps(&table, "C:\\"), [r"C:\Work\WinSxS"]);
         assert!(drain(&mut scan, &table, "report", 200).is_empty());
+    }
+
+    #[test]
+    fn switching_the_primary_link_between_pages_keeps_both_names_once() {
+        for first_page_size in [1, 2] {
+            let mut table = ready_table();
+            table.upsert(16, ROOT, "match-first.txt", false, false, 0);
+            table.upsert(17, ROOT, "match-a.txt", false, false, 0);
+            table.set_aliases(17, vec![(ROOT, "match-a.txt".into()), (ROOT, "match-b.txt".into())]);
+            let mut scan = table.begin_scoped_scan("C:\\", "C:\\").unwrap();
+            let finder = memmem::Finder::new("match-");
+            let mut hits = Vec::new();
+            while hits.len() < first_page_size {
+                assert_eq!(scan.step(&table, "C:\\", &finder, first_page_size, &mut hits), Some(false));
+            }
+
+            table.upsert(17, ROOT, "match-b.txt", false, false, 0);
+            let mut paths = drain(&mut scan, &table, "match-", 1);
+            for hit in hits {
+                assert!(paths.insert(hit.path), "repeated name after primary switch");
+            }
+            assert_eq!(paths, [r"C:\match-first.txt", r"C:\match-a.txt", r"C:\match-b.txt"]
+                .map(String::from).into_iter().collect());
+        }
     }
 
     #[test]

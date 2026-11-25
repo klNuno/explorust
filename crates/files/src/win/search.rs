@@ -6,6 +6,8 @@ use crate::search_delivery::Delivery;
 use crate::win::shell::Pidl;
 use crate::win::tab::Browser;
 use fsindex::client;
+use fsindex::proto::Page;
+use std::io;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use windows::Storage::Search::{FolderDepth, IndexerOption, QueryOptions};
@@ -63,7 +65,9 @@ impl Worker {
                     PostMessageW(Some(HWND(hwnd as _)), MSG_RESULTS, WPARAM(0), LPARAM(0)).is_ok()
                 });
                 let result = match &com {
-                    Ok(()) => query(&job, &active, |result| post(Ok(result))),
+                    Ok(()) => query(&job, &active, |result| post(Ok(result)), |path, consume| {
+                        client::query_pages(&job.query, path, active, consume)
+                    }),
                     Err(error) => Err(error.clone()),
                 };
                 if !active() {
@@ -126,11 +130,16 @@ fn indexed_volume(path: &str) -> bool {
     }
 }
 
-fn query(job: &Request, active: &impl Fn() -> bool, mut post: impl FnMut(Results) -> bool) -> Result<()> {
+fn query(
+    job: &Request,
+    active: &impl Fn() -> bool,
+    mut post: impl FnMut(Results) -> bool,
+    query_pages: impl FnOnce(&str, &mut dyn FnMut(Page) -> bool) -> io::Result<bool>,
+) -> Result<()> {
     if let Some(path) = job.path.as_deref().filter(|path| indexed_volume(path)) {
         let mut first = true;
         let mut gaps = Vec::new();
-        let status = client::query_pages(&job.query, path, active, |page| {
+        let status = query_pages(path, &mut |page| {
             if !active() {
                 return false;
             }
@@ -165,8 +174,7 @@ fn query(job: &Request, active: &impl Fn() -> bool, mut post: impl FnMut(Results
                 return Ok(());
             }
             Err(error) if !first => {
-                crate::win::log::line(&format!("index search ended after a partial reply: {error}"));
-                return Ok(());
+                crate::win::log::line(&format!("index search ended after a partial reply, retrying with Windows Search: {error}"));
             }
             _ => {},
         }
@@ -267,21 +275,54 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    struct Directory(PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    #[test]
+    fn a_disconnected_index_replaces_partial_results_with_windows_search() {
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap() };
+        let _apartment = Apartment;
+        let root = Directory(std::env::temp_dir().join(format!("explorust-search-disconnect-{}", std::process::id())));
+        fs::create_dir_all(&root.0).unwrap();
+        let path = root.0.to_str().unwrap();
+        let indexed = root.0.join("needle-indexed.txt");
+        fs::write(&indexed, []).unwrap();
+        let job = Request {
+            tab: 1,
+            generation: 0,
+            folder: Pidl::parse(path).unwrap(),
+            path: Some(path.into()),
+            query: "needle".into(),
+        };
+        let mut responses = Vec::new();
+        query(&job, &|| true, |result| { responses.push(result); true }, |scope, consume| {
+            assert_eq!(scope, path);
+            let reply = fsindex::proto::Reply {
+                hits: vec![fsindex::proto::Hit {
+                    path: indexed.to_str().unwrap().into(), folder: false, noisy: false, rank: 0, modified: 0,
+                }],
+                micros: 0,
+                names: 2,
+            };
+            assert!(consume(Page { reply, more: true, gaps: false }));
+            Err(io::ErrorKind::BrokenPipe.into())
+        }).unwrap();
+        assert!(matches!(&responses[..], [Results::Indexed { hits, first: true }, Results::Windows(_)] if hits.len() == 1),
+            "expected native replacement after the partial page, got {} responses", responses.len());
+    }
+
     #[test]
     fn windows_search_returns_only_the_missing_subtree() {
-        struct Directory(PathBuf);
-        impl Drop for Directory {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-        struct Apartment;
-        impl Drop for Apartment {
-            fn drop(&mut self) {
-                unsafe { CoUninitialize() };
-            }
-        }
-
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap() };
         let _apartment = Apartment;
         let root = Directory(std::env::temp_dir().join(format!("explorust-search-{}", std::process::id())));

@@ -83,8 +83,25 @@ pub struct Frame {
     tear: Option<usize>,
 }
 
+struct FrameSlot {
+    frame: RefCell<Frame>,
+    search_wake: Cell<bool>,
+}
+
+impl FrameSlot {
+    fn with<R>(&self, hwnd: HWND, f: impl FnOnce(&mut Frame) -> R) -> Option<R> {
+        let mut frame = self.frame.try_borrow_mut().ok()?;
+        let result = f(&mut frame);
+        drop(frame);
+        if self.search_wake.replace(false) {
+            unsafe { let _ = PostMessageW(Some(hwnd), search::MSG_RESULTS, WPARAM(0), LPARAM(0)); }
+        }
+        Some(result)
+    }
+}
+
 thread_local! {
-    static FRAMES: RefCell<Vec<(HWND, Rc<RefCell<Frame>>)>> = const { RefCell::new(Vec::new()) };
+    static FRAMES: RefCell<Vec<(HWND, Rc<FrameSlot>)>> = const { RefCell::new(Vec::new()) };
     static SHARED: RefCell<Option<(Rc<Shared>, &'static Strings)>> = const { RefCell::new(None) };
     static NEW_WINDOW: Cell<Option<HWND>> = const { Cell::new(None) };
     static BROWSES: RefCell<Vec<(HWND, usize, Pidl)>> = const { RefCell::new(Vec::new()) };
@@ -112,15 +129,13 @@ pub fn init(sh: Rc<Shared>, s: &'static Strings, cmd: HWND) {
     }
 }
 
-fn find(hwnd: HWND) -> Option<Rc<RefCell<Frame>>> {
+fn find(hwnd: HWND) -> Option<Rc<FrameSlot>> {
     FRAMES.with(|f| f.borrow().iter().find(|(h, _)| *h == hwnd).map(|(_, r)| r.clone()))
 }
 
 /// Runs `f` on the frame of `hwnd` unless it is already in use further up the stack.
 fn with<R>(hwnd: HWND, f: impl FnOnce(&mut Frame) -> R) -> Option<R> {
-    let rc = find(hwnd)?;
-    let mut fr = rc.try_borrow_mut().ok()?;
-    Some(f(&mut fr))
+    find(hwnd)?.with(hwnd, f)
 }
 
 fn context_clipboard(defview: HWND, view: &IShellView, items: bool) -> Option<menu::ClipboardRoute> {
@@ -245,14 +260,15 @@ pub fn create(place: &Pidl, x: i32, y: i32, parked: bool, reload_folder: Arc<Mut
             select: None,
             tear: None,
         };
-        let rc = Rc::new(RefCell::new(frame));
+        let rc = Rc::new(FrameSlot { frame: RefCell::new(frame), search_wake: Cell::new(false) });
         FRAMES.with(|f| f.borrow_mut().push((hwnd, rc.clone())));
         // The frame becomes the whole window except Windows' resize borders.
         let prepared = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
             .and_then(|()| {
-                let mut fr = rc.borrow_mut();
-                fr.extend_frame();
-                fr.add_tab(place)
+                rc.with(hwnd, |fr| {
+                    fr.extend_frame();
+                    fr.add_tab(place)
+                }).expect("new frame is not borrowed")
             });
         if let Err(error) = prepared {
             let _ = DestroyWindow(hwnd);
@@ -1601,7 +1617,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             search::MSG_RESULTS => {
-                with(hwnd, Frame::search_results);
+                if let Some(slot) = find(hwnd) && slot.with(hwnd, Frame::search_results).is_none() {
+                    // A popup or COM call can dispatch this while the outer handler holds the
+                    // frame. The worker waits for its single pending response to be consumed.
+                    slot.search_wake.set(true);
+                    log::line("search wake deferred while the frame is busy");
+                }
                 LRESULT(0)
             }
             operations::MSG_OPERATION => {
