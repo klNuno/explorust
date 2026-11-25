@@ -151,7 +151,10 @@ pub fn serve(handler: Handler, pages: PageHandler) {
                     let (reply, covered) = hd(&request.query, request.max, request.scope.as_deref());
                     proto::write_reply_with_coverage(&mut f, &reply, request.version, covered)
                 };
-                if result.is_err() {
+                if let Err(error) = result {
+                    if request.paged && error.kind() == std::io::ErrorKind::BrokenPipe {
+                        log::line(&format!("paged search stopped after client disconnected in {:?}", request.scope));
+                    }
                     break;
                 }
             }

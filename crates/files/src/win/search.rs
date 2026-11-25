@@ -66,6 +66,10 @@ impl Worker {
                     Ok(()) => query(&job, &active, |result| post(Ok(result))),
                     Err(error) => Err(error.clone()),
                 };
+                if !active() {
+                    crate::win::log::line(&format!("tab {}: search worker stopped after cancellation in {:?}", job.tab, job.path));
+                    continue;
+                }
                 if let Err(error) = result {
                     post(Err(error));
                 }
