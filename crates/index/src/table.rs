@@ -1,7 +1,7 @@
 //! The names of one volume in a compact table. Each MFT record number indexes an 8-byte slot
 //! (parent record, name index with flags); per name, `meta` holds the noisy bit and recency, so a
 //! query reads only sequential arrays until its best hits are known; the names live once, folded (`fold`, each
-//! name after a `\n`), with one bit per byte (`case`) marking the characters to raise back. A prefix
+//! name after a `\n`), with compact case marks for reconstructing the original names. A prefix
 //! query is one pass over the name starts, a substring query one `memmem` of the query over the
 //! folded arena; an offset maps back to its name through `starts` (sorted, binary search).
 
@@ -11,8 +11,13 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
+mod case;
 mod scoped;
 pub use scoped::ScopedScan;
+mod snapshot;
+pub use snapshot::{Snapshot, SnapshotCursor};
+#[cfg(test)]
+mod bench;
 
 pub const SEP: u8 = b'\n';
 /// The root directory's MFT record number on NTFS.
@@ -26,7 +31,8 @@ const UNDER: u32 = 1 << 29;
 const IDX: u32 = (1 << 29) - 1;
 const COMPACTION_SLICE: usize = 16_384;
 
-#[derive(Clone, Copy)]
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Slot {
     parent: u32,
     /// Name index in the arenas plus DIR and NOISY, or NONE for a free slot.
@@ -55,7 +61,7 @@ struct Compaction {
 #[derive(Default)]
 pub struct Table {
     slots: Vec<Slot>,
-    case: Vec<u8>,
+    case: case::Case,
     fold: Vec<u8>,
     starts: Vec<u32>,
     recs: Vec<u32>,
@@ -147,7 +153,7 @@ fn reserve_append<T>(vec: &mut Vec<T>, count: usize, compact: bool) {
 
 impl Table {
     pub fn new() -> Table {
-        Table { case: vec![0], fold: vec![SEP], id: TABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ..Default::default() }
+        Table { fold: vec![SEP], id: TABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ..Default::default() }
     }
 
     pub fn id(&self) -> u64 {
@@ -248,15 +254,26 @@ impl Table {
         self.live == 0
     }
 
-    /// Heap bytes held by the table.
+    /// Heap bytes for the table's main arenas, including overflow payloads.
     pub fn bytes(&self) -> usize {
-        self.slots.capacity() * size_of::<Slot>() + self.case.capacity() + self.fold.capacity() + (self.starts.capacity() + self.recs.capacity()) * 4 + self.meta.capacity() * 8
+        self.arena_bytes().into_iter().map(|(_, bytes)| bytes).sum()
+    }
+
+    fn arena_bytes(&self) -> [(&'static str, usize); 6] {
+        [
+            ("slots", self.slots.capacity() * size_of::<Slot>()),
+            ("case", self.case.bytes()),
+            ("fold", self.fold.capacity()),
+            ("starts", self.starts.capacity() * size_of::<u32>()),
+            ("recs", self.recs.capacity() * size_of::<u32>()),
+            ("meta", self.meta.capacity() * size_of::<u64>()),
+        ]
     }
 
     pub fn shrink(&mut self) {
         self.compact_growth = true;
         self.slots.shrink_to_fit();
-        self.case.shrink_to_fit();
+        self.case.marks.shrink_to_fit();
         self.fold.shrink_to_fit();
         self.starts.shrink_to_fit();
         self.recs.shrink_to_fit();
@@ -280,10 +297,6 @@ impl Table {
         }
     }
 
-    fn changed(&self, at: usize) -> bool {
-        self.case[at >> 3] & (1 << (at & 7)) != 0
-    }
-
     pub fn name(&self, rec: u32) -> Option<String> {
         let s = self.slots.get(rec as usize)?;
         if s.name == NONE {
@@ -291,7 +304,7 @@ impl Table {
         }
         let (a, b) = self.name_range((s.name & IDX) as usize);
         let f = std::str::from_utf8(&self.fold[a..b]).ok()?;
-        Some(crate::fold::unfold(f, |i| self.changed(a + i)))
+        Some(self.case.unfold((s.name & IDX) as usize, f))
     }
 
     pub fn is_dir(&self, rec: u32) -> bool {
@@ -365,7 +378,8 @@ impl Table {
                 self.meta[oi] = write_time(modified, previous) | if under { META_NOISY } else { 0 };
                 return;
             }
-            self.recs[(old.name & IDX) as usize] = NONE;
+            self.recs[oi] = NONE;
+            self.case.remove(oi);
             self.dead += 1;
             self.live -= 1;
         }
@@ -376,17 +390,10 @@ impl Table {
         self.starts.push(self.fold.len() as u32);
         self.recs.push(rec);
         self.meta.push(write_time(modified, previous) | if under { META_NOISY } else { 0 });
-        let base = self.fold.len();
-        let count = name.len() + 1;
-        reserve_append(&mut self.fold, count, self.compact_growth);
-        let case_len = (base + count).div_ceil(8);
-        let extra_case = case_len - self.case.len();
-        reserve_append(&mut self.case, extra_case, self.compact_growth);
-        self.case.resize(case_len, 0);
-        fold::push_folded(name, &mut self.fold, |i| {
-            let at = base + i;
-            self.case[at >> 3] |= 1 << (at & 7);
-        });
+        reserve_append(&mut self.fold, name.len() + 1, self.compact_growth);
+        reserve_append(&mut self.case.marks, 1, self.compact_growth);
+        self.case.marks.push(0);
+        fold::push_folded(name, &mut self.fold, |at| self.case.mark(idx as usize, name.len(), at));
         self.fold.push(SEP);
         self.slots[r] = Slot { parent, name: idx | flags };
         self.live += 1;
@@ -402,6 +409,7 @@ impl Table {
             return;
         }
         self.recs[(s.name & IDX) as usize] = NONE;
+        self.case.remove((s.name & IDX) as usize);
         *s = FREE;
         self.dead += 1;
         self.live -= 1;
@@ -442,14 +450,6 @@ impl Table {
             let (a, b) = self.name_range(i);
             let base = cursor.bytes;
             if base != a {
-                // The write cursor trails the read cursor, so later case bits remain intact.
-                // Copy the separator's zero bit as well, for the next name appended there.
-                for (at, source) in (base..).zip(a..=b) {
-                    let changed = u8::from(self.changed(source));
-                    let mask = 1 << (at & 7);
-                    let byte = &mut self.case[at >> 3];
-                    *byte = (*byte & !mask) | (changed << (at & 7));
-                }
                 self.fold.copy_within(a..=b, base);
             }
             let slot = &mut self.slots[rec as usize];
@@ -457,6 +457,7 @@ impl Table {
             self.starts[cursor.kept] = base as u32;
             self.recs[cursor.kept] = rec;
             self.meta[cursor.kept] = self.meta[i];
+            self.case.compact(i, cursor.kept);
             cursor.bytes += b + 1 - a;
             cursor.kept += 1;
         }
@@ -469,10 +470,7 @@ impl Table {
         // under the volume lock, even when shrinking.
         let Compaction { kept, bytes: base, .. } = cursor;
         self.fold.truncate(base);
-        self.case.truncate(base.div_ceil(8));
-        if base % 8 != 0 && let Some(last) = self.case.last_mut() {
-            *last &= (1 << (base % 8)) - 1;
-        }
+        self.case.marks.truncate(kept);
         self.starts.truncate(kept);
         self.recs.truncate(kept);
         self.meta.truncate(kept);
@@ -489,7 +487,9 @@ impl Table {
                     if self.slots[r as usize].name & DIR == 0 {
                         self.pruned_files.push(r);
                     }
-                    self.recs[(self.slots[r as usize].name & IDX) as usize] = NONE;
+                    let i = (self.slots[r as usize].name & IDX) as usize;
+                    self.recs[i] = NONE;
+                    self.case.remove(i);
                     self.slots[r as usize] = PRUNED;
                     self.dead += 1;
                     self.live -= 1;
@@ -658,12 +658,14 @@ impl Table {
         }
         let mut top = Top::new(max);
         // Name prefixes: one pass over the name starts, cheaper than memmem when most names match.
-        let (q0, n) = (q[0], q.len());
+        let (q0, tail) = (q[0], &q[1..]);
         let indices = self.name_indices();
         for names in &indices {
             for (i, &st) in (names.start..).zip(&self.starts[names.clone()]) {
                 let st = st as usize;
-                if self.fold[st] == q0 && self.fold.get(st..st + n) == Some(q) && self.recs[i] != NONE
+                if self.fold[st] == q0
+                    && (tail.is_empty() || self.fold.get(st + 1..st + 1 + tail.len()) == Some(tail))
+                    && self.recs[i] != NONE
                     && scope.is_none_or(|ancestor| self.descends_from(self.recs[i], ancestor)) {
                     top.offer(meta_key(self.meta[i], 0), i);
                 }
@@ -1022,21 +1024,30 @@ mod tests {
     }
 
     #[test]
-    fn compaction_preserves_unicode_case_and_clears_bits_for_the_next_append() {
+    fn compaction_preserves_inline_and_extended_case_before_the_next_append() {
         let mut t = Table::new();
         t.upsert(16, ROOT, "DELETE-A", false, false, 0);
         t.upsert(17, ROOT, "ÉTÉ-ß.txt", false, false, 11);
-        t.upsert(18, ROOT, "REMOVE-ME.txt", false, false, 0);
+        t.upsert(18, ROOT, "remove-another-mixed-case-ALIAS.txt", false, false, 0);
         t.upsert(19, ROOT, "ΣΊΣΥΦΟΣ.txt", false, true, 23);
+        t.upsert(20, ROOT, "long-lowercase-name-ÉTÉ.TXT", false, false, 4);
+        t.upsert(22, ROOT, "lowercase-name-with-A.txt", false, false, 4);
+        t.upsert(23, ROOT, "File-with-a-late-Capital.txt", false, false, 4);
         t.remove(16);
         t.remove(18);
         t.compact();
-        t.upsert(20, ROOT, "lower.txt", false, false, 0);
-        for (record, name) in [(17, "ÉTÉ-ß.txt"), (19, "ΣΊΣΥΦΟΣ.txt"), (20, "lower.txt")] {
+        t.upsert(21, ROOT, "lower.txt", false, false, 0);
+        for (record, name) in [(17, "ÉTÉ-ß.txt"), (19, "ΣΊΣΥΦΟΣ.txt"), (20, "long-lowercase-name-ÉTÉ.TXT"), (21, "lower.txt"), (22, "lowercase-name-with-A.txt"), (23, "File-with-a-late-Capital.txt")] {
             assert_eq!(t.name(record).as_deref(), Some(name));
         }
         let hit = t.query("σίσυφοσ", 1)[0];
         assert_eq!((hit.rec, hit.modified(), hit.noisy()), (19, 23, true));
+        t.journal_current = true;
+        t.finish_initial_links();
+        let mut scan = t.begin_scoped_scan("C:\\", "C:\\").unwrap();
+        let mut hits = Vec::new();
+        assert_eq!(scan.step(&t, "C:\\", &memmem::Finder::new("été".as_bytes()), 16, &mut hits), Some(true));
+        assert_eq!(hits.into_iter().map(|hit| hit.path).collect::<Vec<_>>(), ["C:\\ÉTÉ-ß.txt", "C:\\long-lowercase-name-ÉTÉ.TXT"]);
     }
 
     #[test]

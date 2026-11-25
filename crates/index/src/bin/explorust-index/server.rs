@@ -1,6 +1,7 @@
 //! The index: one table per fixed NTFS volume, loaded from the MFT then kept current from the
 //! journal on a thread per volume, and the pipe that answers queries from them.
 
+use crate::cache::Cache;
 use crate::hydration::Hydration;
 use crate::{log, metadata, pipe, volume};
 use fsindex::fold;
@@ -8,7 +9,7 @@ use fsindex::proto::{self, Hit, Reply, Request};
 use memchr::memmem;
 use std::fs::File;
 use std::io;
-use fsindex::table::{SortKey, Table};
+use fsindex::table::{SnapshotCursor, SortKey, Table};
 use parking_lot::RwLock as VolumeLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -27,23 +28,67 @@ fn memory() -> (f64, f64) {
     (c.PrivateUsage as f64 / 1048576.0, c.WorkingSetSize as f64 / 1048576.0)
 }
 
+struct Loaded {
+    mft: volume::Mft,
+    position: volume::JournalPosition,
+    cursor: SnapshotCursor,
+    fresh: bool,
+}
+
+fn load(v: &volume::Volume, cache: Option<&Cache>) -> windows_core::Result<Loaded> {
+    let letter = v.letter;
+    if let Some(cache) = cache {
+        let journal = v.journal()?;
+        let clock = Instant::now();
+        let restored = match cache.read(&journal) {
+            Ok(Some(snapshot)) => {
+                let cursor = snapshot.cursor;
+                v.replay(snapshot).map(|(mft, position)| Some(Loaded { mft, position, cursor, fresh: false }))
+                    .map_err(io::Error::from)
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        };
+        match restored {
+            Ok(Some(loaded)) => {
+                log::line(&format!("{letter}: MFT snapshot: {} names, {} journal records replayed in {} ms", loaded.mft.names.len(), loaded.position.changes(), clock.elapsed().as_millis()));
+                return Ok(loaded);
+            }
+            Ok(None) => {}
+            Err(e) => log::line(&format!("{letter}: MFT snapshot unusable, reading the volume: {e}")),
+        }
+    }
+    let journal = v.journal()?;
+    let cursor = SnapshotCursor { journal: journal.UsnJournalID, next: journal.NextUsn };
+    let clock = Instant::now();
+    let mft = v.load(cursor.next)?;
+    let (n, bytes) = (mft.names.len(), mft.names.bytes());
+    log::line(&format!("{letter}: MFT read: {n} names in {} ms, table {:.1} MB ({:.1} bytes a name)", clock.elapsed().as_millis(), bytes as f64 / 1048576.0, bytes as f64 / n.max(1) as f64));
+    Ok(Loaded { mft, position: volume::JournalPosition::new(cursor.next), cursor, fresh: true })
+}
+
 /// Loads and follows one volume forever (reloads when the journal is lost).
 fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
     let mut first = true;
     loop {
         let r = (|| -> windows_core::Result<windows_core::Error> {
             let v = volume::Volume::open(letter)?;
-            let j = v.journal()?;
-            let t0 = Instant::now();
-            let volume::Mft { names, sequences, pruned } = v.load(j.NextUsn)?;
+            let cache = Cache::for_volume(&v.device_path(), letter);
+            let Loaded { mft: volume::Mft { names, sequences, pruned }, position, cursor, fresh } = load(&v, cache.as_ref())?;
             let id = names.id();
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let (n, bytes) = (names.len(), names.bytes());
             let hydration = Hydration::publish(vol.table.clone(), names);
-            log::line(&format!("{letter}: MFT read: {n} names in {ms:.0} ms, table {:.1} MB ({:.1} bytes a name)", bytes as f64 / 1048576.0, bytes as f64 / n.max(1) as f64));
             if first {
                 let _ = loaded.send(());
                 first = false;
+            }
+            // The first unscoped search can already read the table. Start mutations only
+            // once the snapshot has been written, so its cursor describes exactly these names.
+            if fresh && let Some(cache) = cache {
+                let clock = Instant::now();
+                match cache.save(&vol.table.read(), &sequences, &pruned, cursor) {
+                    Ok(()) => log::line(&format!("{letter}: MFT snapshot saved in {} ms", clock.elapsed().as_millis())),
+                    Err(e) => log::line(&format!("{letter}: could not save MFT snapshot: {e}")),
+                }
             }
             if !pruned.is_empty() {
                 match v.duplicate() {
@@ -52,7 +97,7 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
                 }
             }
             metadata::spawn(letter, v.device_path(), sequences, hydration);
-            Ok(v.follow(j.UsnJournalID, j.NextUsn, &vol.table))
+            Ok(v.follow(cursor.journal, position, &vol.table))
         })();
         match r {
             Ok(e) => log::line(&format!("{letter}: journal read stopped ({e}), reloading")),
@@ -70,6 +115,9 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
             let _ = loaded.send(());
             first = false;
         }
+        // A lost journal invalidates the old table. Release it before the next MFT scan,
+        // also invalidating the metadata and link jobs that still refer to its table ID.
+        *vol.table.write() = Table::new();
         std::thread::sleep(Duration::from_secs(30));
     }
 }
@@ -205,9 +253,9 @@ pub fn rescan() -> usize {
     new.len()
 }
 
-/// Runs the index; `ready` is called at once (the service reports running and answers from what
-/// is loaded); the startup summary is logged when every volume's first load ended.
-pub fn run(ready: Option<&dyn Fn()>) {
+/// Start loading the volumes and accept queries. The startup summary is logged once each
+/// volume's first load ended.
+pub fn run(start_notices: impl FnOnce()) {
     let letters = volume::fixed_ntfs();
     log::line(&format!("index: fixed NTFS volumes {letters:?}"));
     let t0 = Instant::now();
@@ -235,9 +283,7 @@ pub fn run(ready: Option<&dyn Fn()>) {
             log::line(&format!("index: volume added, process private {private:.1} MB, working set {ws:.1} MB"));
         }
     });
-    if let Some(f) = ready {
-        f();
-    }
+    start_notices();
     pipe::serve(Arc::new(move |q: &str, max: u16, scope: Option<&str>| {
         let vols: Vec<Arc<Vol>> = VOLS.read().map(|v| v.iter().map(|(_, v)| v.clone()).collect()).unwrap_or_default();
         answer(&vols, q, max, scope)

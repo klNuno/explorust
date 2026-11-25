@@ -1,11 +1,11 @@
 //! The service: dispatcher entry, control handler, and the install and uninstall that
 //! `explorust-guard --install` and `--restore` run.
 
-use crate::{log, pipe, server};
+use crate::{cache, log, session};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, HANDLE, NO_ERROR};
+use windows::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, ERROR_TIMEOUT, HANDLE, NO_ERROR};
 use windows::Win32::UI::WindowsAndMessaging::{DBT_DEVTYP_DEVICEINTERFACE, DEV_BROADCAST_DEVICEINTERFACE_W, DEVICE_NOTIFY_SERVICE_HANDLE, RegisterDeviceNotificationW};
 use windows_core::GUID;
 use windows::Win32::System::Services::{
@@ -19,6 +19,7 @@ use windows::Win32::System::Services::{
 use windows_core::{HSTRING, PCWSTR, PWSTR};
 
 static STATUS: OnceLock<isize> = OnceLock::new();
+static NOTICES: OnceLock<session::Notices> = OnceLock::new();
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
 fn report(state: SERVICE_STATUS_CURRENT_STATE) {
@@ -27,6 +28,7 @@ fn report(state: SERVICE_STATUS_CURRENT_STATE) {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: state,
         dwControlsAccepted: if state == SERVICE_RUNNING { SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE } else { 0 },
+        dwWaitHint: if state == SERVICE_STOP_PENDING { 5000 } else { 0 },
         ..Default::default()
     };
     // SAFETY: the handle came from RegisterServiceCtrlHandlerExW.
@@ -40,41 +42,23 @@ const DBT_DEVICEARRIVAL: u32 = 0x8000;
 unsafe extern "system" fn handler(ctrl: u32, event: u32, _: *mut core::ffi::c_void, _: *mut core::ffi::c_void) -> u32 {
     match ctrl {
         SERVICE_CONTROL_SESSIONCHANGE => {
-            let _ = std::thread::Builder::new().name("index-session".into()).spawn(pipe::refresh);
+            if let Some(notices) = NOTICES.get() { notices.session.signal(); }
             NO_ERROR.0
         }
         SERVICE_CONTROL_DEVICEEVENT => {
-            if event == DBT_DEVICEARRIVAL {
-                // The letter comes a moment after the volume interface.
-                let _ = std::thread::Builder::new().name("index-arrival".into()).spawn(|| {
-                    for _ in 0..5 {
-                        std::thread::sleep(Duration::from_secs(2));
-                        if server::rescan() > 0 {
-                            break;
-                        }
-                    }
-                });
+            if event == DBT_DEVICEARRIVAL && let Some(notices) = NOTICES.get() {
+                notices.volume.signal();
             }
             NO_ERROR.0
         }
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
             // Once: a second STOP or a SHUTDOWN during the stop only gets its answer.
-            if STOPPING.swap(true, Ordering::SeqCst) {
+            if STOPPING.load(Ordering::Acquire) {
                 return NO_ERROR.0;
             }
             report(SERVICE_STOP_PENDING);
-            // The handler answers first: ending the process inside it breaks the SCM's call, and
-            // `sc stop` or Restart-Service then report that the service cannot be stopped.
-            let stop = || {
-                log::line("service: stop");
-                std::thread::sleep(Duration::from_millis(100));
-                report(SERVICE_STOPPED);
-                std::process::exit(0);
-            };
-            if std::thread::Builder::new().name("index-stop".into()).spawn(stop).is_err() {
-                report(SERVICE_STOPPED);
-                std::process::exit(0);
-            }
+            STOPPING.store(true, Ordering::Release);
+            if let Some(notices) = NOTICES.get() { notices.stop.signal(); }
             NO_ERROR.0
         }
         SERVICE_CONTROL_INTERROGATE => NO_ERROR.0,
@@ -93,6 +77,14 @@ unsafe extern "system" fn service_main(_: u32, _: *mut PWSTR) {
             return;
         }
     }
+    let notices = match session::Notices::new() {
+        Ok(notices) => NOTICES.get_or_init(|| notices),
+        Err(e) => {
+            log::line(&format!("service: could not create worker events: {e}"));
+            report(SERVICE_STOPPED);
+            return;
+        }
+    };
     log::line("service: started");
     let filter = DEV_BROADCAST_DEVICEINTERFACE_W {
         dbcc_size: size_of::<DEV_BROADCAST_DEVICEINTERFACE_W>() as u32,
@@ -107,7 +99,12 @@ unsafe extern "system" fn service_main(_: u32, _: *mut PWSTR) {
             Err(e) => log::line(&format!("service: RegisterDeviceNotificationW: {e}")),
         }
     }
-    server::run(Some(&|| report(SERVICE_RUNNING)));
+    report(SERVICE_RUNNING);
+    if let Err(e) = session::supervise(&notices.stop, &STOPPING) {
+        log::line(&format!("service: worker supervisor failed: {e}"));
+    }
+    log::line("service: stop");
+    report(SERVICE_STOPPED);
 }
 
 pub fn dispatch() -> u32 {
@@ -131,21 +128,20 @@ impl Drop for Sc {
     }
 }
 
-fn stop(s: &Sc) {
+fn stop(s: &Sc) -> windows_core::Result<()> {
     let mut st = SERVICE_STATUS::default();
-    // SAFETY: control and status queries on an open service handle.
-    unsafe {
-        if ControlService(s.0, SERVICE_CONTROL_STOP, &mut st).is_err() {
-            return;
+    // SAFETY: control and status queries on an open service handle. A stop already in
+    // progress rejects another stop request, so wait for the actual state either way.
+    let _ = unsafe { ControlService(s.0, SERVICE_CONTROL_STOP, &mut st) };
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(10) {
+        unsafe { QueryServiceStatus(s.0, &mut st)? };
+        if st.dwCurrentState == SERVICE_STOPPED {
+            return Ok(());
         }
-        let t = Instant::now();
-        while t.elapsed() < Duration::from_secs(10) {
-            if QueryServiceStatus(s.0, &mut st).is_err() || st.dwCurrentState == SERVICE_STOPPED {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        std::thread::sleep(Duration::from_millis(100));
     }
+    Err(ERROR_TIMEOUT.into())
 }
 
 fn say(s: &str) {
@@ -171,7 +167,7 @@ pub fn install() -> u32 {
             let (svc, what) = match OpenServiceW(scm.0, &name, SERVICE_ALL_ACCESS) {
                 Ok(h) => {
                     let s = Sc(h);
-                    stop(&s);
+                    stop(&s)?;
                     ChangeServiceConfigW(s.0, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, &cmd, PCWSTR::null(), None, PCWSTR::null(), PCWSTR::null(), PCWSTR::null(), &display)?;
                     (s, "updated")
                 }
@@ -211,22 +207,27 @@ pub fn uninstall() -> u32 {
         (|| -> windows_core::Result<()> {
             let scm = Sc(OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ALL_ACCESS)?);
             let s = Sc(OpenServiceW(scm.0, &name, SERVICE_ALL_ACCESS)?);
-            stop(&s);
+            stop(&s)?;
             DeleteService(s.0)
         })()
     };
     match r {
         Ok(()) => {
             say(&format!("uninstall: service {} stopped and deleted", fsindex::SERVICE));
-            0
         }
         // Absent, or already deleted and waiting for its last handle: nothing left to do.
         Err(e) if e.code().0 as u32 & 0xffff == 1060 || e.code().0 as u32 & 0xffff == 1072 => {
             say(&format!("uninstall: service {} already gone ({e})", fsindex::SERVICE));
-            0
         }
         Err(e) => {
             say(&format!("uninstall: service {}: {e}", fsindex::SERVICE));
+            return 1;
+        }
+    }
+    match cache::clear() {
+        Ok(()) => 0,
+        Err(e) => {
+            say(&format!("uninstall: could not remove index snapshots: {e}"));
             1
         }
     }

@@ -4,6 +4,27 @@ use std::time::{Duration, Instant};
 pub const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const FAST_ATTEMPTS: u8 = 3;
+const SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+pub struct BackoffLog {
+    last: Option<Instant>,
+    count: usize,
+}
+
+impl BackoffLog {
+    pub fn backed_off(&mut self, count: usize) {
+        self.count += count;
+    }
+
+    pub fn summary(&mut self, now: Instant) -> Option<usize> {
+        if self.count == 0 || self.last.is_some_and(|last| now.duration_since(last) < SUMMARY_INTERVAL) {
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.count))
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct LinkRetry {
@@ -61,6 +82,18 @@ pub fn queue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_coalesces_backoff_transitions_within_one_interval() {
+        let now = Instant::now();
+        let mut log = BackoffLog::default();
+        log.backed_off(2);
+        assert_eq!(log.summary(now), Some(2));
+        log.backed_off(1);
+        assert_eq!(log.summary(now + RETRY_INTERVAL), None);
+        assert_eq!(log.summary(now + SUMMARY_INTERVAL), Some(1));
+        assert_eq!(log.summary(now + 2 * SUMMARY_INTERVAL), None);
+    }
 
     #[test]
     fn a_link_change_promotes_a_failed_rename_lookup() {
