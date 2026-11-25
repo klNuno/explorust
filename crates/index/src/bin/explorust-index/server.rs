@@ -1,7 +1,7 @@
 //! The index: one table per fixed NTFS volume, loaded from the MFT then kept current from the
 //! journal on a thread per volume, and the pipe that answers queries from them.
 
-use crate::cache::Cache;
+use crate::cache::{self, Cache};
 use crate::hydration::Hydration;
 use crate::{log, metadata, pipe, volume};
 use fsindex::fold;
@@ -13,8 +13,9 @@ use fsindex::table::{SnapshotCursor, SortKey, Table};
 use parking_lot::RwLock as VolumeLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use windows::Win32::Foundation::ERROR_INVALID_DATA;
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
-use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END};
 
 pub struct Vol {
     pub root: String,
@@ -59,7 +60,7 @@ fn load(v: &volume::Volume, cache: Option<&Cache>) -> windows_core::Result<Loade
         }
     }
     let journal = v.journal()?;
-    let cursor = SnapshotCursor { journal: journal.UsnJournalID, next: journal.NextUsn };
+    let cursor = SnapshotCursor { journal: journal.UsnJournalID, next: journal.NextUsn, boot: cache::boot() };
     let clock = Instant::now();
     let mft = v.load(cursor.next)?;
     let (n, bytes) = (mft.names.len(), mft.names.bytes());
@@ -74,22 +75,40 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
         let r = (|| -> windows_core::Result<windows_core::Error> {
             let v = volume::Volume::open(letter)?;
             let cache = Cache::for_volume(&v.device_path(), letter);
-            let Loaded { mft: volume::Mft { names, sequences, pruned }, position, cursor, fresh } = load(&v, cache.as_ref())?;
+            let Loaded { mft: volume::Mft { names, mut sequences, mut pruned }, mut position, mut cursor, fresh } = load(&v, cache.as_ref())?;
             let id = names.id();
-            let hydration = Hydration::publish(vol.table.clone(), names);
+            *vol.table.write() = names;
             if first {
                 let _ = loaded.send(());
                 first = false;
             }
-            // The first unscoped search can already read the table. Start mutations only
-            // once the snapshot has been written, so its cursor describes exactly these names.
-            if fresh && let Some(cache) = cache {
-                let clock = Instant::now();
-                match cache.save(&vol.table.read(), &sequences, &pruned, cursor) {
-                    Ok(()) => log::line(&format!("{letter}: MFT snapshot saved in {} ms", clock.elapsed().as_millis())),
-                    Err(e) => log::line(&format!("{letter}: could not save MFT snapshot: {e}")),
+            if let Some(cache) = cache {
+                if fresh {
+                    save(&cache, &vol.table, &sequences, &pruned, cursor, letter);
+                } else if !cursor.verified_in(cache::boot()) {
+                    // SAFETY: background mode lowers both CPU and I/O priority on this thread.
+                    let background = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) }.is_ok();
+                    let clock = Instant::now();
+                    let repaired = v.reconcile(&vol.table, &mut sequences, &mut pruned);
+                    if background {
+                        // SAFETY: this thread successfully entered background mode above.
+                        let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) };
+                    }
+                    repaired?;
+                    let journal = v.journal()?;
+                    cursor.next = position.next();
+                    if cursor.journal != journal.UsnJournalID || !(journal.FirstUsn.max(journal.LowestValidUsn)..=journal.NextUsn).contains(&cursor.next) {
+                        return Err(ERROR_INVALID_DATA.into());
+                    }
+                    position.clear_link_retries(&vol.table);
+                    log::line(&format!("{letter}: MFT reconciled: {} names in {} ms", vol.table.read().len(), clock.elapsed().as_millis()));
+                    // The old snapshot retains its boot identifier if the worker stops before
+                    // this atomic replacement. Any writes during the scan are replayed from next.
+                    cursor.boot = cache::boot();
+                    save(&cache, &vol.table, &sequences, &pruned, cursor, letter);
                 }
             }
+            let hydration = Hydration::watch(vol.table.clone());
             if !pruned.is_empty() {
                 match v.duplicate() {
                     Ok(handle) => links_later(letter, handle, pruned, vol.clone(), id),
@@ -119,6 +138,14 @@ fn keep(letter: char, vol: Arc<Vol>, loaded: std::sync::mpsc::Sender<()>) {
         // also invalidating the metadata and link jobs that still refer to its table ID.
         *vol.table.write() = Table::new();
         std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+fn save(cache: &Cache, table: &VolumeLock<Table>, sequences: &[u16], pruned: &[u64], cursor: SnapshotCursor, letter: char) {
+    let clock = Instant::now();
+    match cache.save(&table.read(), sequences, pruned, cursor) {
+        Ok(()) => log::line(&format!("{letter}: MFT snapshot saved in {} ms", clock.elapsed().as_millis())),
+        Err(e) => log::line(&format!("{letter}: could not save MFT snapshot: {e}")),
     }
 }
 

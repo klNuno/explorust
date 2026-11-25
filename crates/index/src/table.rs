@@ -24,6 +24,10 @@ mod snapshot;
 pub use snapshot::{Snapshot, SnapshotCursor};
 #[cfg(test)]
 mod bench;
+#[cfg(any(windows, test))]
+mod reconcile;
+#[cfg(any(windows, test))]
+pub use reconcile::reconcile;
 
 pub const SEP: u8 = b'\n';
 /// The root directory's MFT record number on NTFS.
@@ -338,6 +342,10 @@ impl Table {
     /// pruned tree does not replace a kept name outside it: a file with hard links on both sides
     /// keeps its outside one (the journal reports changes under either name).
     pub fn upsert(&mut self, rec: u32, parent: u32, name: &str, dir: bool, attrs_noisy: bool, modified: i64) {
+        self.upsert_record(rec, parent, name, dir, attrs_noisy, modified, true);
+    }
+
+    fn upsert_record(&mut self, rec: u32, parent: u32, name: &str, dir: bool, attrs_noisy: bool, modified: i64, respect_pruning: bool) {
         if rec == NONE || name.is_empty() || name.contains('\n') {
             return;
         }
@@ -346,7 +354,7 @@ impl Table {
             self.slots.resize(r + 1, self.compact_growth);
         }
         let old = self.slots.at(r);
-        if self.pruned_parent(parent) {
+        if respect_pruning && self.pruned_parent(parent) {
             if !dir && old.name != NONE && !self.walk_pruned(rec) {
                 self.set_modified(rec, modified);
                 return;

@@ -8,7 +8,7 @@ use std::io::{self, BufReader, BufWriter};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, HLOCAL, LocalFree, NTSTATUS};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
@@ -21,6 +21,42 @@ use windows::Win32::System::Ioctl::USN_JOURNAL_DATA_V0;
 use windows_core::{HSTRING, w};
 
 static DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+static BOOT: OnceLock<[u8; 16]> = OnceLock::new();
+
+// SystemBootEnvironmentInformation begins with a GUID for this Windows boot.
+const SYSTEM_BOOT_ENVIRONMENT_INFORMATION: u32 = 90;
+
+#[derive(Default)]
+#[repr(C)]
+struct BootEnvironment {
+    id: [u8; 16],
+    firmware: u32,
+    flags: u64,
+}
+
+windows_core::link!("ntdll.dll" "system" fn NtQuerySystemInformation(class: u32, info: *mut std::ffi::c_void, len: u32, written: *mut u32) -> NTSTATUS);
+
+pub fn boot() -> [u8; 16] {
+    *BOOT.get_or_init(|| {
+        let mut environment = BootEnvironment::default();
+        let mut written = 0;
+        // SAFETY: the buffer has the size and alignment of SYSTEM_BOOT_ENVIRONMENT_INFORMATION.
+        let status = unsafe {
+            NtQuerySystemInformation(
+                SYSTEM_BOOT_ENVIRONMENT_INFORMATION,
+                (&mut environment as *mut BootEnvironment).cast(),
+                size_of::<BootEnvironment>() as u32,
+                &mut written,
+            )
+        };
+        if status.0 >= 0 && written >= 16 && environment.id != [0; 16] {
+            environment.id
+        } else {
+            log::line("index: Windows boot identifier is unavailable; restored snapshots will be reconciled");
+            [0; 16]
+        }
+    })
+}
 
 fn path() -> io::Result<PathBuf> {
     Ok(std::env::current_exe()?.with_file_name("index-cache"))

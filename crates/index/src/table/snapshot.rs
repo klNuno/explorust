@@ -6,12 +6,21 @@ use bytemuck::{Pod, cast_slice, cast_slice_mut};
 use crc32fast::Hasher;
 use std::io::{self, Read, Write};
 
-const VERSION: &[u8; 8] = b"EXPMFT04";
+const VERSION: &[u8; 8] = b"EXPMFT05";
+const PREVIOUS_VERSION: &[u8; 8] = b"EXPMFT04";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotCursor {
     pub journal: u64,
     pub next: i64,
+    /// A zero identifier means the boot could not be identified.
+    pub boot: [u8; 16],
+}
+
+impl SnapshotCursor {
+    pub fn verified_in(self, boot: [u8; 16]) -> bool {
+        boot != [0; 16] && self.boot == boot
+    }
 }
 
 pub struct Snapshot {
@@ -118,6 +127,7 @@ impl Snapshot {
         out.bytes(VERSION)?;
         out.bytes(&cursor.journal.to_le_bytes())?;
         out.bytes(&cursor.next.to_le_bytes())?;
+        out.bytes(&cursor.boot)?;
         match &names.slots {
             Slots::Packed(slots) => {
                 out.bytes(&[0])?;
@@ -171,12 +181,14 @@ impl Snapshot {
             hash: Hasher::new(),
             remaining,
         };
-        if &input.word::<8>()? != VERSION {
+        let version = input.word::<8>()?;
+        if &version != VERSION && &version != PREVIOUS_VERSION {
             return Err(invalid());
         }
         let cursor = SnapshotCursor {
             journal: u64::from_le_bytes(input.word()?),
             next: i64::from_le_bytes(input.word()?),
+            boot: if &version == VERSION { input.word()? } else { [0; 16] },
         };
         if !usable(cursor) {
             return Ok(None);
@@ -263,19 +275,23 @@ mod tests {
         let cursor = SnapshotCursor {
             journal: 7,
             next: 42,
+            boot: [42; 16],
         };
         let mut bytes = Vec::new();
         Snapshot::write(&mut bytes, &names, cursor, &[7; 21], &[20]).unwrap();
         let read = |bytes: &[u8]| Snapshot::read_if(bytes, bytes.len() as u64, |c| c == cursor);
         let snapshot = read(&bytes).unwrap().unwrap();
         assert_eq!(snapshot.cursor, cursor);
+        assert!(snapshot.cursor.verified_in(cursor.boot));
+        assert!(!snapshot.cursor.verified_in([43; 16]));
+        assert!(!SnapshotCursor { boot: [0; 16], ..cursor }.verified_in([0; 16]));
         assert_eq!(snapshot.sequences, [7; 21]);
         assert_eq!(snapshot.pruned, [20]);
         assert_eq!(snapshot.names.state(20), crate::table::RecState::Pruned);
         assert_eq!(snapshot.names.path(18, "C:\\"), names.path(18, "C:\\"));
         assert_eq!(snapshot.names.query("été", 5), names.query("été", 5));
         assert!(
-            Snapshot::read_if(&bytes[..24], bytes.len() as u64, |_| false)
+            Snapshot::read_if(&bytes[..40], bytes.len() as u64, |_| false)
                 .unwrap()
                 .is_none()
         );
@@ -284,5 +300,13 @@ mod tests {
         assert!(read(&bytes[..last]).is_err());
         bytes[last] ^= 1;
         assert!(read(&bytes).is_err());
+
+        let mut legacy = bytes[..last - 3].to_vec();
+        legacy[..8].copy_from_slice(PREVIOUS_VERSION);
+        legacy.drain(24..40);
+        legacy.extend_from_slice(&crc32fast::hash(&legacy).to_le_bytes());
+        let previous = Snapshot::read_if(&legacy[..], legacy.len() as u64, |_| true).unwrap().unwrap();
+        assert!(!previous.cursor.verified_in(cursor.boot));
+        assert_eq!(previous.names.path(18, "C:\\"), names.path(18, "C:\\"));
     }
 }

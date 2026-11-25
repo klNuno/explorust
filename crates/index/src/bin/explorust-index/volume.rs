@@ -2,7 +2,7 @@
 
 use crate::retry::{self, BackoffLog, LinkRetry};
 use crate::{log, metadata};
-use fsindex::table::{RecState, Snapshot, Table};
+use fsindex::table::{RecState, Snapshot, Table, reconcile};
 use fsindex::usn::{self, Record};
 use parking_lot::{RwLock, RwLockWriteGuard};
 use std::collections::HashMap;
@@ -78,6 +78,17 @@ impl JournalPosition {
 
     pub fn changes(&self) -> u64 {
         self.changes
+    }
+
+    pub fn next(&self) -> i64 {
+        self.next
+    }
+
+    pub fn clear_link_retries(&mut self, table: &RwLock<Table>) {
+        let mut names = table.write();
+        for (rec, _) in self.retries.drain() {
+            names.finish_link_lookup(rec);
+        }
     }
 }
 
@@ -346,6 +357,23 @@ impl Volume {
             t.cover_mft_records(highest);
         }
         let mut seqs: Vec<u16> = Vec::new();
+        self.enumerate_mft(high, |bytes| usn::parse_mft(bytes, |_| true, |r| {
+            if let Some(i) = usize::try_from(r.rec).ok().filter(|&i| i < u32::MAX as usize) {
+                if seqs.len() <= i {
+                    seqs.resize(i + 1, 0);
+                }
+                seqs[i] = r.seq;
+            }
+            apply(&mut t, &r, 0)
+        }))?;
+        let pruned = t.settle();
+        t.shrink();
+        let files: Vec<u64> = t.take_pruned_files().into_iter().filter_map(|r| seqs.get(r as usize).map(|&seq| full_reference(r, seq))).collect();
+        log::line(&format!("{}: {pruned} names inside WinSxS left out ({} files)", self.letter, files.len()));
+        Ok(Mft { names: t, sequences: seqs, pruned: files })
+    }
+
+    fn enumerate_mft(&self, high: i64, mut batch: impl FnMut(&[u8]) -> bool) -> windows_core::Result<()> {
         let mut med = MFT_ENUM_DATA_V0 { StartFileReferenceNumber: 0, LowUsn: 0, HighUsn: high };
         let mut buf = vec![0u8; 1 << 20];
         loop {
@@ -354,25 +382,41 @@ impl Volume {
                 Err(e) if e.code() == ERROR_HANDLE_EOF.to_hresult() => break,
                 Err(e) => return Err(e),
             };
-            if got <= 8 {
-                break;
+            let next = u64::from_le_bytes(buf[..8].try_into().unwrap());
+            if got < 8 {
+                return Err(ERROR_INVALID_DATA.into());
             }
-            med.StartFileReferenceNumber = u64::from_le_bytes(buf[..8].try_into().unwrap_or_default());
-            usn::parse(&buf[8..got], |r| {
-                if let Some(i) = usize::try_from(r.rec).ok().filter(|&i| i < u32::MAX as usize) {
-                    if seqs.len() <= i {
-                        seqs.resize(i + 1, 0);
-                    }
-                    seqs[i] = r.seq;
+            if next & usn::MASK48 <= med.StartFileReferenceNumber & usn::MASK48 {
+                if got == 8 {
+                    break;
                 }
-                apply(&mut t, &r, 0)
-            });
+                return Err(ERROR_INVALID_DATA.into());
+            }
+            if !batch(&buf[8..got]) {
+                return Err(ERROR_INVALID_DATA.into());
+            }
+            med.StartFileReferenceNumber = next;
         }
-        let pruned = t.settle();
-        t.shrink();
-        let files: Vec<u64> = t.take_pruned_files().into_iter().filter_map(|r| seqs.get(r as usize).map(|&seq| full_reference(r, seq))).collect();
-        log::line(&format!("{}: {pruned} names inside WinSxS left out ({} files)", self.letter, files.len()));
-        Ok(Mft { names: t, sequences: seqs, pruned: files })
+        Ok(())
+    }
+
+    pub fn reconcile(&self, table: &RwLock<Table>, sequences: &mut Vec<u16>, pruned: &mut Vec<u64>) -> windows_core::Result<()> {
+        if let Some(highest) = self.highest_mft_record() {
+            table.write().cover_mft_records(highest);
+        }
+        let mut records = Vec::new();
+        reconcile(table, sequences, pruned, |dirs, apply| self.reconcile_pass(dirs, &mut records, apply))
+    }
+
+    fn reconcile_pass(&self, dirs: bool, records: &mut Vec<Record>, apply: &mut dyn FnMut(&[Record])) -> windows_core::Result<()> {
+        self.enumerate_mft(i64::MAX, |bytes| {
+            records.clear();
+            if !usn::parse_mft(bytes, |attrs| (attrs & usn::ATTR_DIRECTORY != 0) == dirs, |record| records.push(record)) {
+                return false;
+            }
+            apply(records);
+            true
+        })
     }
 
     /// Apply the closed interval since the snapshot before publishing any of its names.
@@ -443,13 +487,13 @@ impl Volume {
             let parent = r.parent.min(u32::MAX as u64) as u32;
             let frn = full_reference(rec, r.seq);
             let deleted = r.reason & usn::REASON_FILE_DELETE != 0;
+            let directory = r.attrs & usn::ATTR_DIRECTORY != 0;
+            let moved = r.reason & (usn::REASON_FILE_DELETE | usn::REASON_RENAME_NEW_NAME) != 0;
+            // A pruned directory moved into view has descendants whose names we never kept.
+            if directory && moved && t.pruned_parent(rec) && !t.pruned_parent(parent) {
+                return Err(ERROR_INVALID_DATA.into());
+            }
             if let Some(replay) = replay.as_deref_mut() {
-                let directory = r.attrs & usn::ATTR_DIRECTORY != 0;
-                let moved = r.reason & (usn::REASON_FILE_DELETE | usn::REASON_RENAME_NEW_NAME) != 0;
-                // The cache has no descendants of a pruned directory moved back into view.
-                if directory && moved && t.pruned_parent(rec) && !t.pruned_parent(parent) {
-                    return Err(ERROR_INVALID_DATA.into());
-                }
                 replay.resettle |= directory;
                 let slot = rec as usize;
                 if replay.sequences.len() <= slot {
@@ -550,7 +594,10 @@ impl Volume {
             if got > 8 {
                 match self.changes(&buf[8..got], table, &mut retries, None) {
                     Ok(applied) => changes += applied,
-                    Err(e) => return e,
+                    Err(e) => {
+                        table.write().journal_current = false;
+                        return e;
+                    }
                 }
             } else if !caught_up {
                 table.write().journal_current = true;
@@ -630,7 +677,7 @@ mod tests {
         fs::write(&delete, b"delete").unwrap();
 
         let journal = volume.journal().unwrap();
-        let cursor = SnapshotCursor { journal: journal.UsnJournalID, next: journal.NextUsn };
+        let cursor = SnapshotCursor { journal: journal.UsnJournalID, next: journal.NextUsn, boot: [1; 16] };
         let mft = volume.load(cursor.next).unwrap();
         let mut bytes = Vec::new();
         Snapshot::write(&mut bytes, &mft.names, cursor, &mft.sequences, &mft.pruned).unwrap();
@@ -655,6 +702,70 @@ mod tests {
             let query = absent.file_name().unwrap().to_str().unwrap();
             assert!(loaded.names.query(query, 10).is_empty());
         }
+    }
+
+    #[test]
+    fn mft_repairs_provisional_names_and_keeps_writes_during_the_scan() {
+        let volume = Volume::open('C').unwrap();
+        let dir = std::env::temp_dir().join(format!("explorust-mft-reconcile-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let fixture = Fixture(dir);
+        let actual = fixture.0.join("current-mft-name.txt");
+        let concurrent = fixture.0.join("concurrent-mft-name.txt");
+        let created = fixture.0.join("created-during-mft.txt");
+        let deleted = fixture.0.join("deleted-during-mft.txt");
+        fs::write(&actual, b"actual").unwrap();
+        fs::write(&deleted, b"delete").unwrap();
+        let rec = file_reference(&File::open(&actual).unwrap()) as u32;
+        let parent = file_reference(&OpenOptions::new().read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0).open(&fixture.0).unwrap()) as u32;
+
+        let journal = volume.journal().unwrap();
+        let boot = crate::cache::boot();
+        assert_ne!(boot, [0; 16]);
+        let mut prior_boot = boot;
+        prior_boot[0] ^= 1;
+        let mut cursor = SnapshotCursor { journal: journal.UsnJournalID, next: journal.NextUsn, boot: prior_boot };
+        let Mft { mut names, mut sequences, mut pruned } = volume.load(cursor.next).unwrap();
+        names.upsert(rec, parent, "offline-stale-name.txt", false, false, 0);
+        names.compact();
+        let mut previous = Vec::new();
+        Snapshot::write(&mut previous, &names, cursor, &sequences, &pruned).unwrap();
+        drop(names);
+        let read = |bytes: &[u8]| Snapshot::read_if(bytes, bytes.len() as u64, |_| true).unwrap().unwrap();
+        let provisional = read(&previous);
+        assert!(!provisional.cursor.verified_in(boot));
+        assert_eq!(provisional.names.name(rec).as_deref(), Some("offline-stale-name.txt"));
+
+        let table = RwLock::new(provisional.names);
+        let mut records = Vec::new();
+        reconcile(&table, &mut sequences, &mut pruned, |dirs, apply| {
+            volume.reconcile_pass(dirs, &mut records, apply)?;
+            if !dirs {
+                // These writes are after this part of the MFT was read, before marking the
+                // snapshot verified. Only the saved USN cursor can recover them.
+                fs::rename(&actual, &concurrent).unwrap();
+                fs::write(&created, b"create").unwrap();
+                fs::remove_file(&deleted).unwrap();
+            }
+            assert!(!read(&previous).cursor.verified_in(boot));
+            Ok::<_, windows_core::Error>(())
+        }).unwrap();
+        let names = table.into_inner();
+        assert_eq!(names.name(rec).as_deref(), Some("current-mft-name.txt"));
+        assert!(!names.journal_current);
+
+        cursor.boot = boot;
+        let mut verified = Vec::new();
+        Snapshot::write(&mut verified, &names, cursor, &sequences, &pruned).unwrap();
+        drop(names);
+        let snapshot = read(&verified);
+        assert!(snapshot.cursor.verified_in(boot));
+        let (updated, position) = volume.replay(snapshot).unwrap();
+        assert!(position.changes() >= 3);
+        assert_eq!(updated.names.name(rec).as_deref(), Some("concurrent-mft-name.txt"));
+        assert_eq!(updated.names.query("created-during-mft.txt", 1).len(), 1);
+        assert!(updated.names.query("deleted-during-mft.txt", 1).is_empty());
     }
 
     #[test]

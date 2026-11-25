@@ -39,7 +39,17 @@ pub const MASK48: u64 = (1 << 48) - 1;
 
 /// Parses the records of `buf` (without the cursor); stops at the first malformed one and
 /// skips records of another major version.
-pub fn parse(buf: &[u8], mut f: impl FnMut(Record)) {
+pub fn parse(buf: &[u8], f: impl FnMut(Record)) {
+    parse_records(buf, false, |_| true, f);
+}
+
+/// A complete MFT enumeration is used to prove absence. Reject an incomplete or unsupported
+/// record rather than silently turning it into a deletion.
+pub fn parse_mft(buf: &[u8], select: impl Fn(u32) -> bool, f: impl FnMut(Record)) -> bool {
+    parse_records(buf, true, select, f)
+}
+
+fn parse_records(buf: &[u8], strict: bool, select: impl Fn(u32) -> bool, mut f: impl FnMut(Record)) -> bool {
     let mut o = 0usize;
     while o + 60 <= buf.len() {
         let Some(len) = u32_at(buf, o).map(|l| l as usize) else { break };
@@ -54,13 +64,20 @@ pub fn parse(buf: &[u8], mut f: impl FnMut(Record)) {
                 break;
             };
             let (nl, no) = (nl as usize, no as usize);
-            if no + nl <= len {
+            if no < 60 || nl % 2 != 0 || no + nl > len {
+                if strict {
+                    return false;
+                }
+            } else if select(attrs) {
                 let units: Vec<u16> = r[no..no + nl].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
                 f(Record { rec: frn & MASK48, seq: (frn >> 48) as u16, parent: parent & MASK48, usn: usn as i64, reason, attrs, name: String::from_utf16_lossy(&units) });
             }
+        } else if strict {
+            return false;
         }
         o += len;
     }
+    o == buf.len()
 }
 
 /// Builds one V2 record, for tests and the bench.
@@ -86,6 +103,15 @@ pub fn encode(rec: u64, parent: u64, usn: i64, reason: u32, attrs: u32, name: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mft_reader_requires_a_complete_supported_batch() {
+        let mut record = encode(40, 5, 0, 0, ATTR_DIRECTORY, "Projects");
+        assert!(parse_mft(&record, |_| false, |_| panic!("filtered")));
+        assert!(!parse_mft(&record[..record.len() - 1], |_| true, |_| {}));
+        record[4] = 3;
+        assert!(!parse_mft(&record, |_| true, |_| {}));
+    }
 
     #[test]
     fn round_trip() {

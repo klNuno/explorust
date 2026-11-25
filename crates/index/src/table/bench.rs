@@ -9,6 +9,35 @@ mod snapshot;
 #[test]
 #[ignore = "release benchmark with 7 million names"]
 fn seven_million_names() {
+    let count = 7_000_000u32;
+    let mut table = Table::new();
+    let begin = Instant::now();
+    table.upsert(ROOT, ROOT, ".", true, false, 0);
+    for i in 0..count - 2 {
+        let (rec, parent, name, dir) = synthetic_name(i);
+        // Unhydrated files retain zero. The rest span several years at FILETIME precision.
+        let modified = if dir || i % 13 == 0 {
+            0
+        } else {
+            133_138_374_000_000_000 + i64::from(i) * 234_567_891
+        };
+        table.upsert(rec, parent, &name, dir, i % 91 == 0, modified);
+    }
+    let needle = "uniquenarrowneedle";
+    let known = 16 + count + count / 27;
+    table.upsert(known, ROOT, &format!("human-{needle}.txt"), false, false, 0);
+    let built = begin.elapsed();
+    table.settle();
+    table.shrink();
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("EXPLORUST_RECONCILE_BENCH").is_some() {
+        snapshot::reconcile_names(table, count, known, needle);
+        return;
+    }
+    benchmark_queries(table, begin, built, count, known, needle);
+}
+
+fn synthetic_name(i: u32) -> (u32, u32, String, bool) {
     let vocabulary = [
         "report",
         "setup",
@@ -28,43 +57,28 @@ fn seven_million_names() {
         "packed",
     ];
     let extensions = ["txt", "dll", "png", "json", "exe", "md", "rs", "mp4"];
-    let count = 7_000_000u32;
-    let mut table = Table::new();
-    let begin = Instant::now();
-    table.upsert(ROOT, ROOT, ".", true, false, 0);
-    for i in 0..count - 2 {
-        let rec = 16 + i + i / 27;
-        let word = vocabulary[i as usize % vocabulary.len()];
-        let dir = i < 140_000;
-        let parent = if i < 32 {
-            ROOT
-        } else if dir {
-            16 + i / 9 + i / 9 / 27
-        } else {
-            let folder = (i.wrapping_mul(18371) % 139_968) + 32;
-            16 + folder + folder / 27
-        };
-        let name = if dir {
-            format!("{word} folder {i}")
-        } else {
-            let suffix = vocabulary[(i >> 9) as usize % vocabulary.len()];
-            let ext = extensions[((i >> 5) ^ i) as usize % extensions.len()];
-            format!("{word}_{suffix}-{i}.{ext}")
-        };
-        // Unhydrated files retain zero. The rest span several years at FILETIME precision.
-        let modified = if dir || i % 13 == 0 {
-            0
-        } else {
-            133_138_374_000_000_000 + i64::from(i) * 234_567_891
-        };
-        table.upsert(rec, parent, &name, dir, i % 91 == 0, modified);
-    }
-    let needle = "uniquenarrowneedle";
-    let known = 16 + count + count / 27;
-    table.upsert(known, ROOT, &format!("human-{needle}.txt"), false, false, 0);
-    let built = begin.elapsed();
-    table.settle();
-    table.shrink();
+    let rec = 16 + i + i / 27;
+    let word = vocabulary[i as usize % vocabulary.len()];
+    let dir = i < 140_000;
+    let parent = if i < 32 {
+        ROOT
+    } else if dir {
+        16 + i / 9 + i / 9 / 27
+    } else {
+        let folder = (i.wrapping_mul(18371) % 139_968) + 32;
+        16 + folder + folder / 27
+    };
+    let name = if dir {
+        format!("{word} folder {i}")
+    } else {
+        let suffix = vocabulary[(i >> 9) as usize % vocabulary.len()];
+        let ext = extensions[((i >> 5) ^ i) as usize % extensions.len()];
+        format!("{word}_{suffix}-{i}.{ext}")
+    };
+    (rec, parent, name, dir)
+}
+
+fn benchmark_queries(mut table: Table, begin: Instant, built: std::time::Duration, count: u32, known: u32, needle: &str) {
     table.journal_current = true;
     table.finish_initial_links();
     assert_eq!(table.len(), count as usize);
