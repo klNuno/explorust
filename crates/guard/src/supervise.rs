@@ -406,7 +406,10 @@ pub fn explorer_path() -> PathBuf {
 /// ends. A start that fails (no process, no taskbar within 60 s, or a taskbar that lives under 30 s)
 /// counts; after 3 in a row the user is told once how to start it by hand, and the guard keeps
 /// trying, waiting longer between tries (up to a minute). `notice` shows once a taskbar answers.
+/// The escape hotkey is released first.
 fn explorer_forever(notice: Option<Notice>) -> u32 {
+    // Explorer has its own shortcuts: the escape to it has no use now and is given back.
+    hotkey::release();
     let release = Event::named(RELEASE_EXPLORER).ok();
     let _handoff = Event::named(WATCHES_EXPLORER_HANDOFF).ok();
     folders::handler(false);
