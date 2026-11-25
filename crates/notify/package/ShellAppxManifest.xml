@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap3 uap10 rescap">
+  <Identity Name="explorust.shell" Publisher="CN=explorust local code signing" Version="1.0.0.0" ProcessorArchitecture="x64"/>
+  <Properties>
+    <DisplayName>explorust</DisplayName>
+    <PublisherDisplayName>explorust</PublisherDisplayName>
+    <Logo>logo-large.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+  <Resources>
+    <Resource Language="en-us"/>
+  </Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26300.0"/>
+  </Dependencies>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust"/>
+    <uap3:Capability Name="userNotificationListener"/>
+  </Capabilities>
+  <Applications>
+    <Application Id="shell" Executable="explorust.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements AppListEntry="none" DisplayName="explorust" Description="explorust shell"
+        BackgroundColor="transparent" Square150x150Logo="logo-large.png" Square44x44Logo="logo.png"/>
+    </Application>
+    <Application Id="guard" Executable="explorust-supervisor.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements AppListEntry="none" DisplayName="explorust" Description="explorust guard"
+        BackgroundColor="transparent" Square150x150Logo="logo-large.png" Square44x44Logo="logo.png"/>
+    </Application>
+    <Application Id="keys" Executable="explorust-keys.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements AppListEntry="none" DisplayName="explorust keys" Description="explorust keyboard shortcuts"
+        BackgroundColor="transparent" Square150x150Logo="logo-large.png" Square44x44Logo="logo.png"/>
+    </Application>
+    <Application Id="notify" Executable="explorust-notify.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements AppListEntry="none" DisplayName="explorust notifications" Description="explorust notification listener"
+        BackgroundColor="transparent" Square150x150Logo="logo-large.png" Square44x44Logo="logo.png"/>
+    </Application>
+  </Applications>
+</Package>

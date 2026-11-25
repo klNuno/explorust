@@ -1,6 +1,7 @@
 //! Names shared by the session supervisor, setup and the standalone switch.
 
 pub const SWITCH_EXE: &str = "explorust-switch.exe";
+pub const BOOTSTRAP_ACTIVE: &str = r"Local\explorust-bootstrap-active";
 pub const GUARD_MUTEX: &str = r"Local\explorust-guard";
 pub const RELEASE_EXPLORER: &str = r"Local\explorust-guard-release-explorer";
 pub const WATCHES_EXPLORER_HANDOFF: &str = r"Local\explorust-guard-watches-explorer-handoff";

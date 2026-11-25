@@ -188,6 +188,10 @@ impl Watcher {
         }
     }
 
+    pub(super) fn rollback_event(&self) -> &Event {
+        &self.signals.rollback
+    }
+
     pub fn accept(&self) -> Result<(), String> {
         self.signals.accepted.signal()?;
         if wait_any(&[self.signals.completed.0, self.child.handle], Some(5_000)) == Some(0) {

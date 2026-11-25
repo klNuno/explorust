@@ -7,6 +7,4 @@ build = "../guard/build.rs"
 
 [dependencies]
 guard = { path = "../guard" }
-windows = { workspace = true, features = [
-  "Win32_System_Diagnostics_ToolHelp",
-] }
+windows = { workspace = true }

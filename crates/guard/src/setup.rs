@@ -69,8 +69,8 @@ pub fn run() -> u32 {
         Icon::Shield,
         tr("Installer explorust ?", "Install explorust?"),
         tr(
-            "explorust remplace la barre des tâches, le menu Démarrer et l'Explorateur de Windows.\n\nAu moindre problème, Windows reprend la main tout seul. Pour revenir à Windows à tout moment : Ctrl+Alt+Maj+F12, ou menu Démarrer > explorust > Revenir à Windows.",
-            "explorust replaces the Windows taskbar, Start menu and File Explorer.\n\nAt the first problem, Windows takes over by itself. To go back to Windows at any time: Ctrl+Alt+Shift+F12, or Start > explorust > Back to Windows.",
+            "explorust remplace la barre des tâches, le menu Démarrer et l'Explorateur de Windows. À la première installation, vous l'autorisez à lire les notifications Windows pour les afficher.\n\nAu moindre problème, Windows reprend la main tout seul. Pour revenir à Windows à tout moment : Ctrl+Alt+Maj+F12, ou menu Démarrer > explorust > Revenir à Windows.",
+            "explorust replaces the Windows taskbar, Start menu and File Explorer. On first install, you allow it to read Windows notifications so it can display them.\n\nAt the first problem, Windows takes over by itself. To go back to Windows at any time: Ctrl+Alt+Shift+F12, or Start > explorust > Back to Windows.",
         ),
         &[(INSTALL, go)],
         true,

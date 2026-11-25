@@ -60,15 +60,10 @@ pub fn run(parent: u32, hwnd: isize) -> i32 {
     code
 }
 
-/// The helper's application in the sparse package of `crates/notify/package` (family name from
-/// its name and unsigned publisher).
-pub const AUMID: &str = "explorust.notify_m23m5a37cevzy!notify";
+const LEGACY_AUMID: &str = "explorust.notify_m23m5a37cevzy!notify";
 
 /// Starts the helper with package identity: activated through its AUMID, so the package's
-/// external location (the folder of explorust-notify.exe) decides which exe runs. Windows' side by
-/// side loader refuses the unsigned publisher in an exe manifest's `msix` element ("The msix
-/// publisher must be valid according to MSIX packaging rules", SideBySide event, 26300.9974), so
-/// a direct start can never give it the identity. Returns its process handle, or None when it is
+/// external location decides which exe runs. Returns its process handle, or None when it is
 /// turned off (`EXPLORUST_NOTIFY_HELPER=0`), the package is missing or it did not start.
 pub fn start(target: HWND) -> Option<HANDLE> {
     if std::env::var("EXPLORUST_NOTIFY_HELPER").as_deref() == Ok("0") {
@@ -77,17 +72,17 @@ pub fn start(target: HWND) -> Option<HANDLE> {
     }
     let args = format!("--parent {} --hwnd {}", std::process::id(), target.0 as isize);
     let t0 = std::time::Instant::now();
-    let pid = match activate(&args) {
-        Ok(pid) => pid,
+    let (pid, aumid) = match activate(&args) {
+        Ok(result) => result,
         Err(e) => {
-            log::line(&format!("listener: {AUMID} not activated: {e}"));
+            log::line(&format!("listener: {EXE} not activated: {e}"));
             return None;
         }
     };
     // SAFETY: a handle to wait on the helper; closed by nobody, it lives as long as we watch it.
     match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) } {
         Ok(h) => {
-            log::line(&format!("listener: {EXE} activated as {AUMID}, pid {pid}, in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
+            log::line(&format!("listener: {EXE} activated as {aumid}, pid {pid}, in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
             Some(h)
         }
         Err(e) => {
@@ -97,14 +92,19 @@ pub fn start(target: HWND) -> Option<HANDLE> {
     }
 }
 
-pub fn activate(args: &str) -> windows_core::Result<u32> {
+pub fn activate(args: &str) -> windows_core::Result<(u32, &'static str)> {
+    use crate::msix_identity::{self, NOTIFY_AUMID};
     use windows::Win32::System::Com::{CLSCTX_LOCAL_SERVER, CoCreateInstance};
     use windows::Win32::UI::Shell::{AO_NOERRORUI, ApplicationActivationManager, IApplicationActivationManager};
     use windows_core::HSTRING;
     // SAFETY: plain COM activation and one call with owned strings.
     unsafe {
         let m: IApplicationActivationManager = CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
-        m.ActivateApplication(&HSTRING::from(AUMID), &HSTRING::from(args), AO_NOERRORUI)
+        let args = HSTRING::from(args);
+        let start = |aumid| m.ActivateApplication(&HSTRING::from(aumid), &args, AO_NOERRORUI).map(|pid| (pid, aumid));
+        start(NOTIFY_AUMID).or_else(|error| {
+            if msix_identity::require().is_ok() { Err(error) } else { start(LEGACY_AUMID) }
+        })
     }
 }
 

@@ -190,9 +190,9 @@ fn switch(
         if Event::is_signalled(CANCEL_FOR_RESTORE) {
             return Err("turning off explorust before starting the new shell".into());
         }
-        let supervisor = Child::spawn(guard, &format!("--live {worker_pid} {stamp}"))?;
-        log::line(&format!("switch: guard pid {} took over the session", supervisor.pid));
-        wait_for_verdict(exe, &supervisor)?;
+        let guard_process = Child::spawn(guard, &format!("--live {worker_pid} {stamp}"))?;
+        log::line(&format!("switch: guard pid {} took over the session", guard_process.pid));
+        wait_for_verdict(exe, &guard_process, watcher.rollback_event())?;
         watcher.accept()?;
         Ok(Outcome::Running)
     });
@@ -288,7 +288,7 @@ fn previous_guard(explorer: u32, guard: &Path) -> Result<Option<PreviousGuard>, 
     }
     // Old builds have no handoff event. Keep a handle to the verified Explorer parent while it
     // still exists. This handle identifies the process even if its PID is reused.
-    let parent = explorer::processes("explorer.exe")?
+    let parent = guard::processes::in_session("explorer.exe")?
         .into_iter()
         .find(|process| process.pid == explorer)
         .ok_or("Explorer exited while checking its previous guard")?
@@ -340,7 +340,7 @@ fn release_retiring_guard(explorer: u32, guard: &Path) -> Result<(), String> {
     release_previous_guard(previous)
 }
 
-fn wait_for_verdict(exe: &Path, supervisor: &Child) -> Result<(), String> {
+fn wait_for_verdict(exe: &Path, supervisor: &Child, rollback: &Event) -> Result<(), String> {
     let started = Instant::now();
     loop {
         if Event::is_signalled(CANCEL_FOR_RESTORE) {
@@ -350,7 +350,7 @@ fn wait_for_verdict(exe: &Path, supervisor: &Child) -> Result<(), String> {
             let _ = Event::set_existing(FALLBACK_EVENT);
             return Err(format!("Explorer pid {pid} took back the taskbar"));
         }
-        if supervisor.ended() {
+        if supervisor.ended() || rollback.signalled() {
             return Err("supervision ended before the build verdict".into());
         }
         if !Event::is_signalled(FALLBACK_EVENT)

@@ -7,7 +7,7 @@ settle=${1:-60}
 os win run g1 -- shutdown /r /t 0 >/dev/null 2>&1
 sleep 45
 for i in $(seq 1 40); do
-  if os win run g1 --ps -- 'if (Get-Process explorust-guard,explorer -EA SilentlyContinue) { "SHELLUP" }' 2>&1 | grep -q SHELLUP; then
+  if os win run g1 --ps -- 'if (Get-Process explorust-guard,explorust-supervisor,explorer -EA SilentlyContinue) { "SHELLUP" }' 2>&1 | grep -q SHELLUP; then
     echo "shell process up after $((45 + (i - 1) * 20)) s or so"
     break
   fi

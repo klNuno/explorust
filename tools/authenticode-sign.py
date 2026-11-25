@@ -7,6 +7,7 @@ signature, so it is signed here with a self-signed code-signing certificate that
 
   tools/authenticode-sign.py keygen         make the key and certificate if they are missing
   tools/authenticode-sign.py sign <exe>...  sign PE files in place (SHA-256, no timestamp)
+  tools/authenticode-sign.py sign-msix <unsigned.msix> <signed.msix>
 
 The private key stays out of git in .agents/keys/ (EXPLORUST_SIGN_KEY overrides the path); the
 public certificate is crates/guard/res/explorust-codesign.cer, embedded in the guard.
@@ -242,6 +243,15 @@ def main():
         cert = open(CER, "rb").read()
         for p in sys.argv[2:]:
             sign(p, cert)
+    elif len(sys.argv) == 4 and sys.argv[1] == "sign-msix":
+        with tempfile.TemporaryDirectory() as scratch:
+            cert = os.path.join(scratch, "cert.pem")
+            openssl("x509", "-inform", "DER", "-in", CER, "-out", cert)
+            signer = os.environ.get("OSSLSIGNCODE", "osslsigncode")
+            subprocess.run([
+                signer, "sign", "-h", "sha256", "-certs", cert, "-key", KEY,
+                "-in", sys.argv[2], "-out", sys.argv[3],
+            ], check=True)
     else:
         raise SystemExit(__doc__)
 

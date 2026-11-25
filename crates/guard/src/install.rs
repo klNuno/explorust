@@ -26,14 +26,18 @@ const STORES: [&str; 2] = ["Root", "TrustedPublisher"];
 /// some host builds start beside explorust.exe, the toast listener's helper with its sparse
 /// package (`package.rs`), the UI-access keyboard hook, the file index service and the default
 /// handlers (image viewer, Task Manager for Win+X).
-const FILES: [&str; 13] = [
-    "explorust-guard.exe",
+pub const GUARD_EXE: &str = "explorust-guard.exe";
+pub const SUPERVISOR_EXE: &str = "explorust-supervisor.exe";
+const FILES: [&str; 15] = [
+    GUARD_EXE,
+    SUPERVISOR_EXE,
     crate::switch_events::SWITCH_EXE,
     "explorust.exe",
     "explorust-open.exe",
     "nickel-windows-app-probe.exe",
     "explorust-notify.exe",
     crate::package::MSIX,
+    crate::package::LEGACY_MSIX,
     "explorust-keys.exe",
     "explorust_inject.dll",
     INDEX,
@@ -41,6 +45,7 @@ const FILES: [&str; 13] = [
     "explorust-taskman.exe",
     crate::apps::SETTINGS_EXE,
 ];
+
 /// The MFT/USN index (`crates/index`), registered as the service `explorust-index`.
 const INDEX: &str = "explorust-index.exe";
 const SERVICE: &str = "explorust-index";
@@ -79,11 +84,13 @@ pub fn system32() -> PathBuf {
 /// Every file is first copied into a staging folder beside the live one and checked; only then are
 /// the live files swapped one by one (a rename on the same volume), and a failed swap puts every
 /// earlier file back, so a full disk or a broken payload leaves the installed version working.
-pub fn copy_files(from: &Path) -> Result<PathBuf, String> {
+pub fn copy_files(from: &Path, activate: impl FnOnce(&Path) -> Result<(), String>) -> Result<PathBuf, String> {
     let to = dir();
+    let guard = to.join(GUARD_EXE);
     std::fs::create_dir_all(&to).map_err(|e| format!("create {}: {e}", to.display()))?;
     if same_dir(from, &to) {
-        return Ok(to.join(FILES[0]));
+        activate(&guard)?;
+        return Ok(guard);
     }
     clean_leftovers(&to);
     let stage = to.join(format!(".new-{}", std::process::id()));
@@ -112,16 +119,16 @@ pub fn copy_files(from: &Path) -> Result<PathBuf, String> {
         match result {
             Ok(aside) => swapped.push((dst, aside)),
             Err(e) => {
-                for (d, a) in swapped.iter().rev() {
-                    let _ = std::fs::remove_file(d);
-                    if let Some(a) = a {
-                        let _ = std::fs::rename(a, d);
-                    }
-                }
+                rollback_files(&swapped);
                 let _ = std::fs::remove_dir_all(&stage);
                 return Err(format!("{e}; the previous files are back"));
             }
         }
+    }
+    if let Err(error) = activate(&guard) {
+        rollback_files(&swapped);
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(error);
     }
     for (_, aside) in swapped {
         if let Some(a) = aside {
@@ -130,7 +137,25 @@ pub fn copy_files(from: &Path) -> Result<PathBuf, String> {
     }
     let _ = std::fs::remove_dir_all(&stage);
     log::line(&format!("install: {} files swapped in {}", names.len(), to.display()));
-    Ok(to.join(FILES[0]))
+    Ok(guard)
+}
+
+fn rollback_files(swapped: &[(PathBuf, Option<PathBuf>)]) {
+    for (live, previous) in swapped.iter().rev() {
+        if std::fs::remove_file(live).is_err() && live.exists() {
+            let abandoned = live.with_extension(format!("del{}-rollback", std::process::id()));
+            if let Err(error) = std::fs::rename(live, &abandoned) {
+                log::line(&format!("install: rollback could not move {}: {error}", live.display()));
+                continue;
+            }
+            discard(&abandoned);
+        }
+        if let Some(previous) = previous
+            && let Err(error) = std::fs::rename(previous, live)
+        {
+            log::line(&format!("install: rollback could not restore {}: {error}", live.display()));
+        }
+    }
 }
 
 /// Copies the payload into `stage` and checks each copy's size; returns the names copied.
@@ -139,7 +164,10 @@ fn stage_files(from: &Path, stage: &Path) -> Result<Vec<&'static str>, String> {
     for name in FILES {
         let src = from.join(name);
         if !src.exists() {
-            if name == "explorust.exe" || name == "explorust-guard.exe" {
+            if matches!(name, "explorust.exe" | GUARD_EXE)
+                || (option_env!("EXPLORUST_PACKAGE_BUILD").is_some()
+                    && matches!(name, SUPERVISOR_EXE | "explorust-keys.exe" | "explorust-notify.exe" | crate::package::MSIX))
+            {
                 return Err(format!("{} missing", src.display()));
             }
             continue;
