@@ -52,6 +52,11 @@ pub fn spawn(target: HWND) {
 }
 
 fn listen(target: HWND) {
+    let packaged = crate::msix_identity::require().is_ok();
+    // WinRT can report Allowed for this desktop process despite a per-package denial.
+    if packaged && super::system::shell_notification_access_denied() {
+        return log::line("listener: access denied by the shell package consent");
+    }
     // SAFETY: COM for this thread, MTA: WinRT events arrive on worker threads.
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     let t0 = std::time::Instant::now();
@@ -61,12 +66,20 @@ fn listen(target: HWND) {
     };
     let access = listener.GetAccessStatus().unwrap_or(UserNotificationListenerAccessStatus::Unspecified);
     log::line(&format!("listener: access {:?}", access.0));
+    if access == UserNotificationListenerAccessStatus::Denied {
+        return;
+    }
     if access != UserNotificationListenerAccessStatus::Allowed {
         match listener.RequestAccessAsync().and_then(|op| op.join()) {
             Ok(a) if a == UserNotificationListenerAccessStatus::Allowed => log::line("listener: access granted"),
             Ok(a) => return log::line(&format!("listener: access denied ({}), turn on notification access for desktop apps", a.0)),
             Err(e) => return log::line(&format!("listener: access request failed: {e}")),
         }
+    }
+    // The installed session uses the dedicated listener even though the shell also has identity.
+    // That keeps the WNS subscription and its COM lifetime in the helper.
+    if packaged {
+        return watch(&listener, target);
     }
     let at_start: Vec<u32> = listener
         .GetNotificationsAsync(NotificationKinds::Toast)

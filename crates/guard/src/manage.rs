@@ -68,48 +68,34 @@ pub fn install() -> u32 {
     // Anything already there (even a damaged install other accounts may use) is not undone on a
     // failure: only a machine with no trace of explorust is.
     let fresh = !install::dir().exists() && !reg::has_uninstall_entry() && reg::machine_users().is_empty();
-    let guard = if elevated {
-        match machine_install(&from) {
-            Ok(g) => g,
-            Err(e) => {
-                say(&format!("install failed: {e}"));
-                if fresh {
-                    undo_machine();
-                }
-                return FAILED;
-            }
-        }
+    let packaged = option_env!("EXPLORUST_PACKAGE_BUILD").is_some();
+    let result = if elevated {
+        machine_install(&from, packaged)
+    } else if packaged {
+        Err("the signed shell needs an elevated install into Program Files".into())
     } else {
         say("install: not elevated, so no Program Files copy: a uiAccess build will not start from here");
-        me.clone()
+        set_shell(&me, false).map(|()| me)
     };
-    let dir = guard.parent().map(Path::to_path_buf).unwrap_or_default();
-    // The toast listener's identity; explorust runs without it (it polls), so a failure only warns.
-    match package::add(&from, &dir) {
-        Ok(p) => say(&format!("install: notification helper package {p}, external location {}", dir.display())),
-        Err(e) => say(&format!("install: notification helper package not installed ({e}); toasts are polled")),
-    }
-    folders::viewer(&dir, true);
-    // The users list keeps the shared files while any account still starts the guard: without this
-    // account in it, an uninstall from another account could remove them under it.
-    let owner = if elevated {
-        match account::own_sid() {
-            Some(sid) => reg::add_machine_user(&sid).map_err(|e| format!("users list: {e}")),
-            None => Err("users list: this account's SID is unknown".to_string()),
+    let guard = match result {
+        Ok(guard) => guard,
+        Err(error) => {
+            say(&format!("install failed: {error}"));
+            if elevated && fresh {
+                undo_machine();
+            }
+            return FAILED;
         }
-    } else {
-        Ok(())
     };
-    if let Err(e) = owner.and_then(|()| reg::set_shell(&format!("\"{}\"", guard.display()))) {
-        say(&format!("install failed: {e}"));
-        // This user's registrations point into the files: they go first.
-        folders::viewer(&dir, false);
-        remove_package();
-        if elevated && fresh {
-            undo_machine();
+    let dir = guard.parent().expect("guard path has a parent");
+    if packaged {
+        if let Err(error) = package::remove_legacy() {
+            say(&format!("install: legacy notification registration will be retried ({error})"));
         }
-        return FAILED;
+    } else if let Err(error) = package::add_legacy(&from, dir) {
+        say(&format!("install: notification helper package not installed ({error}); toasts are polled"));
     }
+    folders::viewer(dir, true);
     // A fresh try: the streak of problem logons starts again.
     reg::set_problem_streak(0);
     reg::set_logon_had_problem(false);
@@ -121,19 +107,44 @@ pub fn install() -> u32 {
     0
 }
 
-/// Copies the files (all or nothing), trusts the certificate, installs the index service and writes
-/// the Apps entry. Err stops the install before the Shell value is touched.
-fn machine_install(from: &Path) -> Result<PathBuf, String> {
-    let guard = install::copy_files(from)?;
+/// Installs the files and verifies the package before recording the Winlogon shell. A registration
+/// failure rolls back the file swap, leaving the previous installation and its consent usable.
+fn machine_install(from: &Path, packaged: bool) -> Result<PathBuf, String> {
     let trust = install::trust(true)?;
-    say(&format!("install: shell copied to {}, certificate trusted ({trust})", install::dir().display()));
-    match install::index_service(true) {
-        Ok(s) => say(&format!("install: {s}")),
-        // Search falls back to Windows Search: not a reason to refuse the shell.
-        Err(e) => say(&format!("install: index service not installed ({e})")),
+    say(&format!("install: certificate trusted ({trust})"));
+    install::copy_files(from, |guard| {
+        let added = packaged && package::add(&install::dir())?;
+        let enable = || {
+            apps::register(guard).map_err(|e| format!("Apps entry: {e}"))?;
+            set_shell(guard, true)
+        };
+        if let Err(error) = enable() {
+            if added && let Err(cleanup) = package::remove_current() {
+                say(&format!("install: could not undo package registration ({cleanup})"));
+            }
+            return Err(error);
+        }
+        match install::index_service(true) {
+            Ok(s) => say(&format!("install: {s}")),
+            Err(e) => say(&format!("install: index service not installed ({e})")),
+        }
+        Ok(())
+    })
+}
+
+fn set_shell(guard: &Path, register_user: bool) -> Result<(), String> {
+    let sid = if register_user {
+        let sid = account::own_sid().ok_or("users list: this account's SID is unknown")?;
+        reg::add_machine_user(&sid).map_err(|e| format!("users list: {e}"))?;
+        Some(sid)
+    } else {
+        None
+    };
+    let result = reg::set_shell(&format!("\"{}\"", guard.display())).map_err(|e| format!("Shell value: {e}"));
+    if result.is_err() && let Some(sid) = sid && reg::shell().is_none() {
+        let _ = reg::remove_machine_user(&sid);
     }
-    apps::register(&guard).map_err(|e| format!("Apps entry: {e}"))?;
-    Ok(guard)
+    result
 }
 
 /// A fresh install that failed halfway leaves nothing behind.
@@ -215,8 +226,8 @@ pub fn restore_session(mode: RestoreMode) -> (Result<String, String>, Result<Ses
                 let result = bring_back_explorer();
                 drop(recovery);
                 drop(switch);
-                if result.is_ok() && !matches!(mode, RestoreMode::Repair) {
-                    remove_package();
+                if result.is_ok() && let Err(error) = remove_package() {
+                    break Err(format!("restore: shell package cleanup failed ({error})"));
                 }
                 break result.map(SessionDesktop::Ready);
             }
@@ -237,13 +248,11 @@ pub fn restore_session(mode: RestoreMode) -> (Result<String, String>, Result<Ses
     (user, back)
 }
 
-/// This user's notification helper package; a failure only warns (it does nothing without the
-/// files).
-pub fn remove_package() {
-    match package::remove() {
-        Ok(r) => say(&format!("restore: notification package {r}")),
-        Err(e) => say(&format!("restore: notification package not removed ({e})")),
-    }
+/// Removes this user's shell registration once Explorer owns the desktop.
+pub fn remove_package() -> Result<(), String> {
+    package::remove()?;
+    say("restore: shell and legacy notification packages absent");
+    Ok(())
 }
 
 /// Brings explorer's taskbar back now and says so only once it answers. A running guard does it
@@ -320,10 +329,6 @@ pub fn restore() -> u32 {
         let back = install::recovery_lock_for(0).and_then(|_lock| bring_back_explorer());
         (Ok(String::new()), back)
     };
-    // Only once the shell is off for good and explorer answers: the package is explorust's.
-    if mine && user.is_ok() && back.is_ok() {
-        remove_package();
-    }
     let machine = match (&user, &back, install::elevated()) {
         (Ok(_), Ok(_), true) => restore_machine(None).map(|_| ()),
         (Err(_), _, true) => Err("files kept: the Shell value is still there".to_string()),

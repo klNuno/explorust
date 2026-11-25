@@ -18,8 +18,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// From the notice: the user already chose, so no question, only the result.
 pub fn start_detached() {
-    let Ok(me) = std::env::current_exe() else { return };
-    match std::process::Command::new(&me).args(["--uninstall", "--yes"]).creation_flags(CREATE_NO_WINDOW).spawn() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let guard = exe.with_file_name(install::GUARD_EXE);
+    match std::process::Command::new(guard).args(["--uninstall", "--yes"]).creation_flags(CREATE_NO_WINDOW).spawn() {
         Ok(c) => log::line(&format!("uninstall started, pid {}", c.id())),
         Err(e) => log::line(&format!("uninstall did not start: {e}")),
     }

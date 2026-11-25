@@ -220,4 +220,16 @@ mod tests {
         assert!(!maximized_framed(true, false, false));
         assert!(!maximized_framed(false, true, true));
     }
+
+    #[test]
+    fn fullscreen_coverage_is_independent_for_each_monitor() {
+        let primary = Rect::new(0, 0, 1280, 800);
+        let secondary = Rect::new(-1920, -280, 0, 800);
+        let spilling_past_secondary = Rect::new(-1920, -280, 600, 800);
+        assert!(fullscreen_cover(spilling_past_secondary, secondary, false));
+        assert!(!fullscreen_cover(spilling_past_secondary, primary, false));
+        let spanning = Rect::new(-1920, -280, 1280, 800);
+        assert!(fullscreen_cover(spanning, secondary, false));
+        assert!(fullscreen_cover(spanning, primary, false));
+    }
 }

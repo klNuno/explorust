@@ -11,9 +11,13 @@ pub mod log;
 mod manage;
 mod notice;
 mod package;
+#[path = "../../msix-identity.rs"]
+#[allow(dead_code)]
+mod msix_identity;
 pub mod policy;
 mod prefetch;
 pub mod proc;
+pub mod processes;
 pub mod reg;
 #[path = "../../shell/src/reopen.rs"]
 pub mod reopen;
@@ -26,7 +30,8 @@ pub mod explorer_launch;
 pub mod taskbar;
 pub mod ui;
 mod uninstall;
+mod watchdog;
 
 pub use supervise::explorer_path;
-pub use command::run;
+pub use command::{run, run_supervisor};
 mod command;

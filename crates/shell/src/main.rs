@@ -41,6 +41,10 @@ mod log;
 #[cfg(target_os = "windows")]
 mod minimized;
 #[cfg(target_os = "windows")]
+#[path = "../../msix-identity.rs"]
+#[allow(dead_code)]
+mod msix_identity;
+#[cfg(target_os = "windows")]
 mod prefetch;
 mod problem;
 #[cfg(target_os = "windows")]
@@ -56,6 +60,10 @@ mod startup;
 mod startup_retry;
 #[cfg(any(target_os = "windows", test))]
 mod startup_rules;
+#[cfg(target_os = "windows")]
+#[path = "../../guard/src/switch_events.rs"]
+#[allow(dead_code)]
+mod switch_events;
 
 #[cfg(target_os = "windows")]
 fn main() {
@@ -65,6 +73,12 @@ fn main() {
         Some("--download-symbols") => std::process::exit(if uwp_host::prefetch() { 0 } else { 1 }),
         Some("--startup-apps") => std::process::exit(startup::run(args.next().as_deref())),
         _ => {}
+    }
+    if option_env!("EXPLORUST_PACKAGE_BUILD").is_some()
+        && let Err(error) = msix_identity::require()
+    {
+        log::line(&format!("shell: {error}"));
+        std::process::exit(6);
     }
     // Before any COM call of the process (AppContainer hosts call back into twinui here).
     match comsec::init() {

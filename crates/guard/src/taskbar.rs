@@ -6,7 +6,7 @@ use crate::policy::{ANSWER_WITHIN, Probe};
 use crate::proc::Child;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, GetShellWindow, GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NULL,
@@ -40,16 +40,19 @@ pub fn answers(h: HWND, within: Duration) -> bool {
 }
 
 pub fn image_path(pid: u32) -> Option<String> {
-    // SAFETY: the handle is closed; the buffer has the length given.
-    unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = vec![0u16; 1024];
-        let mut len = buf.len() as u32;
-        let r = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
-        let _ = CloseHandle(h);
-        r.ok()?;
-        Some(String::from_utf16_lossy(&buf[..len as usize]))
-    }
+    // SAFETY: the query handle is closed after it is used.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let image = process_image_path(handle);
+    let _ = unsafe { CloseHandle(handle) };
+    image
+}
+
+pub(crate) fn process_image_path(handle: HANDLE) -> Option<String> {
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: the caller holds the process handle, and the buffer has the stated size.
+    unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) }.ok()?;
+    Some(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
 /// Asks explorust's (`pid`) taskbar window for an answer.
