@@ -13,11 +13,12 @@ pub struct Hydration {
 }
 
 impl Hydration {
-    pub fn publish(table: Arc<RwLock<Table>>, mut names: Table) -> Self {
+    pub fn watch(table: Arc<RwLock<Table>>) -> Self {
+        let mut names = table.write();
         let generation = names.id();
         let revision = names.touches();
         names.watch_touches(true);
-        *table.write() = names;
+        drop(names);
         Self { table, generation, revision }
     }
 
@@ -89,6 +90,11 @@ mod tests {
     use super::*;
     use fsindex::table::ROOT;
 
+    fn publish(table: Arc<RwLock<Table>>, names: Table) -> Hydration {
+        *table.write() = names;
+        Hydration::watch(table)
+    }
+
     fn load_names() -> Table {
         let mut table = Table::new();
         table.upsert(20, ROOT, "notes-old.txt", false, false, 0);
@@ -99,7 +105,7 @@ mod tests {
     #[test]
     fn names_are_searchable_before_hydration() {
         let table = Arc::new(RwLock::new(Table::new()));
-        let hydration = Hydration::publish(table.clone(), load_names());
+        let hydration = publish(table.clone(), load_names());
         assert_eq!(hydration.pending(20..20 + BATCH), Some(vec![20, 21]));
         let (begin, wait) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -118,7 +124,7 @@ mod tests {
     #[test]
     fn hydration_keeps_journal_updates_and_drops_old_generations() {
         let table = Arc::new(RwLock::new(Table::new()));
-        let hydration = Hydration::publish(table.clone(), load_names());
+        let hydration = publish(table.clone(), load_names());
         {
             let mut table = table.write();
             table.touch(20);
@@ -132,7 +138,7 @@ mod tests {
         assert_eq!(table.read().query("notes", 1)[0].modified(), 5);
         assert_eq!(table.read().query("replacement", 1)[0].modified(), 0);
 
-        let next = Hydration::publish(table.clone(), load_names());
+        let next = publish(table.clone(), load_names());
         assert!(!hydration.is_current());
         assert_eq!(hydration.pending(20..22), None);
         assert_eq!(hydration.apply(&[(20, 100)]), None);

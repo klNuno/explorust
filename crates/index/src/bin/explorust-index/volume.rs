@@ -1,15 +1,15 @@
 //! One NTFS volume: its handle, the USN journal, the MFT enumeration and the journal follower.
 
-use crate::retry::{self, LinkRetry};
+use crate::retry::{self, BackoffLog, LinkRetry};
 use crate::{log, metadata};
-use fsindex::table::{RecState, Table};
+use fsindex::table::{RecState, Snapshot, Table, reconcile};
 use fsindex::usn::{self, Record};
 use parking_lot::{RwLock, RwLockWriteGuard};
 use std::collections::HashMap;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::time::Instant;
 use windows::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE, ERROR_MORE_DATA, GENERIC_READ, HANDLE,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_HANDLE_EOF, ERROR_INVALID_DATA, ERROR_JOURNAL_NOT_ACTIVE, ERROR_MORE_DATA, GENERIC_READ, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_READ_ATTRIBUTES,
@@ -18,8 +18,9 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
-    CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA, FSCTL_QUERY_FILE_LAYOUT, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
-    MFT_ENUM_DATA_V0, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
+    CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA, FSCTL_GET_NTFS_VOLUME_DATA,
+    FSCTL_QUERY_FILE_LAYOUT, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V0,
+    NTFS_VOLUME_DATA_BUFFER, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows_core::HSTRING;
@@ -62,6 +63,38 @@ pub struct Mft {
     pub names: Table,
     pub sequences: Vec<u16>,
     pub pruned: Vec<u64>,
+}
+
+pub struct JournalPosition {
+    next: i64,
+    retries: HashMap<u32, LinkRetry>,
+    changes: u64,
+}
+
+impl JournalPosition {
+    pub fn new(next: i64) -> Self {
+        Self { next, retries: HashMap::new(), changes: 0 }
+    }
+
+    pub fn changes(&self) -> u64 {
+        self.changes
+    }
+
+    pub fn next(&self) -> i64 {
+        self.next
+    }
+
+    pub fn clear_link_retries(&mut self, table: &RwLock<Table>) {
+        let mut names = table.write();
+        for (rec, _) in self.retries.drain() {
+            names.finish_link_lookup(rec);
+        }
+    }
+}
+
+struct Replay<'a> {
+    sequences: &'a mut Vec<u16>,
+    resettle: bool,
 }
 
 // SAFETY: each Volume owns its handle. The workers receive their own handles.
@@ -303,10 +336,44 @@ impl Volume {
         self.h
     }
 
+    fn highest_mft_record(&self) -> Option<u64> {
+        let mut buffer = [0; size_of::<NTFS_VOLUME_DATA_BUFFER>() + 64];
+        let bytes = ioctl(self.h, FSCTL_GET_NTFS_VOLUME_DATA, &(), &mut buffer).ok()?;
+        if bytes < size_of::<NTFS_VOLUME_DATA_BUFFER>() {
+            return None;
+        }
+        // SAFETY: the ioctl filled at least the fixed prefix, which contains only integers.
+        let data = unsafe { buffer.as_ptr().cast::<NTFS_VOLUME_DATA_BUFFER>().read_unaligned() };
+        u64::try_from(data.MftValidDataLength)
+            .ok()?
+            .checked_div(u64::from(data.BytesPerFileRecordSegment))?
+            .checked_sub(1)
+    }
+
     /// Reads the names up to `high`, keeping the sequence numbers for later metadata lookups.
     pub fn load(&self, high: i64) -> windows_core::Result<Mft> {
         let mut t = Table::new();
+        if let Some(highest) = self.highest_mft_record() {
+            t.cover_mft_records(highest);
+        }
         let mut seqs: Vec<u16> = Vec::new();
+        self.enumerate_mft(high, |bytes| usn::parse_mft(bytes, |_| true, |r| {
+            if let Some(i) = usize::try_from(r.rec).ok().filter(|&i| i < u32::MAX as usize) {
+                if seqs.len() <= i {
+                    seqs.resize(i + 1, 0);
+                }
+                seqs[i] = r.seq;
+            }
+            apply(&mut t, &r, 0)
+        }))?;
+        let pruned = t.settle();
+        t.shrink();
+        let files: Vec<u64> = t.take_pruned_files().into_iter().filter_map(|r| seqs.get(r as usize).map(|&seq| full_reference(r, seq))).collect();
+        log::line(&format!("{}: {pruned} names inside WinSxS left out ({} files)", self.letter, files.len()));
+        Ok(Mft { names: t, sequences: seqs, pruned: files })
+    }
+
+    fn enumerate_mft(&self, high: i64, mut batch: impl FnMut(&[u8]) -> bool) -> windows_core::Result<()> {
         let mut med = MFT_ENUM_DATA_V0 { StartFileReferenceNumber: 0, LowUsn: 0, HighUsn: high };
         let mut buf = vec![0u8; 1 << 20];
         loop {
@@ -315,28 +382,87 @@ impl Volume {
                 Err(e) if e.code() == ERROR_HANDLE_EOF.to_hresult() => break,
                 Err(e) => return Err(e),
             };
-            if got <= 8 {
-                break;
+            let next = u64::from_le_bytes(buf[..8].try_into().unwrap());
+            if got < 8 {
+                return Err(ERROR_INVALID_DATA.into());
             }
-            med.StartFileReferenceNumber = u64::from_le_bytes(buf[..8].try_into().unwrap_or_default());
-            usn::parse(&buf[8..got], |r| {
-                if let Some(i) = usize::try_from(r.rec).ok().filter(|&i| i < u32::MAX as usize) {
-                    if seqs.len() <= i {
-                        seqs.resize(i + 1, 0);
-                    }
-                    seqs[i] = r.seq;
+            if next & usn::MASK48 <= med.StartFileReferenceNumber & usn::MASK48 {
+                if got == 8 {
+                    break;
                 }
-                apply(&mut t, &r, 0)
-            });
+                return Err(ERROR_INVALID_DATA.into());
+            }
+            if !batch(&buf[8..got]) {
+                return Err(ERROR_INVALID_DATA.into());
+            }
+            med.StartFileReferenceNumber = next;
         }
-        let pruned = t.settle();
-        t.shrink();
-        let files: Vec<u64> = t.take_pruned_files().into_iter().filter_map(|r| seqs.get(r as usize).map(|&seq| full_reference(r, seq))).collect();
-        log::line(&format!("{}: {pruned} names inside WinSxS left out ({} files)", self.letter, files.len()));
-        Ok(Mft { names: t, sequences: seqs, pruned: files })
+        Ok(())
     }
 
-    fn changes(&self, bytes: &[u8], table: &RwLock<Table>, retries: &mut HashMap<u32, LinkRetry>) -> u64 {
+    pub fn reconcile(&self, table: &RwLock<Table>, sequences: &mut Vec<u16>, pruned: &mut Vec<u64>) -> windows_core::Result<usize> {
+        if let Some(highest) = self.highest_mft_record() {
+            table.write().cover_mft_records(highest);
+        }
+        let mut records = Vec::new();
+        reconcile(table, sequences, pruned, |dirs, apply| self.reconcile_pass(dirs, &mut records, apply))
+    }
+
+    fn reconcile_pass(&self, dirs: bool, records: &mut Vec<Record>, apply: &mut dyn FnMut(&[Record])) -> windows_core::Result<()> {
+        self.enumerate_mft(i64::MAX, |bytes| {
+            records.clear();
+            if !usn::parse_mft(bytes, |attrs| (attrs & usn::ATTR_DIRECTORY != 0) == dirs, |record| records.push(record)) {
+                return false;
+            }
+            apply(records);
+            true
+        })
+    }
+
+    /// Apply the closed interval since the snapshot before publishing any of its names.
+    /// The live follower keeps the same retry jobs and resumes at the returned cursor.
+    pub fn replay(&self, snapshot: Snapshot) -> windows_core::Result<(Mft, JournalPosition)> {
+        let Snapshot { names, cursor, mut sequences, mut pruned } = snapshot;
+        let journal = self.journal()?;
+        let low = journal.FirstUsn.max(journal.LowestValidUsn);
+        if cursor.journal != journal.UsnJournalID || !(low..=journal.NextUsn).contains(&cursor.next) {
+            return Err(ERROR_INVALID_DATA.into());
+        }
+        let mut position = JournalPosition::new(cursor.next);
+        let table = RwLock::new(names);
+        let mut replay = Replay { sequences: &mut sequences, resettle: false };
+        let mut buf = vec![0u8; 64 << 10];
+        while position.next < journal.NextUsn {
+            let rd = READ_USN_JOURNAL_DATA_V0 {
+                StartUsn: position.next, ReasonMask: u32::MAX, ReturnOnlyOnClose: 0,
+                Timeout: 0, BytesToWaitFor: 0, UsnJournalID: cursor.journal,
+            };
+            let got = ioctl(self.h, FSCTL_READ_USN_JOURNAL, &rd, &mut buf)?;
+            let bytes = buf.get(..got).filter(|bytes| bytes.len() >= 8)
+                .ok_or_else(|| windows_core::Error::from(ERROR_INVALID_DATA))?;
+            let next = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+            if next <= position.next {
+                return Err(ERROR_INVALID_DATA.into());
+            }
+            position.changes += self.changes(&bytes[8..], &table, &mut position.retries, Some(&mut replay))?;
+            position.next = next;
+        }
+        let mut names = table.into_inner();
+        if replay.resettle {
+            names.settle();
+            pruned.extend(names.take_pruned_files().into_iter().filter_map(|rec| {
+                sequences.get(rec as usize).map(|&seq| full_reference(rec, seq))
+            }));
+        }
+        // A cached pruned record may have been deleted and reused while the shell was off.
+        pruned.retain(|&frn| sequences.get((frn & usn::MASK48) as usize) == Some(&((frn >> 48) as u16)));
+        Ok((Mft { names, sequences, pruned }, position))
+    }
+
+    fn changes(
+        &self, bytes: &[u8], table: &RwLock<Table>, retries: &mut HashMap<u32, LinkRetry>,
+        mut replay: Option<&mut Replay<'_>>,
+    ) -> windows_core::Result<u64> {
         let mut records = Vec::new();
         let mut dates = HashMap::new();
         usn::parse(bytes, |r| {
@@ -344,7 +470,9 @@ impl Volume {
                 return;
             }
             let frn = full_reference(r.rec as u32, r.seq);
-            if r.reason & (usn::REASON_FILE_CREATE | usn::REASON_BASIC_INFO_CHANGE | usn::REASON_DATA_CHANGE | usn::REASON_RENAME_NEW_NAME) != 0
+            // The initial layout pass already gets the latest timestamps after a restore.
+            if replay.is_none()
+                && r.reason & (usn::REASON_FILE_CREATE | usn::REASON_BASIC_INFO_CHANGE | usn::REASON_DATA_CHANGE | usn::REASON_RENAME_NEW_NAME) != 0
                 && r.reason & usn::REASON_FILE_DELETE == 0
             {
                 dates.entry(frn).or_insert_with(|| metadata::last_write_by_id(self.h, frn).unwrap_or(0));
@@ -356,10 +484,25 @@ impl Volume {
         let mut refs = HashMap::new();
         for r in &records {
             let rec = r.rec as u32;
+            let parent = r.parent.min(u32::MAX as u64) as u32;
             let frn = full_reference(rec, r.seq);
             let deleted = r.reason & usn::REASON_FILE_DELETE != 0;
+            let directory = r.attrs & usn::ATTR_DIRECTORY != 0;
+            let moved = r.reason & (usn::REASON_FILE_DELETE | usn::REASON_RENAME_NEW_NAME) != 0;
+            // A pruned directory moved into view has descendants whose names we never kept.
+            if directory && moved && t.pruned_parent(rec) && !t.pruned_parent(parent) {
+                return Err(ERROR_INVALID_DATA.into());
+            }
+            if let Some(replay) = replay.as_deref_mut() {
+                replay.resettle |= directory;
+                let slot = rec as usize;
+                if replay.sequences.len() <= slot {
+                    replay.sequences.resize(slot + 1, 0);
+                }
+                replay.sequences[slot] = if deleted { 0 } else { r.seq };
+            }
             let repair_name = r.reason & usn::REASON_HARD_LINK_CHANGE != 0
-                || t.pruned_parent(r.parent.min(u32::MAX as u64) as u32)
+                || t.pruned_parent(parent)
                 || r.reason & (usn::REASON_RENAME_NEW_NAME | usn::REASON_RENAME_OLD_NAME)
                     == (usn::REASON_RENAME_NEW_NAME | usn::REASON_RENAME_OLD_NAME);
             if deleted || retries.get(&rec).is_some_and(|job| job.frn != frn) {
@@ -381,12 +524,13 @@ impl Volume {
                 retry::queue(retries, rec, frn, now, repair_name);
             }
         }
-        records.len() as u64
+        Ok(records.len() as u64)
     }
 
-    fn retry_links(&self, table: &RwLock<Table>, retries: &mut HashMap<u32, LinkRetry>, mut lookup: impl FnMut(u64) -> Option<LinkInfo>) {
+    fn retry_links(&self, table: &RwLock<Table>, retries: &mut HashMap<u32, LinkRetry>, mut lookup: impl FnMut(u64) -> Option<LinkInfo>) -> usize {
         let now = Instant::now();
         let due: Vec<_> = retries.extract_if(|_, job| job.due <= now).collect();
+        let mut backed_off = 0;
         for (rec, job) in due {
             if let Some(info) = lookup(job.frn) {
                 let mut t = table.write();
@@ -401,9 +545,6 @@ impl Volume {
                 }
                 t.set_aliases(rec, info.names);
                 t.finish_link_lookup(rec);
-                if job.recovering() {
-                    log::line(&format!("{}: hard link lookup recovered: record {rec}", self.letter));
-                }
             } else {
                 let next = job.after_failure(Instant::now());
                 if next.recovering() && !job.recovering() {
@@ -412,20 +553,21 @@ impl Volume {
                         t.touch(rec);
                         t.prune(rec);
                     }
-                    log::line(&format!("{}: hard link lookup backing off: record {rec}, scoped coverage unavailable", self.letter));
+                    backed_off += 1;
                 }
                 retries.insert(rec, next);
             }
         }
+        backed_off
     }
 
     /// Applies the journal from `next` on, blocking until changes come; returns on an error
     /// (journal deleted or wrapped past `next`), after which the caller reloads.
-    pub fn follow(&self, journal_id: u64, mut next: i64, table: &RwLock<Table>) -> windows_core::Error {
+    pub fn follow(&self, journal_id: u64, position: JournalPosition, table: &RwLock<Table>) -> windows_core::Error {
+        let JournalPosition { mut next, mut retries, mut changes } = position;
         let mut buf = vec![0u8; 64 << 10];
-        let mut changes = 0u64;
         let mut since = Instant::now();
-        let mut retries = HashMap::new();
+        let mut backoff = BackoffLog::default();
         let mut links_buf = vec![0u8; 8 << 10];
         let mut caught_up = false;
         loop {
@@ -450,14 +592,23 @@ impl Volume {
                 next = i64::from_le_bytes(buf[..8].try_into().unwrap_or_default());
             }
             if got > 8 {
-                changes += self.changes(&buf[8..got], table, &mut retries);
+                match self.changes(&buf[8..got], table, &mut retries, None) {
+                    Ok(applied) => changes += applied,
+                    Err(e) => {
+                        table.write().journal_current = false;
+                        return e;
+                    }
+                }
             } else if !caught_up {
                 table.write().journal_current = true;
                 caught_up = true;
             }
             let had_retries = !retries.is_empty();
             if had_retries {
-                self.retry_links(table, &mut retries, |frn| hard_links(self.h, frn, &mut links_buf));
+                backoff.backed_off(self.retry_links(table, &mut retries, |frn| hard_links(self.h, frn, &mut links_buf)));
+            }
+            if let Some(count) = backoff.summary(Instant::now()) {
+                log::line(&format!("{}: hard link lookups backing off: {count} entered slow retry, {} lookups pending", self.letter, retries.len()));
             }
             if got > 8 || had_retries {
                 loop {
@@ -486,7 +637,7 @@ impl Volume {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fsindex::table::ROOT;
+    use fsindex::table::{ROOT, SnapshotCursor};
     use std::fs::{self, File, OpenOptions};
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::PathBuf;
@@ -510,6 +661,111 @@ mod tests {
         let mut bytes = usn::encode(frn & usn::MASK48, parent.into(), 100, reason, 0, name);
         bytes[8..16].copy_from_slice(&frn.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn restore_replays_creates_renames_and_deletes_and_rejects_a_different_journal() {
+        let volume = Volume::open('C').expect("open NTFS test volume as administrator");
+        let dir = std::env::temp_dir().join(format!("explorust-snapshot-replay-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let fixture = Fixture(dir);
+        let rename = fixture.0.join("replay-before-name");
+        let delete = fixture.0.join("replay-delete-name");
+        let after = fixture.0.join("replay-renamed-name");
+        let new = fixture.0.join("replay-created-name");
+        fs::write(&rename, b"rename") .unwrap();
+        fs::write(&delete, b"delete").unwrap();
+
+        let journal = volume.journal().unwrap();
+        let cursor = SnapshotCursor { journal: journal.UsnJournalID, next: journal.NextUsn, boot: [1; 16] };
+        let mft = volume.load(cursor.next).unwrap();
+        let mut bytes = Vec::new();
+        Snapshot::write(&mut bytes, &mft.names, cursor, &mft.sequences, &mft.pruned).unwrap();
+        drop(mft);
+        let read = || Snapshot::read_if(bytes.as_slice(), bytes.len() as u64, |_| true).unwrap().unwrap();
+        let mut old = read();
+        old.cursor.journal ^= 1;
+        assert!(volume.replay(old).is_err());
+
+        fs::rename(&rename, &after).unwrap();
+        fs::remove_file(&delete).unwrap();
+        fs::write(&new, b"create").unwrap();
+        let (loaded, journal) = volume.replay(read()).unwrap();
+        assert!(journal.changes() >= 3);
+        for expected in [&after, &new] {
+            let query = expected.file_name().unwrap().to_str().unwrap();
+            let hits = loaded.names.query(query, 10);
+            assert!(hits.iter().any(|hit| loaded.names.path(hit.rec, "C:\\")
+                .is_some_and(|path| path.eq_ignore_ascii_case(expected.to_str().unwrap()))));
+        }
+        for absent in [&rename, &delete] {
+            let query = absent.file_name().unwrap().to_str().unwrap();
+            assert!(loaded.names.query(query, 10).is_empty());
+        }
+    }
+
+    #[test]
+    fn mft_repairs_provisional_names_and_keeps_writes_during_the_scan() {
+        let volume = Volume::open('C').unwrap();
+        let dir = std::env::temp_dir().join(format!("explorust-mft-reconcile-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let fixture = Fixture(dir);
+        let actual = fixture.0.join("current-mft-name.txt");
+        let concurrent = fixture.0.join("concurrent-mft-name.txt");
+        let created = fixture.0.join("created-during-mft.txt");
+        let deleted = fixture.0.join("deleted-during-mft.txt");
+        fs::write(&actual, b"actual").unwrap();
+        fs::write(&deleted, b"delete").unwrap();
+        let rec = file_reference(&File::open(&actual).unwrap()) as u32;
+        let parent = file_reference(&OpenOptions::new().read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0).open(&fixture.0).unwrap()) as u32;
+
+        let journal = volume.journal().unwrap();
+        let boot = crate::cache::boot();
+        assert_ne!(boot, [0; 16]);
+        let mut prior_boot = boot;
+        prior_boot[0] ^= 1;
+        let mut cursor = SnapshotCursor { journal: journal.UsnJournalID, next: journal.NextUsn, boot: prior_boot };
+        let Mft { mut names, mut sequences, mut pruned } = volume.load(cursor.next).unwrap();
+        names.upsert(rec, parent, "offline-stale-name.txt", false, false, 0);
+        names.compact();
+        let mut previous = Vec::new();
+        Snapshot::write(&mut previous, &names, cursor, &sequences, &pruned).unwrap();
+        drop(names);
+        let read = |bytes: &[u8]| Snapshot::read_if(bytes, bytes.len() as u64, |_| true).unwrap().unwrap();
+        let provisional = read(&previous);
+        assert!(!provisional.cursor.verified_in(boot));
+        assert_eq!(provisional.names.name(rec).as_deref(), Some("offline-stale-name.txt"));
+
+        let table = RwLock::new(provisional.names);
+        let mut records = Vec::new();
+        reconcile(&table, &mut sequences, &mut pruned, |dirs, apply| {
+            volume.reconcile_pass(dirs, &mut records, apply)?;
+            if !dirs {
+                // These writes are after this part of the MFT was read, before marking the
+                // snapshot verified. Only the saved USN cursor can recover them.
+                fs::rename(&actual, &concurrent).unwrap();
+                fs::write(&created, b"create").unwrap();
+                fs::remove_file(&deleted).unwrap();
+            }
+            assert!(!read(&previous).cursor.verified_in(boot));
+            Ok::<_, windows_core::Error>(())
+        }).unwrap();
+        let names = table.into_inner();
+        assert_eq!(names.name(rec).as_deref(), Some("current-mft-name.txt"));
+        assert!(!names.journal_current);
+
+        cursor.boot = boot;
+        let mut verified = Vec::new();
+        Snapshot::write(&mut verified, &names, cursor, &sequences, &pruned).unwrap();
+        drop(names);
+        let snapshot = read(&verified);
+        assert!(snapshot.cursor.verified_in(boot));
+        let (updated, position) = volume.replay(snapshot).unwrap();
+        assert!(position.changes() >= 3);
+        assert_eq!(updated.names.name(rec).as_deref(), Some("concurrent-mft-name.txt"));
+        assert_eq!(updated.names.query("created-during-mft.txt", 1).len(), 1);
+        assert!(updated.names.query("deleted-during-mft.txt", 1).is_empty());
     }
 
     #[test]
@@ -544,12 +800,12 @@ mod tests {
 
         fs::rename(&before, &removed).unwrap();
         let rename = event(frn, first_id, usn::REASON_RENAME_NEW_NAME, "removed.txt");
-        volume.changes(&rename, &table, &mut retries);
+        volume.changes(&rename, &table, &mut retries, None).unwrap();
         assert!(!retries[&rec].repair_name);
         volume.retry_links(&table, &mut retries, |_| None);
         fs::remove_file(&removed).unwrap();
         let deletion = event(frn, first_id, usn::REASON_HARD_LINK_CHANGE, "removed.txt");
-        volume.changes(&deletion, &table, &mut retries);
+        volume.changes(&deletion, &table, &mut retries, None).unwrap();
         let mut buffer = vec![0; 8 << 10];
         volume.retry_links(&table, &mut retries, |frn| hard_links(volume.h, frn, &mut buffer));
 
@@ -575,7 +831,7 @@ mod tests {
         let table = RwLock::new(names);
         let mut retries = HashMap::new();
         let change = usn::encode(u64::from(rec), ROOT.into(), 100, usn::REASON_HARD_LINK_CHANGE, 0, "obsolete.txt");
-        volume.changes(&change, &table, &mut retries);
+        volume.changes(&change, &table, &mut retries, None).unwrap();
 
         for _ in 0..3 {
             retries.get_mut(&rec).unwrap().due = Instant::now();

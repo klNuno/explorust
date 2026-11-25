@@ -111,7 +111,7 @@ impl Table {
                 let matched = at + pos;
                 i = self.seek(i, names.end, matched);
                 at = matched + needle.len();
-                let rec = self.recs[i];
+                let rec = self.recs.get(i);
                 if matched == self.starts[i] as usize
                     && rec != NONE
                     && self.is_dir(rec)
@@ -174,7 +174,7 @@ impl ScopedScan {
         let end = self.records.end.min(self.records.start + SLICE);
         while self.records.start < end && hits.len() < limit {
             let rec = self.records.next().unwrap();
-            let slot = table.slots[rec];
+            let slot = table.slots.at(rec);
             if slot.name == NONE
                 || self
                     .seen
@@ -186,7 +186,7 @@ impl ScopedScan {
             let i = (slot.name & IDX) as usize;
             let (a, b) = table.name_range(i);
             if let Some(at) = finder.find(&table.fold[a..b])
-                && let Some(hit) = self.primary_hit(table, root, i, rank(&table.fold, a, a + at))
+                && let Some(hit) = self.primary_hit(table, root, rec as u32, i, rank(&table.fold, a, a + at))
             {
                 hits.push(hit);
             }
@@ -218,7 +218,7 @@ impl ScopedScan {
                         path.push('\\');
                     }
                     path.push_str(&alias.name);
-                    let meta = primary.map_or(0, |slot| table.meta[(slot.name & IDX) as usize]);
+                    let meta = primary.map_or(0, |slot| table.meta.get((slot.name & IDX) as usize));
                     let key = meta_key(meta, rank);
                     hits.push(Hit {
                         path,
@@ -262,8 +262,9 @@ impl ScopedScan {
             i = table.seek(i, end, matched);
             let (a, b) = table.name_range(i);
             at = b + 1;
-            if let Some(hit) = self.primary_hit(table, root, i, rank(&table.fold, a, matched)) {
-                let rec = table.recs[i] as usize;
+            let rec = table.recs.get(i);
+            if let Some(hit) = self.primary_hit(table, root, rec, i, rank(&table.fold, a, matched)) {
+                let rec = rec as usize;
                 if self.seen.len() <= rec / 64 {
                     self.seen.resize(rec / 64 + 1, 0);
                 }
@@ -279,8 +280,7 @@ impl ScopedScan {
         arena.next == arena.end
     }
 
-    fn primary_hit(&self, table: &Table, root: &str, i: usize, rank: u8) -> Option<Hit> {
-        let rec = table.recs[i];
+    fn primary_hit(&self, table: &Table, root: &str, rec: u32, i: usize, rank: u8) -> Option<Hit> {
         if rec == NONE
             || rec == self.scope
             || (self.scope != ROOT && !table.descends_from(rec, self.scope))
@@ -291,7 +291,7 @@ impl ScopedScan {
             return None;
         }
         let path = table.path(rec, root)?;
-        let (key, modified) = meta_key(table.meta[i], rank);
+        let (key, modified) = meta_key(table.meta.get(i), rank);
         Some(Hit {
             path,
             folder: table.is_dir(rec),

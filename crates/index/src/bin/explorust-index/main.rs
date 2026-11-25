@@ -6,6 +6,8 @@
 //!   the service `explorust-index` for this exe; `explorust-guard --install` and `--restore` call them.
 //! - `--query <text>`: ask the running service and print the hits and timings.
 
+#[cfg(target_os = "windows")]
+mod cache;
 #[cfg(any(target_os = "windows", test))]
 mod hydration;
 #[cfg(target_os = "windows")]
@@ -21,6 +23,8 @@ mod server;
 #[cfg(target_os = "windows")]
 mod service;
 #[cfg(target_os = "windows")]
+mod session;
+#[cfg(target_os = "windows")]
 mod volume;
 
 #[cfg(target_os = "windows")]
@@ -28,8 +32,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("--service") => service::dispatch(),
+        Some("--worker") => session::run_worker(),
         Some("--console") => {
-            server::run(None);
+            server::run(|| {});
             0
         }
         Some("--install") => service::install(),

@@ -1,7 +1,7 @@
-//! The names of one volume in a compact table. Each MFT record number indexes an 8-byte slot
+//! The names of one volume in a compact table. Each MFT record number indexes a slot
 //! (parent record, name index with flags); per name, `meta` holds the noisy bit and recency, so a
 //! query reads only sequential arrays until its best hits are known; the names live once, folded (`fold`, each
-//! name after a `\n`), with one bit per byte (`case`) marking the characters to raise back. A prefix
+//! name after a `\n`), with compact case marks for reconstructing the original names. A prefix
 //! query is one pass over the name starts, a substring query one `memmem` of the query over the
 //! folded arena; an offset maps back to its name through `starts` (sorted, binary search).
 
@@ -11,8 +11,23 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
+mod case;
+mod meta;
+use meta::{META_NOISY, Metadata};
+mod records;
+use records::Records;
+mod slots;
+use slots::{FREE, PRUNED, Slot, Slots};
 mod scoped;
 pub use scoped::ScopedScan;
+mod snapshot;
+pub use snapshot::{Snapshot, SnapshotCursor};
+#[cfg(test)]
+mod bench;
+#[cfg(any(windows, test))]
+mod reconcile;
+#[cfg(any(windows, test))]
+pub use reconcile::reconcile;
 
 pub const SEP: u8 = b'\n';
 /// The root directory's MFT record number on NTFS.
@@ -20,27 +35,12 @@ pub const ROOT: u32 = 5;
 const NONE: u32 = u32::MAX;
 const DIR: u32 = 1 << 31;
 const NOISY: u32 = 1 << 30;
-/// The record or one of its folders is noisy: set from the parent on insert, and for the whole
-/// table by `settle` after the MFT load (records come in record order, children before parents).
-const UNDER: u32 = 1 << 29;
 const IDX: u32 = (1 << 29) - 1;
 const COMPACTION_SLICE: usize = 16_384;
-
-#[derive(Clone, Copy)]
-struct Slot {
-    parent: u32,
-    /// Name index in the arenas plus DIR and NOISY, or NONE for a free slot.
-    name: u32,
-}
-
-const FREE: Slot = Slot { parent: 0, name: NONE };
-/// A record inside a pruned tree: no name kept, and its children are pruned too.
-const PRUNED: Slot = Slot { parent: NONE, name: NONE };
+const PREFIX_WORDS: usize = (1 << 16) / u64::BITS as usize;
 /// Folders whose contents are left out of the table: the component store holds a large share of a
 /// Windows volume's names (long ones), none of them anything a user opens.
 const PRUNE_NAMES: [&str; 1] = ["winsxs"];
-/// In `meta`: the name or a folder of it is noisy; the remaining bits hold last write time.
-const META_NOISY: u64 = 1 << 63;
 
 /// Folder names whose contents rank after everything else (Windows Search leaves them out).
 const NOISY_NAMES: [&str; 9] = ["windows", "appdata", "$recycle.bin", "winsxs", "node_modules", ".git", "programdata", "system volume information", "target"];
@@ -54,12 +54,14 @@ struct Compaction {
 
 #[derive(Default)]
 pub struct Table {
-    slots: Vec<Slot>,
-    case: Vec<u8>,
+    slots: Slots,
+    case: case::Case,
     fold: Vec<u8>,
+    /// Prefixes ever inserted; keeping deleted ones only allows an unnecessary scan.
+    prefixes: Vec<u64>,
     starts: Vec<u32>,
-    recs: Vec<u32>,
-    meta: Vec<u64>,
+    recs: Records,
+    meta: Metadata,
     live: usize,
     dead: usize,
     compaction: Option<Compaction>,
@@ -124,7 +126,7 @@ impl Found {
     }
 }
 
-/// Clean before noisy, then match rank, then newest first at full FILETIME precision.
+/// Clean before noisy, then match rank, then newest first at the index's stored precision.
 pub type SortKey = (u8, Reverse<u64>);
 
 fn word_start(prev: u8) -> bool {
@@ -147,11 +149,15 @@ fn reserve_append<T>(vec: &mut Vec<T>, count: usize, compact: bool) {
 
 impl Table {
     pub fn new() -> Table {
-        Table { case: vec![0], fold: vec![SEP], id: TABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ..Default::default() }
+        Table { fold: vec![SEP], id: TABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ..Default::default() }
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    pub fn cover_mft_records(&mut self, highest: u64) {
+        self.recs.cover(highest);
     }
 
     pub fn state(&self, rec: u32) -> RecState {
@@ -168,7 +174,7 @@ impl Table {
     pub fn prune(&mut self, rec: u32) {
         if self.slots.get(rec as usize).is_some_and(|s| s.name != NONE && s.name & DIR == 0) {
             self.remove(rec);
-            self.slots[rec as usize] = PRUNED;
+            self.slots.set(rec as usize, PRUNED);
         }
     }
 
@@ -248,19 +254,31 @@ impl Table {
         self.live == 0
     }
 
-    /// Heap bytes held by the table.
+    /// Heap bytes for the table's main arenas, including overflow payloads.
     pub fn bytes(&self) -> usize {
-        self.slots.capacity() * size_of::<Slot>() + self.case.capacity() + self.fold.capacity() + (self.starts.capacity() + self.recs.capacity()) * 4 + self.meta.capacity() * 8
+        self.arena_bytes().into_iter().map(|(_, bytes)| bytes).sum()
+    }
+
+    fn arena_bytes(&self) -> [(&'static str, usize); 7] {
+        [
+            ("slots", self.slots.bytes()),
+            ("case", self.case.bytes()),
+            ("fold", self.fold.capacity()),
+            ("prefixes", self.prefixes.capacity() * size_of::<u64>()),
+            ("starts", self.starts.capacity() * size_of::<u32>()),
+            ("recs", self.recs.bytes()),
+            ("meta", self.meta.bytes()),
+        ]
     }
 
     pub fn shrink(&mut self) {
         self.compact_growth = true;
         self.slots.shrink_to_fit();
-        self.case.shrink_to_fit();
+        self.case.marks.shrink_to_fit();
         self.fold.shrink_to_fit();
         self.starts.shrink_to_fit();
         self.recs.shrink_to_fit();
-        self.meta.shrink_to_fit();
+        self.meta.words.shrink_to_fit();
     }
 
     fn name_range(&self, i: usize) -> (usize, usize) {
@@ -280,10 +298,6 @@ impl Table {
         }
     }
 
-    fn changed(&self, at: usize) -> bool {
-        self.case[at >> 3] & (1 << (at & 7)) != 0
-    }
-
     pub fn name(&self, rec: u32) -> Option<String> {
         let s = self.slots.get(rec as usize)?;
         if s.name == NONE {
@@ -291,7 +305,7 @@ impl Table {
         }
         let (a, b) = self.name_range((s.name & IDX) as usize);
         let f = std::str::from_utf8(&self.fold[a..b]).ok()?;
-        Some(crate::fold::unfold(f, |i| self.changed(a + i)))
+        Some(self.case.unfold((s.name & IDX) as usize, f))
     }
 
     pub fn is_dir(&self, rec: u32) -> bool {
@@ -303,14 +317,14 @@ impl Table {
     }
 
     pub fn needs_modified(&self, rec: u32) -> bool {
-        self.slots.get(rec as usize).is_some_and(|s| s.name != NONE && self.meta[(s.name & IDX) as usize] & !META_NOISY == 0)
+        self.slots.get(rec as usize).is_some_and(|s| s.name != NONE && self.meta.needs_modified((s.name & IDX) as usize))
     }
 
     /// Updates a named file's last write time. An unavailable read preserves the known time.
     pub fn set_modified(&mut self, rec: u32, modified: i64) -> bool {
         let Some(s) = self.slots.get(rec as usize).filter(|s| s.name != NONE && modified > 0) else { return false };
-        let m = &mut self.meta[(s.name & IDX) as usize];
-        *m = modified as u64 | (*m & META_NOISY);
+        let i = (s.name & IDX) as usize;
+        self.meta.set(i, modified as u64, self.meta.noisy(i));
         true
     }
 
@@ -328,22 +342,25 @@ impl Table {
     /// pruned tree does not replace a kept name outside it: a file with hard links on both sides
     /// keeps its outside one (the journal reports changes under either name).
     pub fn upsert(&mut self, rec: u32, parent: u32, name: &str, dir: bool, attrs_noisy: bool, modified: i64) {
+        self.upsert_record(rec, parent, name, dir, attrs_noisy, modified, true);
+    }
+
+    fn upsert_record(&mut self, rec: u32, parent: u32, name: &str, dir: bool, attrs_noisy: bool, modified: i64, respect_pruning: bool) {
         if rec == NONE || name.is_empty() || name.contains('\n') {
             return;
         }
         let r = rec as usize;
         if r >= self.slots.len() {
-            let count = r + 1 - self.slots.len();
-            reserve_append(&mut self.slots, count, self.compact_growth);
-            self.slots.resize(r + 1, FREE);
+            self.slots.resize(r + 1, self.compact_growth);
         }
-        if self.pruned_parent(parent) {
-            if !dir && self.slots[r].name != NONE && !self.walk_pruned(rec) {
+        let old = self.slots.at(r);
+        if respect_pruning && self.pruned_parent(parent) {
+            if !dir && old.name != NONE && !self.walk_pruned(rec) {
                 self.set_modified(rec, modified);
                 return;
             }
             self.remove(rec);
-            self.slots[r] = PRUNED;
+            self.slots.set(r, PRUNED);
             if !dir {
                 self.pruned_files.push(rec);
             }
@@ -353,56 +370,61 @@ impl Table {
             self.prune_roots.push(rec);
         }
         let noisy = attrs_noisy || name.starts_with('$') || NOISY_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name));
-        let under = noisy || self.slots.get(parent as usize).is_some_and(|p| p.name != NONE && p.name & UNDER != 0);
-        let flags = if dir { DIR } else { 0 } | if noisy { NOISY } else { 0 } | if under { UNDER } else { 0 };
-        let old = self.slots[r];
-        let mut previous = 0;
+        let under = noisy || self.slots.get(parent as usize).is_some_and(|p| {
+            p.name != NONE && self.meta.noisy((p.name & IDX) as usize)
+        });
+        let flags = if dir { DIR } else { 0 } | if noisy { NOISY } else { 0 };
+        let mut time = modified.max(0) as u64;
         if old.name != NONE {
             let oi = (old.name & IDX) as usize;
-            previous = self.meta[oi] & !META_NOISY;
+            if time == 0 {
+                time = self.meta.get(oi) & !META_NOISY;
+            }
             if old.parent == parent && self.name(rec).as_deref() == Some(name) {
-                self.slots[r].name = (old.name & IDX) | flags;
-                self.meta[oi] = write_time(modified, previous) | if under { META_NOISY } else { 0 };
+                self.slots.set(r, Slot { name: (old.name & IDX) | flags, ..old });
+                self.meta.set(oi, time, under);
                 return;
             }
-            self.recs[(old.name & IDX) as usize] = NONE;
+            self.recs.set(oi, NONE);
+            self.case.remove(oi);
+            self.meta.clear(oi);
             self.dead += 1;
             self.live -= 1;
         }
         let idx = self.starts.len() as u32;
         reserve_append(&mut self.starts, 1, self.compact_growth);
-        reserve_append(&mut self.recs, 1, self.compact_growth);
-        reserve_append(&mut self.meta, 1, self.compact_growth);
-        self.starts.push(self.fold.len() as u32);
-        self.recs.push(rec);
-        self.meta.push(write_time(modified, previous) | if under { META_NOISY } else { 0 });
-        let base = self.fold.len();
-        let count = name.len() + 1;
-        reserve_append(&mut self.fold, count, self.compact_growth);
-        let case_len = (base + count).div_ceil(8);
-        let extra_case = case_len - self.case.len();
-        reserve_append(&mut self.case, extra_case, self.compact_growth);
-        self.case.resize(case_len, 0);
-        fold::push_folded(name, &mut self.fold, |i| {
-            let at = base + i;
-            self.case[at >> 3] |= 1 << (at & 7);
-        });
+        let start = self.fold.len();
+        self.starts.push(start as u32);
+        self.recs.push(rec, self.compact_growth);
+        self.meta.push(time, under, self.compact_growth);
+        reserve_append(&mut self.fold, name.len() + 1, self.compact_growth);
+        reserve_append(&mut self.case.marks, 1, self.compact_growth);
+        self.case.marks.push(0);
+        fold::push_folded(name, &mut self.fold, |at| self.case.mark(idx as usize, name.len(), at));
+        if let [a, b, ..] = self.fold[start..] {
+            let (word, bit) = prefix_bit(a, b);
+            if self.prefixes.is_empty() {
+                self.prefixes.resize(PREFIX_WORDS, 0);
+            }
+            self.prefixes[word] |= bit;
+        }
         self.fold.push(SEP);
-        self.slots[r] = Slot { parent, name: idx | flags };
+        self.slots.set(r, Slot { parent, name: idx | flags });
         self.live += 1;
     }
 
     pub fn remove(&mut self, rec: u32) {
         self.mark_link_change(rec);
         self.aliases.remove(&rec);
-        let Some(s) = self.slots.get_mut(rec as usize) else { return };
+        let Some(s) = self.slots.get(rec as usize) else { return };
+        self.slots.set(rec as usize, FREE);
         if s.name == NONE {
             // A deleted file inside a pruned tree is free, not pruned (a lookup then sees the change).
-            *s = FREE;
             return;
         }
-        self.recs[(s.name & IDX) as usize] = NONE;
-        *s = FREE;
+        self.recs.set((s.name & IDX) as usize, NONE);
+        self.case.remove((s.name & IDX) as usize);
+        self.meta.clear((s.name & IDX) as usize);
         self.dead += 1;
         self.live -= 1;
     }
@@ -434,7 +456,7 @@ impl Table {
         });
         let end = cursor.next.saturating_add(names).min(self.starts.len());
         for i in cursor.next..end {
-            let rec = self.recs[i];
+            let rec = self.recs.get(i);
             if rec == NONE {
                 self.dead -= 1;
                 continue;
@@ -442,21 +464,14 @@ impl Table {
             let (a, b) = self.name_range(i);
             let base = cursor.bytes;
             if base != a {
-                // The write cursor trails the read cursor, so later case bits remain intact.
-                // Copy the separator's zero bit as well, for the next name appended there.
-                for (at, source) in (base..).zip(a..=b) {
-                    let changed = u8::from(self.changed(source));
-                    let mask = 1 << (at & 7);
-                    let byte = &mut self.case[at >> 3];
-                    *byte = (*byte & !mask) | (changed << (at & 7));
-                }
                 self.fold.copy_within(a..=b, base);
             }
-            let slot = &mut self.slots[rec as usize];
-            slot.name = (slot.name & !IDX) | cursor.kept as u32;
+            let slot = self.slots.at(rec as usize);
+            self.slots.set(rec as usize, Slot { name: (slot.name & !IDX) | cursor.kept as u32, ..slot });
             self.starts[cursor.kept] = base as u32;
-            self.recs[cursor.kept] = rec;
-            self.meta[cursor.kept] = self.meta[i];
+            self.recs.set(cursor.kept, rec);
+            self.meta.compact(i, cursor.kept);
+            self.case.compact(i, cursor.kept);
             cursor.bytes += b + 1 - a;
             cursor.kept += 1;
         }
@@ -469,13 +484,10 @@ impl Table {
         // under the volume lock, even when shrinking.
         let Compaction { kept, bytes: base, .. } = cursor;
         self.fold.truncate(base);
-        self.case.truncate(base.div_ceil(8));
-        if base % 8 != 0 && let Some(last) = self.case.last_mut() {
-            *last &= (1 << (base % 8)) - 1;
-        }
+        self.case.marks.truncate(kept);
         self.starts.truncate(kept);
         self.recs.truncate(kept);
-        self.meta.truncate(kept);
+        self.meta.words.truncate(kept);
         false
     }
 
@@ -485,12 +497,16 @@ impl Table {
         let mut pruned = 0;
         if !self.prune_roots.is_empty() {
             for r in 0..self.slots.len() as u32 {
-                if self.slots[r as usize].name != NONE && self.walk_pruned(r) {
-                    if self.slots[r as usize].name & DIR == 0 {
+                let slot = self.slots.at(r as usize);
+                if slot.name != NONE && self.walk_pruned(r) {
+                    if slot.name & DIR == 0 {
                         self.pruned_files.push(r);
                     }
-                    self.recs[(self.slots[r as usize].name & IDX) as usize] = NONE;
-                    self.slots[r as usize] = PRUNED;
+                    let i = (slot.name & IDX) as usize;
+                    self.recs.set(i, NONE);
+                    self.case.remove(i);
+                    self.meta.clear(i);
+                    self.slots.set(r as usize, PRUNED);
                     self.dead += 1;
                     self.live -= 1;
                     pruned += 1;
@@ -501,14 +517,12 @@ impl Table {
             }
         }
         for r in 0..self.slots.len() as u32 {
-            if self.slots[r as usize].name == NONE {
+            let slot = self.slots.at(r as usize);
+            if slot.name == NONE {
                 continue;
             }
             let u = self.walk_noisy(r);
-            let s = &mut self.slots[r as usize];
-            s.name = if u { s.name | UNDER } else { s.name & !UNDER };
-            let m = &mut self.meta[(s.name & IDX) as usize];
-            *m = if u { *m | META_NOISY } else { *m & !META_NOISY };
+            self.meta.set_noisy((slot.name & IDX) as usize, u);
         }
         pruned
     }
@@ -521,7 +535,7 @@ impl Table {
             if s.name == NONE || r == ROOT || s.parent == r {
                 return false;
             }
-            let p = self.slots.get(s.parent as usize).copied().unwrap_or(FREE);
+            let p = self.slots.get(s.parent as usize).unwrap_or(FREE);
             if self.prune_roots.contains(&s.parent) || (p.parent == NONE && p.name == NONE) {
                 return true;
             }
@@ -581,14 +595,18 @@ impl Table {
     /// come in order, mostly close together): gallop, then binary search.
     fn seek(&self, from: usize, end: usize, pos: usize) -> usize {
         let (mut lo, mut step) = (from, 1usize);
-        let mut hi = lo;
-        while hi < end && self.starts[hi] as usize <= pos {
+        let hi = loop {
+            if step >= end - lo {
+                break end;
+            }
+            let hi = lo + step;
+            if self.starts[hi] as usize > pos {
+                break hi;
+            }
             lo = hi;
-            hi += step;
             step *= 2;
-        }
-        let hi = hi.min(end);
-        lo + self.starts[lo..hi].partition_point(|&s| s as usize <= pos).saturating_sub(1)
+        };
+        lo + self.starts[lo + 1..hi].partition_point(|&s| s as usize <= pos)
     }
 
     /// The best `max` matches of the folded query `q`, sorted.
@@ -610,7 +628,7 @@ impl Table {
             let leaf = path.rsplit_once('\\')?.1;
             let folded = fold::fold(leaf);
             let mut matching = self.name_indices().into_iter().flatten().filter_map(|i| {
-                let rec = self.recs[i];
+                let rec = self.recs.get(i);
                 if rec == NONE || !self.is_dir(rec) {
                     return None;
                 }
@@ -658,14 +676,23 @@ impl Table {
         }
         let mut top = Top::new(max);
         // Name prefixes: one pass over the name starts, cheaper than memmem when most names match.
-        let (q0, n) = (q[0], q.len());
+        let (q0, tail) = (q[0], &q[1..]);
         let indices = self.name_indices();
-        for names in &indices {
-            for (i, &st) in (names.start..).zip(&self.starts[names.clone()]) {
-                let st = st as usize;
-                if self.fold[st] == q0 && self.fold.get(st..st + n) == Some(q) && self.recs[i] != NONE
-                    && scope.is_none_or(|ancestor| self.descends_from(self.recs[i], ancestor)) {
-                    top.offer(meta_key(self.meta[i], 0), i);
+        let prefix_possible = tail.first().is_none_or(|&q1| {
+            let (word, bit) = prefix_bit(q0, q1);
+            self.prefixes.get(word).is_some_and(|mask| mask & bit != 0)
+        });
+        if prefix_possible {
+            for names in &indices {
+                for (i, &st) in (names.start..).zip(&self.starts[names.clone()]) {
+                    let st = st as usize;
+                    if self.fold[st] == q0
+                        && (tail.is_empty() || self.fold.get(st + 1..st + 1 + tail.len()) == Some(tail)) {
+                        let rec = self.recs.get(i);
+                        if rec != NONE && scope.is_none_or(|ancestor| self.descends_from(rec, ancestor)) {
+                            top.offer(meta_key(self.meta.get(i), 0), rec);
+                        }
+                    }
                 }
             }
         }
@@ -683,11 +710,12 @@ impl Table {
                     i = self.seek(i, names.end, m);
                     let (s, e) = self.name_range(i);
                     at = e + 1;
-                    if m == s || self.recs[i] == NONE || scope.is_some_and(|ancestor| !self.descends_from(self.recs[i], ancestor)) {
+                    let rec = self.recs.get(i);
+                    if m == s || rec == NONE || scope.is_some_and(|ancestor| !self.descends_from(rec, ancestor)) {
                         continue;
                     }
                     let rank = if word_start(self.fold[m - 1]) { 1 } else { 2 };
-                    top.offer(meta_key(self.meta[i], rank), i);
+                    top.offer(meta_key(self.meta.get(i), rank), rec);
                     seen += 1;
                     if scope.is_none() && seen >= INNER_CAP {
                         break 'arenas;
@@ -695,7 +723,7 @@ impl Table {
                 }
             }
         }
-        let mut out: Vec<Found> = top.heap.into_iter().map(|(k, i)| Found { key: k, rec: self.recs[i] }).collect();
+        let mut out: Vec<Found> = top.heap.into_iter().map(|(key, rec)| Found { key, rec }).collect();
         out.sort_unstable();
         out
     }
@@ -772,8 +800,9 @@ mod scope_tests {
 /// Inner matches looked at, at most, per query.
 const INNER_CAP: usize = 60_000;
 
-fn write_time(modified: i64, previous: u64) -> u64 {
-    if modified > 0 { modified as u64 } else { previous }
+fn prefix_bit(a: u8, b: u8) -> (usize, u64) {
+    let prefix = usize::from(u16::from_be_bytes([a, b]));
+    (prefix / 64, 1 << (prefix % 64))
 }
 
 fn meta_key(meta: u64, rank: u8) -> SortKey {
@@ -782,7 +811,7 @@ fn meta_key(meta: u64, rank: u8) -> SortKey {
 
 /// The best `max` keys seen so far (a max-heap: the worst kept on top).
 struct Top {
-    heap: std::collections::BinaryHeap<(SortKey, usize)>,
+    heap: std::collections::BinaryHeap<(SortKey, u32)>,
     max: usize,
 }
 
@@ -791,12 +820,13 @@ impl Top {
         Top { heap: std::collections::BinaryHeap::with_capacity(max + 1), max }
     }
 
-    fn offer(&mut self, k: SortKey, i: usize) {
+    fn offer(&mut self, k: SortKey, rec: u32) {
+        let candidate = (k, rec);
         if self.heap.len() < self.max {
-            self.heap.push((k, i));
-        } else if self.heap.peek().is_some_and(|w| k < w.0) {
+            self.heap.push(candidate);
+        } else if self.heap.peek().is_some_and(|w| candidate < *w) {
             self.heap.pop();
-            self.heap.push((k, i));
+            self.heap.push(candidate);
         }
     }
 
@@ -843,19 +873,23 @@ mod tests {
     }
 
     #[test]
-    fn newest_last_write_wins_before_cut() {
+    fn newest_bucket_wins_and_equal_buckets_break_ties_by_record() {
         let mut t = sample();
         let older = 133_800_000_000_000_000;
+        let two_seconds = 20_000_000;
+        t.upsert(52, 32, "clock-new.txt", false, false, older + two_seconds + 1);
+        t.upsert(50, 32, "clock-later.txt", false, false, older + two_seconds);
         t.upsert(51, 32, "clock-old.txt", false, false, older);
-        t.upsert(52, 32, "clock-new.txt", false, false, older + 1);
-        t.upsert(53, 35, "clock-cache.txt", false, false, older + 2);
+        t.upsert(53, 35, "clock-cache.txt", false, false, older + 2 * two_seconds);
         t.compact();
-        assert_eq!(t.query("clock", 1)[0].rec, 52);
+        assert_eq!(t.query("clock", 1)[0].rec, 50);
+        assert_eq!(t.query("clock", 2)[1].modified(), (older + two_seconds) as u64);
+        t.remove(50);
         // SetFileTime can move a file backwards. A later rename without a fresh read keeps it.
         assert!(t.set_modified(52, older - 1));
         t.upsert(52, 32, "clock-renamed.txt", false, false, 0);
         let got = t.query("clock", 2);
-        assert_eq!(got.iter().map(|f| (f.rec, f.modified())).collect::<Vec<_>>(), vec![(51, older as u64), (52, (older - 1) as u64)]);
+        assert_eq!(got.iter().map(|f| (f.rec, f.modified())).collect::<Vec<_>>(), vec![(51, older as u64), (52, (older - two_seconds) as u64)]);
     }
 
     #[test]
@@ -1022,21 +1056,30 @@ mod tests {
     }
 
     #[test]
-    fn compaction_preserves_unicode_case_and_clears_bits_for_the_next_append() {
+    fn compaction_preserves_inline_and_extended_case_before_the_next_append() {
         let mut t = Table::new();
         t.upsert(16, ROOT, "DELETE-A", false, false, 0);
         t.upsert(17, ROOT, "ÉTÉ-ß.txt", false, false, 11);
-        t.upsert(18, ROOT, "REMOVE-ME.txt", false, false, 0);
+        t.upsert(18, ROOT, "remove-another-mixed-case-ALIAS.txt", false, false, 0);
         t.upsert(19, ROOT, "ΣΊΣΥΦΟΣ.txt", false, true, 23);
+        t.upsert(20, ROOT, "long-lowercase-name-ÉTÉ.TXT", false, false, 4);
+        t.upsert(22, ROOT, "lowercase-name-with-A.txt", false, false, 4);
+        t.upsert(23, ROOT, "File-with-a-late-Capital.txt", false, false, 4);
         t.remove(16);
         t.remove(18);
         t.compact();
-        t.upsert(20, ROOT, "lower.txt", false, false, 0);
-        for (record, name) in [(17, "ÉTÉ-ß.txt"), (19, "ΣΊΣΥΦΟΣ.txt"), (20, "lower.txt")] {
+        t.upsert(21, ROOT, "lower.txt", false, false, 0);
+        for (record, name) in [(17, "ÉTÉ-ß.txt"), (19, "ΣΊΣΥΦΟΣ.txt"), (20, "long-lowercase-name-ÉTÉ.TXT"), (21, "lower.txt"), (22, "lowercase-name-with-A.txt"), (23, "File-with-a-late-Capital.txt")] {
             assert_eq!(t.name(record).as_deref(), Some(name));
         }
         let hit = t.query("σίσυφοσ", 1)[0];
         assert_eq!((hit.rec, hit.modified(), hit.noisy()), (19, 23, true));
+        t.journal_current = true;
+        t.finish_initial_links();
+        let mut scan = t.begin_scoped_scan("C:\\", "C:\\").unwrap();
+        let mut hits = Vec::new();
+        assert_eq!(scan.step(&t, "C:\\", &memmem::Finder::new("été".as_bytes()), 16, &mut hits), Some(true));
+        assert_eq!(hits.into_iter().map(|hit| hit.path).collect::<Vec<_>>(), ["C:\\ÉTÉ-ß.txt", "C:\\long-lowercase-name-ÉTÉ.TXT"]);
     }
 
     #[test]
