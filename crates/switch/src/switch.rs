@@ -9,15 +9,12 @@ pub(crate) mod watcher;
 
 use guard::launch_timing::{self, FALLBACK_EVENT, build_verdict_event};
 use guard::proc::{Child, Event};
-use guard::switch_events::{CANCEL_FOR_RESTORE, GUARD_MUTEX, RELEASE_EXPLORER, SWITCH_EXE, WATCHES_EXPLORER_HANDOFF};
+use guard::switch_events::{CANCEL_FOR_RESTORE, RELEASE_EXPLORER, SWITCH_EXE, WATCHES_EXPLORER_HANDOFF};
 use guard::ui::{self, Icon, tr};
 use guard::{account, explorer_launch, install, log, policy, reg, reopen, taskbar};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND};
-use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
-use windows::core::HSTRING;
 
 const VERDICT_LIMIT: Duration = Duration::from_secs(
     launch_timing::NATIVE_BUDGET.as_secs()
@@ -252,24 +249,6 @@ fn wait_for_file_operations(tray: HWND, pid: u32, cancel: &ui::Cancel) -> Result
     Ok(())
 }
 
-fn guard_present() -> Result<bool, String> {
-    // SAFETY: the open handle is closed immediately. The running guard keeps its own handle.
-    match unsafe {
-        OpenMutexW(
-            SYNCHRONIZATION_SYNCHRONIZE,
-            false,
-            &HSTRING::from(GUARD_MUTEX),
-        )
-    } {
-        Ok(handle) => {
-            let _ = unsafe { CloseHandle(handle) };
-            Ok(true)
-        }
-        Err(e) if e.code() == ERROR_FILE_NOT_FOUND.to_hresult() => Ok(false),
-        Err(e) => Err(format!("query the previous guard: {e}")),
-    }
-}
-
 enum PreviousGuard {
     WatchingHandoff,
     Release(Event),
@@ -277,7 +256,7 @@ enum PreviousGuard {
 }
 
 fn previous_guard(explorer: u32, guard: &Path) -> Result<Option<PreviousGuard>, String> {
-    if !guard_present()? {
+    if !install::guard_running()? {
         return Ok(None);
     }
     if Event::open_for_signal(WATCHES_EXPLORER_HANDOFF).is_ok() {
@@ -323,7 +302,7 @@ fn release_previous_guard(previous: Option<PreviousGuard>) -> Result<(), String>
         _ => {}
     }
     let started = Instant::now();
-    while guard_present()? {
+    while install::guard_running()? {
         if started.elapsed() > Duration::from_secs(5) {
             return Err("the previous guard did not release Explorer within 5 s".into());
         }

@@ -7,7 +7,6 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use windows::Win32::System::Threading::TerminateProcess;
 
-const RETIRING_EXPLORER_GRACE: Duration = Duration::from_secs(10);
 
 pub struct ExplorerExit<'a> {
     pub process: &'a Child,
@@ -76,7 +75,7 @@ fn recover(
         let tray_gone_grace_elapsed = if retiring.is_some()
             && original_tray == OriginalTray::Missing && !file_operations
         {
-            original_missing_since.get_or_insert_with(Instant::now).elapsed() >= RETIRING_EXPLORER_GRACE
+            original_missing_since.get_or_insert_with(Instant::now).elapsed() >= policy::RETIRING_EXPLORER_GRACE
                 && last_termination.is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
         } else {
             original_missing_since = None;
@@ -281,22 +280,37 @@ fn recover(
 }
 
 fn stop_retiring_explorer(exit: &ExplorerExit<'_>) -> Result<(), String> {
-    let pid = exit.process.pid;
-    let child = Child::open(pid)?;
+    if stop_retiring(exit.process)? {
+        log::line(&format!("restore: stopped retiring Explorer pid {} after its taskbar disappeared", exit.process.pid));
+    }
+    Ok(())
+}
+
+/// Ends an Explorer whose exit was posted and whose taskbar is gone, unless another process owns
+/// the desktop, a file operation runs, it shows a taskbar again or it already ended. True when it
+/// was ended here.
+pub fn stop_retiring(process: &Child) -> Result<bool, String> {
+    let pid = process.pid;
+    // It may finish on its own between any two of these steps: that is the exit we wanted.
+    let child = match Child::open(pid) {
+        Ok(child) => child,
+        Err(_) if process.ended() => return Ok(false),
+        Err(error) => return Err(error),
+    };
     if taskbar::desktop_owner().is_some_and(|owner| owner != pid)
         || taskbar::explorer_file_operations()
         || taskbar::owns_tray(pid)
-        || exit.process.ended()
+        || process.ended()
     {
-        return Ok(());
+        return Ok(false);
     }
     // SAFETY: the original handle still identifies the same live process as the terminate
-    // handle. Its exit may have been posted, its taskbar is gone, and no file operation is active.
-    unsafe { TerminateProcess(child.handle, 1) }
-        .map_err(|e| format!("could not stop retiring Explorer pid {pid}: {e}"))?;
-    log::line(&format!("restore: stopped retiring Explorer pid {pid} after its taskbar disappeared"));
-    wait_any(&[exit.process.handle], Some(1_000));
-    Ok(())
+    // handle. Its exit was posted, its taskbar is gone, and no file operation is active.
+    if let Err(error) = unsafe { TerminateProcess(child.handle, 1) } {
+        return if process.ended() { Ok(false) } else { Err(format!("could not stop retiring Explorer pid {pid}: {error}")) };
+    }
+    wait_any(&[process.handle], Some(1_000));
+    Ok(true)
 }
 
 fn stop_hung_replacement(process: &Child) -> Result<(), String> {
