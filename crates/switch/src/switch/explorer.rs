@@ -1,6 +1,6 @@
 //! Observe and close only Explorer processes on this desktop and in this Windows session.
 
-use super::reopen_list::{self, Folder};
+use super::reopen_list::{self, Folder, FolderWindow};
 use guard::{explorer_launch::Apartment, explorer_path, log, taskbar};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -13,14 +13,15 @@ use windows::Win32::UI::Shell::{
     SHCreateItemFromIDList, SID_STopLevelBrowser, SIGDN_DESKTOPABSOLUTEPARSING, ShellWindows,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetWindowThreadProcessId, PostMessageW,
+    FindWindowExW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
 };
 use windows::core::{Interface, PCWSTR, w};
 
 const EXIT_EXPLORER: u32 = 0x5B4;
 pub const CLOSE_BUDGET: Duration = Duration::from_secs(30);
 
-fn windows(class: PCWSTR) -> Vec<(HWND, u32)> {
+/// Top-level windows of `class` with their owning process and visibility.
+fn windows(class: PCWSTR) -> Vec<(HWND, u32, bool)> {
     let mut entries = Vec::new();
     let mut after = None;
     // SAFETY: enumerate top-level windows on this thread's desktop.
@@ -28,7 +29,7 @@ fn windows(class: PCWSTR) -> Vec<(HWND, u32)> {
         while let Ok(hwnd) = FindWindowExW(None, after, class, None) {
             let mut pid = 0;
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            entries.push((hwnd, pid));
+            entries.push((hwnd, pid, IsWindowVisible(hwnd).as_bool()));
             after = Some(hwnd);
         }
     }
@@ -38,11 +39,12 @@ fn windows(class: PCWSTR) -> Vec<(HWND, u32)> {
 pub use guard::taskbar::explorer_file_operations as file_operations;
 
 pub fn folder_windows() -> Vec<(isize, u32)> {
-    windows(w!("CabinetWClass"))
-        .into_iter()
-        .filter(|(_, pid)| taskbar::is_explorer(*pid))
-        .map(|(window, pid)| (window.0 as isize, pid))
-        .collect()
+    reopen_list::user_windows(
+        windows(w!("CabinetWClass"))
+            .into_iter()
+            .filter(|(_, pid, _)| taskbar::is_explorer(*pid))
+            .map(|(window, owner, visible)| FolderWindow { hwnd: window.0 as isize, owner, visible }),
+    )
 }
 
 /// Returns None if windows came or went while COM was reading their folders.
@@ -159,7 +161,7 @@ pub fn wait_for_desktop_windows() -> Result<(), String> {
         }
         let desktop_window = windows(w!("Progman"))
             .into_iter()
-            .any(|(_, owner)| taskbar::is_explorer(owner));
+            .any(|(_, owner, _)| taskbar::is_explorer(owner));
         // Wait until every original Explorer folder window is gone before handing over to Files.
         if !desktop_window && folder_windows().is_empty() {
             return Ok(());

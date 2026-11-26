@@ -20,6 +20,23 @@ pub fn folders(entries: impl IntoIterator<Item = Folder>) -> Vec<Folder> {
         .collect()
 }
 
+/// A top-level `CabinetWClass` window owned by Explorer.
+pub struct FolderWindow {
+    pub hwnd: isize,
+    pub owner: u32,
+    pub visible: bool,
+}
+
+/// Windows the switch must save, close and reopen. Explorer's window preloading keeps a
+/// hidden folder window that ShellWindows does not list; it closes with its process.
+pub fn user_windows(windows: impl IntoIterator<Item = FolderWindow>) -> Vec<(isize, u32)> {
+    windows
+        .into_iter()
+        .filter(|window| window.visible)
+        .map(|window| (window.hwnd, window.owner))
+        .collect()
+}
+
 pub fn same_windows(saved: &[Folder], observed: impl Iterator<Item = (isize, u32)>) -> bool {
     let saved_handles: HashSet<_> = saved
         .iter()
@@ -93,6 +110,18 @@ mod tests {
         assert!(!same_windows(&saved, [(1, 1), (2, 2), (3, 3)].into_iter()));
         assert!(!same_windows(&saved, [(1, 1)].into_iter()));
         assert!(!same_windows(&saved, [(1, 1), (2, 3)].into_iter()));
+    }
+
+    #[test]
+    fn hidden_preloaded_explorer_window_is_not_a_user_folder() {
+        // Windows 11 window preloading keeps a hidden "This PC" CabinetWClass that ShellWindows
+        // does not list, so its folder can never be read.
+        let observed = [
+            FolderWindow { hwnd: 1, owner: 7, visible: true },
+            FolderWindow { hwnd: 2, owner: 7, visible: false },
+        ];
+        let saved = [folder(1, 7, r"C:\Users\Public")];
+        assert!(same_windows(&saved, user_windows(observed).into_iter()));
     }
 
     #[test]
