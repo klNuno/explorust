@@ -27,12 +27,27 @@ pub struct FolderWindow {
     pub visible: bool,
 }
 
-/// Windows the switch must save, close and reopen. Explorer's window preloading keeps a
-/// hidden folder window that ShellWindows does not list; it closes with its process.
-pub fn user_windows(windows: impl IntoIterator<Item = FolderWindow>) -> Vec<(isize, u32)> {
+/// Explorer's window preloading keeps a hidden folder window that ShellWindows does not list,
+/// so it can never be saved; it closes with its process. Only the windows seen that way at
+/// capture are excused: a window that appears later makes the switch capture again.
+pub fn preloaded(windows: &[FolderWindow], listed: &HashSet<(isize, u32)>) -> HashSet<(isize, u32)> {
+    windows
+        .iter()
+        .map(|window| (window.visible, (window.hwnd, window.owner)))
+        .filter(|(visible, window)| !visible && !listed.contains(window))
+        .map(|(_, window)| window)
+        .collect()
+}
+
+/// Windows the switch must save, close and reopen. A preloaded window shown since the capture
+/// counts again.
+pub fn user_windows(
+    windows: impl IntoIterator<Item = FolderWindow>,
+    preloaded: &HashSet<(isize, u32)>,
+) -> Vec<(isize, u32)> {
     windows
         .into_iter()
-        .filter(|window| window.visible)
+        .filter(|window| window.visible || !preloaded.contains(&(window.hwnd, window.owner)))
         .map(|window| (window.hwnd, window.owner))
         .collect()
 }
@@ -116,12 +131,23 @@ mod tests {
     fn hidden_preloaded_explorer_window_is_not_a_user_folder() {
         // Windows 11 window preloading keeps a hidden "This PC" CabinetWClass that ShellWindows
         // does not list, so its folder can never be read.
-        let observed = [
-            FolderWindow { hwnd: 1, owner: 7, visible: true },
-            FolderWindow { hwnd: 2, owner: 7, visible: false },
-        ];
-        let saved = [folder(1, 7, r"C:\Users\Public")];
-        assert!(same_windows(&saved, user_windows(observed).into_iter()));
+        let window = |hwnd, visible| FolderWindow { hwnd, owner: 7, visible };
+        let observed = [window(1, true), window(2, false), window(3, false)];
+        // Window 3 is hidden by its user but listed by ShellWindows: it is saved and reopened.
+        let listed = HashSet::from([(1, 7), (3, 7)]);
+        let excused = preloaded(&observed, &listed);
+        assert_eq!(excused, HashSet::from([(2, 7)]));
+        let handles = || observed.iter().map(|w| window(w.hwnd, w.visible));
+        let saved = [folder(1, 7, r"C:\Users\Public"), folder(3, 7, r"C:\Windows\Web")];
+        assert!(same_windows(&saved, user_windows(handles(), &excused).into_iter()));
+        // A listed window whose folder could not be read still blocks the snapshot.
+        assert!(!same_windows(&saved[..1], user_windows(handles(), &excused).into_iter()));
+        // A hidden window that appears after the capture is not excused.
+        let later = handles().chain([window(4, false)]);
+        assert!(!same_windows(&saved, user_windows(later, &excused).into_iter()));
+        // The preloaded window shown later with the same handle must be saved too.
+        let shown = [window(1, true), window(2, true), window(3, false)];
+        assert!(!same_windows(&saved, user_windows(shown, &excused).into_iter()));
     }
 
     #[test]

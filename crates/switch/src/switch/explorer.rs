@@ -2,6 +2,7 @@
 
 use super::reopen_list::{self, Folder, FolderWindow};
 use guard::{explorer_launch::Apartment, explorer_path, log, taskbar};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
@@ -38,20 +39,33 @@ fn windows(class: PCWSTR) -> Vec<(HWND, u32, bool)> {
 
 pub use guard::taskbar::explorer_file_operations as file_operations;
 
+fn explorer_folder_windows() -> Vec<FolderWindow> {
+    windows(w!("CabinetWClass"))
+        .into_iter()
+        .filter(|(_, pid, _)| taskbar::is_explorer(*pid))
+        .map(|(window, owner, visible)| FolderWindow { hwnd: window.0 as isize, owner, visible })
+        .collect()
+}
+
+/// Every Explorer folder window, hidden ones included.
 pub fn folder_windows() -> Vec<(isize, u32)> {
-    reopen_list::user_windows(
-        windows(w!("CabinetWClass"))
-            .into_iter()
-            .filter(|(_, pid, _)| taskbar::is_explorer(*pid))
-            .map(|(window, owner, visible)| FolderWindow { hwnd: window.0 as isize, owner, visible }),
-    )
+    explorer_folder_windows().into_iter().map(|window| (window.hwnd, window.owner)).collect()
+}
+
+/// Hidden preloaded folder windows excused at capture.
+pub type Preloaded = HashSet<(isize, u32)>;
+
+/// The folder windows a snapshot must cover.
+pub fn user_windows(preloaded: &Preloaded) -> Vec<(isize, u32)> {
+    reopen_list::user_windows(explorer_folder_windows(), preloaded)
 }
 
 /// Returns None if windows came or went while COM was reading their folders.
-pub fn open_folders() -> Result<Option<Vec<Folder>>, String> {
-    let open = folder_windows();
+pub fn open_folders() -> Result<Option<(Vec<Folder>, Preloaded)>, String> {
+    let windows = explorer_folder_windows();
+    let open: Vec<_> = windows.iter().map(|window| (window.hwnd, window.owner)).collect();
     if open.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Some((Vec::new(), Preloaded::new())));
     }
     let _apartment = Apartment::new().map_err(|e| format!("initialize ShellWindows COM: {e}"))?;
     // SAFETY: the worker owns the apartment and drops all interfaces before uninitializing it.
@@ -62,6 +76,7 @@ pub fn open_folders() -> Result<Option<Vec<Folder>>, String> {
             .Count()
             .map_err(|e| format!("count ShellWindows: {e}"))?;
         let mut entries = Vec::new();
+        let mut listed = HashSet::new();
         for i in 0..count {
             let Ok(browser) = list
                 .Item(&VARIANT::from(i))
@@ -73,6 +88,7 @@ pub fn open_folders() -> Result<Option<Vec<Folder>>, String> {
             let Some(&(_, owner)) = open.iter().find(|(h, _)| *h == hwnd.0) else {
                 continue;
             };
+            listed.insert((hwnd.0, owner));
             match active_folder(&browser) {
                 Ok(folder) if !folder.is_empty() && !folder.contains('\0') => {
                     entries.push(Folder { hwnd: hwnd.0, owner, path: folder })
@@ -91,10 +107,11 @@ pub fn open_folders() -> Result<Option<Vec<Folder>>, String> {
         if current.len() != open.len() || current.iter().any(|window| !open.contains(window)) {
             return Ok(None);
         }
-        if !reopen_list::same_windows(&entries, open.into_iter()) {
+        let preloaded = reopen_list::preloaded(&windows, &listed);
+        if !reopen_list::same_windows(&entries, reopen_list::user_windows(windows, &preloaded).into_iter()) {
             return Err("one or more Explorer windows could not be saved".into());
         }
-        Ok(Some(reopen_list::folders(entries)))
+        Ok(Some((reopen_list::folders(entries), preloaded)))
     }
 }
 
@@ -153,7 +170,7 @@ pub fn post_exit(
     Ok(true)
 }
 
-pub fn wait_for_desktop_windows() -> Result<(), String> {
+pub fn wait_for_desktop_windows(preloaded: &Preloaded) -> Result<(), String> {
     let started = Instant::now();
     loop {
         if let Some((_, owner)) = taskbar::explorer_window() {
@@ -163,7 +180,7 @@ pub fn wait_for_desktop_windows() -> Result<(), String> {
             .into_iter()
             .any(|(_, owner, _)| taskbar::is_explorer(owner));
         // Wait until every original Explorer folder window is gone before handing over to Files.
-        if !desktop_window && folder_windows().is_empty() {
+        if !desktop_window && user_windows(preloaded).is_empty() {
             return Ok(());
         }
         if started.elapsed() >= CLOSE_BUDGET {
