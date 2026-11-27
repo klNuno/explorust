@@ -1,7 +1,7 @@
 //! What a button does to windows and apps: activate, minimize, launch through the shell.
 
 use super::{log, winx};
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32,
@@ -12,7 +12,7 @@ use windows::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, SHGetIDListFromObject, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, FindWindowExW, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, PostMessageW, SC_MINIMIZE, SC_RESTORE,
+    BringWindowToTop, FindWindowExW, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, PostMessageW, SC_CLOSE, SC_MINIMIZE, SC_RESTORE,
     SW_SHOWNORMAL, SetForegroundWindow, SwitchToThisWindow, WM_SYSCOMMAND,
 };
 
@@ -113,31 +113,58 @@ pub fn minimize(h: HWND) {
 }
 
 /// The process that owns `h`'s content: a UWP frame's hosted CoreWindow, else the window's own.
-fn content_pid(h: HWND) -> u32 {
+/// None for a frame whose app cannot be found (ending its host would close other apps' frames).
+fn content_pid(h: HWND) -> Option<u32> {
     let mut pid = 0u32;
+    let mut class = [0u16; 64];
     // SAFETY: window queries on a handle; a stale one gives 0.
     unsafe {
-        if let Ok(core) = FindWindowExW(Some(h), None, w!("Windows.UI.Core.CoreWindow"), None) {
+        let n = GetClassNameW(h, &mut class);
+        if String::from_utf16_lossy(&class[..n.max(0) as usize]) == "ApplicationFrameWindow" {
+            let core = FindWindowExW(Some(h), None, w!("Windows.UI.Core.CoreWindow"), None).ok()?;
             GetWindowThreadProcessId(core, Some(&mut pid));
-        }
-        if pid == 0 {
+        } else {
             GetWindowThreadProcessId(h, Some(&mut pid));
         }
     }
-    pid
+    (pid != 0).then_some(pid)
+}
+
+/// The full image path of an open process, None when Windows does not give it.
+fn image_path(h: HANDLE) -> Option<String> {
+    let mut buf = vec![0u16; 1024];
+    let mut n = buf.len() as u32;
+    // SAFETY: fills a local buffer of `n` units.
+    unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n) }.ok()?;
+    Some(String::from_utf16_lossy(&buf[..n as usize]))
 }
 
 /// Ends the processes behind a button's windows at once, like Windows' "End task" (Settings >
 /// System > For developers), which also stops an app that no longer answers. Never ends this
-/// shell or explorer.exe.
-pub fn end_task(wins: &[isize]) {
+/// shell, explorer.exe, a UWP frame host or a process unknown by name. A process that also owns
+/// a window of another button (`others`) is not ended: this button's windows get a close instead.
+pub fn end_task(wins: &[isize], others: &[isize]) {
     // SAFETY: plain process id query.
     let me = unsafe { GetCurrentProcessId() };
-    let mut pids: Vec<u32> = wins.iter().map(|h| content_pid(HWND(*h as _))).filter(|p| *p != 0 && *p != me).collect();
+    let shared: Vec<u32> = others.iter().filter_map(|h| content_pid(HWND(*h as _))).collect();
+    let mut pids = Vec::new();
+    for &w in wins {
+        let h = HWND(w as _);
+        match content_pid(h) {
+            Some(pid) if shared.contains(&pid) => {
+                log::line(&format!("end task: pid {pid} also owns another button's window, closing {w:#x} instead"));
+                // SAFETY: asks the window to close, like its own close button.
+                let _ = unsafe { PostMessageW(Some(h), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0)) };
+            }
+            Some(pid) if pid != me => pids.push(pid),
+            Some(_) => {}
+            None => log::line(&format!("end task: no app process for window {w:#x}, skipped")),
+        }
+    }
     pids.sort_unstable();
     pids.dedup();
     for pid in pids {
-        // SAFETY: a handle we open, query and close here.
+        // SAFETY: a handle we open, query, use and close here.
         unsafe {
             let h = match OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
                 Ok(h) => h,
@@ -146,20 +173,18 @@ pub fn end_task(wins: &[isize]) {
                     continue;
                 }
             };
-            let mut buf = [0u16; 260];
-            let mut n = buf.len() as u32;
-            let path = if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n).is_ok() {
-                String::from_utf16_lossy(&buf[..n as usize])
-            } else {
-                String::new()
-            };
-            let name = path.rsplit('\\').next().unwrap_or("");
-            if name.eq_ignore_ascii_case("explorer.exe") {
-                log::line(&format!("end task: kept {path} (pid {pid})"));
-            } else {
-                match TerminateProcess(h, 1) {
-                    Ok(()) => log::line(&format!("end task: ended {path} (pid {pid})")),
-                    Err(e) => log::line(&format!("end task: {path} (pid {pid}): {e}")),
+            match image_path(h) {
+                None => log::line(&format!("end task: pid {pid} has no image path, kept")),
+                Some(path) => {
+                    let name = path.rsplit('\\').next().unwrap_or("");
+                    if ["explorer.exe", "ApplicationFrameHost.exe"].iter().any(|k| name.eq_ignore_ascii_case(k)) {
+                        log::line(&format!("end task: kept {path} (pid {pid})"));
+                    } else {
+                        match TerminateProcess(h, 1) {
+                            Ok(()) => log::line(&format!("end task: ended {path} (pid {pid})")),
+                            Err(e) => log::line(&format!("end task: {path} (pid {pid}): {e}")),
+                        }
+                    }
                 }
             }
             let _ = CloseHandle(h);

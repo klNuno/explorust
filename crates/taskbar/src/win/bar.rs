@@ -128,6 +128,8 @@ struct Bar {
     thumb_want: Option<usize>,
     /// A jump list or context menu of the bar is open.
     menu_up: bool,
+    /// Bar menus open now: a rejected nested request must not clear the outer one's flag.
+    menu_depth: u32,
     /// Keyboard focus on the right side (Win+B): index in `tray_hits()`.
     tray_focus: Option<usize>,
     taskband: Taskband,
@@ -360,6 +362,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             thumbs: None,
             thumb_want: None,
             menu_up: false,
+            menu_depth: 0,
             tray_focus: None,
             taskband,
             shown: if settings.autohide { 0.0 } else { 1.0 },
@@ -1190,7 +1193,8 @@ impl Bar {
 
     /// A menu of the bar opens (true) or closes: no thumbnail flyout while it shows.
     fn set_menu_up(&mut self, up: bool) {
-        self.menu_up = up;
+        self.menu_depth = if up { self.menu_depth + 1 } else { self.menu_depth.saturating_sub(1) };
+        self.menu_up = self.menu_depth > 0;
         if up {
             self.close_thumbs();
         }
@@ -1326,7 +1330,10 @@ impl Bar {
                     let _ = unsafe { PostMessageW(Some(HWND(*h as _)), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0)) };
                 }
             }
-            jump::Pick::EndTask => actions::end_task(&g.wins),
+            jump::Pick::EndTask => {
+                let others: Vec<isize> = self.groups.iter().filter(|o| o.key != g.key).flat_map(|o| o.wins.iter().copied()).collect();
+                actions::end_task(&g.wins, &others);
+            }
             jump::Pick::Pin => {
                 if let Some(pi) = g.pin {
                     self.pins.remove(pi);

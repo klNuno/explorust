@@ -88,7 +88,12 @@ pub fn build(i: &Input, french: bool) -> Vec<Entry> {
     out.push(Entry::Item(ID_PIN, pin.to_string()));
     if i.end_task && i.windows > 0 {
         // Windows' own label, from Windows.UI.ShellCommon's resources.
-        out.push(Entry::Item(ID_END_TASK, t("End task", "Terminer la tâche").to_string()));
+        let label = if i.windows > 1 {
+            t("End all tasks", "Terminer toutes les tâches")
+        } else {
+            t("End task", "Terminer la tâche")
+        };
+        out.push(Entry::Item(ID_END_TASK, label.to_string()));
     }
     match i.windows {
         0 => {}
@@ -156,6 +161,9 @@ mod tests {
         assert!(!build(&closed, false).contains(&Entry::Item(ID_END_TASK, "End task".into())));
         let off = Input { app: "Spotify".into(), windows: 1, ..Default::default() };
         assert!(build(&off, false).iter().all(|e| !matches!(e, Entry::Item(ID_END_TASK, _))));
+        let two = Input { app: "Edge".into(), windows: 2, end_task: true, ..Default::default() };
+        assert!(build(&two, true).contains(&Entry::Item(ID_END_TASK, "Terminer toutes les tâches".into())));
+        assert!(build(&two, false).contains(&Entry::Item(ID_END_TASK, "End all tasks".into())));
         assert_eq!(pick(ID_END_TASK), Some(Pick::EndTask));
     }
 
