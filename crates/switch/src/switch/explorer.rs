@@ -4,10 +4,11 @@ use super::reopen_list::{self, Folder, FolderWindow};
 use guard::{explorer_launch::Apartment, explorer_path, log, taskbar};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, CoCreateInstance, CoTaskMemFree, IServiceProvider,
 };
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_INFORMATION};
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Shell::{
     IFolderView, IPersistFolder2, IShellBrowser, IShellItem, IShellWindows, IWebBrowser2,
@@ -20,6 +21,15 @@ use windows::core::{Interface, PCWSTR, w};
 
 const EXIT_EXPLORER: u32 = 0x5B4;
 pub const CLOSE_BUDGET: Duration = Duration::from_secs(30);
+const PROCESS_DEFAULT_HARD_ERROR_MODE: u32 = 12;
+/// SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX) as the
+/// kernel stores it: the critical-error bit is inverted (measured in g1: 0x8002).
+const QUIET_HARD_ERRORS: u32 = 0x8002;
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtSetInformationProcess(process: HANDLE, class: u32, info: *const core::ffi::c_void, len: u32) -> i32;
+}
 
 /// Top-level windows of `class` with their owning process and visibility.
 fn windows(class: PCWSTR) -> Vec<(HWND, u32, bool)> {
@@ -164,10 +174,36 @@ pub fn post_exit(
         return Ok(false);
     }
     arm()?;
+    quiet_crash_box(pid);
     // SAFETY: this is the taskbar's Exit Explorer command, with no pointer arguments.
     unsafe { PostMessageW(Some(tray), EXIT_EXPLORER, WPARAM(0), LPARAM(0)) }
         .map_err(|e| format!("request Exit Explorer: {e}"))?;
     Ok(true)
+}
+
+/// An Explorer that crashes on its way out (a shell mod) would otherwise sit on a hard-error box
+/// when Windows Error Reporting is off. Only for the Explorer the user agreed to retire.
+fn quiet_crash_box(pid: u32) {
+    // SAFETY: the handle is closed here; the mode is a 4-byte value read during the call.
+    let result = unsafe {
+        OpenProcess(PROCESS_SET_INFORMATION, false, pid)
+            .map_err(|e| e.to_string())
+            .and_then(|process| {
+                let mode = QUIET_HARD_ERRORS;
+                let status = NtSetInformationProcess(
+                    process,
+                    PROCESS_DEFAULT_HARD_ERROR_MODE,
+                    (&raw const mode).cast(),
+                    size_of::<u32>() as u32,
+                );
+                let _ = CloseHandle(process);
+                if status >= 0 { Ok(()) } else { Err(format!("NTSTATUS {status:#010x}")) }
+            })
+    };
+    match result {
+        Ok(()) => log::line(&format!("switch: Explorer pid {pid} crash box off")),
+        Err(e) => log::line(&format!("switch: could not turn off Explorer pid {pid}'s crash box: {e}")),
+    }
 }
 
 pub fn wait_for_desktop_windows(preloaded: &Preloaded) -> Result<(), String> {
