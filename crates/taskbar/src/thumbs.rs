@@ -87,9 +87,63 @@ pub fn place_x(anchor: f32, w: f32, min: f32, max: f32) -> f32 {
     (anchor - w / 2.0).clamp(min, (max - w).max(min))
 }
 
+/// What the flyout does when the pointer is over `slot` (None: elsewhere).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoverStep {
+    /// Nothing changes (the flyout or the delay already matches).
+    Keep,
+    /// The open flyout stays: cancel its close grace.
+    Stay,
+    /// Another button's flyout is open: show this one at once.
+    Switch(usize),
+    /// Start the close grace.
+    CloseSoon,
+    /// Start the hover delay for this button.
+    Arm(usize),
+    /// Cancel the hover delay.
+    Disarm,
+    /// Close the flyout now and cancel any delay.
+    Close,
+}
+
+/// `open`: the button whose flyout shows; `want`: the button whose delay runs; `menu_up`: a
+/// menu of the bar is open, which the flyout must never cover.
+pub fn hover_step(open: Option<usize>, want: Option<usize>, slot: Option<usize>, menu_up: bool) -> HoverStep {
+    match (open, slot) {
+        (Some(_), _) if menu_up => HoverStep::Close,
+        (None, _) if menu_up => HoverStep::Disarm,
+        (Some(o), Some(i)) if o == i => HoverStep::Stay,
+        (Some(_), Some(i)) => HoverStep::Switch(i),
+        (Some(_), None) => HoverStep::CloseSoon,
+        (None, Some(i)) if want == Some(i) => HoverStep::Keep,
+        (None, Some(i)) => HoverStep::Arm(i),
+        (None, None) => HoverStep::Disarm,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_without_menu() {
+        assert_eq!(hover_step(None, None, Some(3), false), HoverStep::Arm(3));
+        assert_eq!(hover_step(None, Some(3), Some(3), false), HoverStep::Keep);
+        assert_eq!(hover_step(Some(3), None, Some(3), false), HoverStep::Stay);
+        assert_eq!(hover_step(Some(3), None, Some(4), false), HoverStep::Switch(4));
+        assert_eq!(hover_step(Some(3), None, None, false), HoverStep::CloseSoon);
+        assert_eq!(hover_step(None, Some(3), None, false), HoverStep::Disarm);
+    }
+
+    /// A right click opens the jump list over the button the pointer rests on: the flyout must
+    /// not come back on top of the menu.
+    #[test]
+    fn menu_keeps_flyout_away() {
+        assert_eq!(hover_step(None, None, Some(8), true), HoverStep::Disarm);
+        assert_eq!(hover_step(None, Some(8), Some(8), true), HoverStep::Disarm);
+        assert_eq!(hover_step(Some(8), None, Some(8), true), HoverStep::Close);
+        assert_eq!(hover_step(Some(8), None, Some(7), true), HoverStep::Close);
+    }
 
     #[test]
     fn fit_keeps_ratio() {

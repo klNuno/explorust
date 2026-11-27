@@ -5,6 +5,7 @@
 pub const ID_LAUNCH: u32 = 1;
 pub const ID_PIN: u32 = 2;
 pub const ID_CLOSE: u32 = 3;
+pub const ID_END_TASK: u32 = 4;
 pub const ID_PINNED: u32 = 100;
 pub const ID_RECENT: u32 = 300;
 pub const ID_TASK: u32 = 500;
@@ -20,6 +21,8 @@ pub struct Input {
     pub tasks: Vec<String>,
     pub pinned_to_bar: bool,
     pub windows: usize,
+    /// Settings > System > For developers > End task is on.
+    pub end_task: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +38,7 @@ pub enum Pick {
     Launch,
     Pin,
     Close,
+    EndTask,
     Pinned(usize),
     Recent(usize),
     Task(usize),
@@ -45,6 +49,7 @@ pub fn pick(id: u32) -> Option<Pick> {
         ID_LAUNCH => Pick::Launch,
         ID_PIN => Pick::Pin,
         ID_CLOSE => Pick::Close,
+        ID_END_TASK => Pick::EndTask,
         i if (ID_PINNED..ID_RECENT).contains(&i) => Pick::Pinned((i - ID_PINNED) as usize),
         i if (ID_RECENT..ID_TASK).contains(&i) => Pick::Recent((i - ID_RECENT) as usize),
         i if (ID_TASK..ID_TASK + 200).contains(&i) => Pick::Task((i - ID_TASK) as usize),
@@ -81,6 +86,10 @@ pub fn build(i: &Input, french: bool) -> Vec<Entry> {
         t("Pin to taskbar", "Épingler à la barre des tâches")
     };
     out.push(Entry::Item(ID_PIN, pin.to_string()));
+    if i.end_task && i.windows > 0 {
+        // Windows' own label, from Windows.UI.ShellCommon's resources.
+        out.push(Entry::Item(ID_END_TASK, t("End task", "Terminer la tâche").to_string()));
+    }
     match i.windows {
         0 => {}
         1 => out.push(Entry::Item(ID_CLOSE, t("Close window", "Fermer la fenêtre").to_string())),
@@ -129,6 +138,25 @@ mod tests {
         assert_eq!(e[18], Entry::Item(ID_LAUNCH, "A && B".into()));
         assert_eq!(e[19], Entry::Item(ID_PIN, "Détacher de la barre des tâches".into()));
         assert_eq!(e[20], Entry::Item(ID_CLOSE, "Fermer toutes les fenêtres".into()));
+    }
+
+    #[test]
+    fn end_task_when_enabled_and_running() {
+        let i = Input { app: "Spotify".into(), windows: 1, end_task: true, ..Default::default() };
+        assert_eq!(
+            build(&i, true),
+            [
+                Entry::Item(ID_LAUNCH, "Spotify".into()),
+                Entry::Item(ID_PIN, "Épingler à la barre des tâches".into()),
+                Entry::Item(ID_END_TASK, "Terminer la tâche".into()),
+                Entry::Item(ID_CLOSE, "Fermer la fenêtre".into()),
+            ]
+        );
+        let closed = Input { app: "Spotify".into(), end_task: true, ..Default::default() };
+        assert!(!build(&closed, false).contains(&Entry::Item(ID_END_TASK, "End task".into())));
+        let off = Input { app: "Spotify".into(), windows: 1, ..Default::default() };
+        assert!(build(&off, false).iter().all(|e| !matches!(e, Entry::Item(ID_END_TASK, _))));
+        assert_eq!(pick(ID_END_TASK), Some(Pick::EndTask));
     }
 
     #[test]

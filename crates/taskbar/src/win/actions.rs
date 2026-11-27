@@ -1,14 +1,18 @@
 //! What a button does to windows and apps: activate, minimize, launch through the shell.
 
 use super::{log, winx};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
+};
+use windows::core::{PWSTR, w};
 use windows::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, SHGetIDListFromObject, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, PostMessageW, SC_MINIMIZE, SC_RESTORE,
+    BringWindowToTop, FindWindowExW, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, PostMessageW, SC_MINIMIZE, SC_RESTORE,
     SW_SHOWNORMAL, SetForegroundWindow, SwitchToThisWindow, WM_SYSCOMMAND,
 };
 
@@ -106,4 +110,59 @@ pub fn activate(h: HWND) -> bool {
 pub fn minimize(h: HWND) {
     // SAFETY: posts a system command to the window.
     let _ = unsafe { PostMessageW(Some(h), WM_SYSCOMMAND, WPARAM(SC_MINIMIZE as usize), LPARAM(0)) };
+}
+
+/// The process that owns `h`'s content: a UWP frame's hosted CoreWindow, else the window's own.
+fn content_pid(h: HWND) -> u32 {
+    let mut pid = 0u32;
+    // SAFETY: window queries on a handle; a stale one gives 0.
+    unsafe {
+        if let Ok(core) = FindWindowExW(Some(h), None, w!("Windows.UI.Core.CoreWindow"), None) {
+            GetWindowThreadProcessId(core, Some(&mut pid));
+        }
+        if pid == 0 {
+            GetWindowThreadProcessId(h, Some(&mut pid));
+        }
+    }
+    pid
+}
+
+/// Ends the processes behind a button's windows at once, like Windows' "End task" (Settings >
+/// System > For developers), which also stops an app that no longer answers. Never ends this
+/// shell or explorer.exe.
+pub fn end_task(wins: &[isize]) {
+    // SAFETY: plain process id query.
+    let me = unsafe { GetCurrentProcessId() };
+    let mut pids: Vec<u32> = wins.iter().map(|h| content_pid(HWND(*h as _))).filter(|p| *p != 0 && *p != me).collect();
+    pids.sort_unstable();
+    pids.dedup();
+    for pid in pids {
+        // SAFETY: a handle we open, query and close here.
+        unsafe {
+            let h = match OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                Ok(h) => h,
+                Err(e) => {
+                    log::line(&format!("end task: cannot open pid {pid}: {e}"));
+                    continue;
+                }
+            };
+            let mut buf = [0u16; 260];
+            let mut n = buf.len() as u32;
+            let path = if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n).is_ok() {
+                String::from_utf16_lossy(&buf[..n as usize])
+            } else {
+                String::new()
+            };
+            let name = path.rsplit('\\').next().unwrap_or("");
+            if name.eq_ignore_ascii_case("explorer.exe") {
+                log::line(&format!("end task: kept {path} (pid {pid})"));
+            } else {
+                match TerminateProcess(h, 1) {
+                    Ok(()) => log::line(&format!("end task: ended {path} (pid {pid})")),
+                    Err(e) => log::line(&format!("end task: {path} (pid {pid}): {e}")),
+                }
+            }
+            let _ = CloseHandle(h);
+        }
+    }
 }

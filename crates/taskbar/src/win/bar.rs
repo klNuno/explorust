@@ -126,6 +126,8 @@ struct Bar {
     thumbs: Option<ThumbFlyout>,
     /// The slot whose hover delay runs.
     thumb_want: Option<usize>,
+    /// A jump list or context menu of the bar is open.
+    menu_up: bool,
     /// Keyboard focus on the right side (Win+B): index in `tray_hits()`.
     tray_focus: Option<usize>,
     taskband: Taskband,
@@ -357,6 +359,7 @@ fn create(class: &HSTRING) -> windows_core::Result<()> {
             side: Side::new(hwnd, WM_APP_STATUS),
             thumbs: None,
             thumb_want: None,
+            menu_up: false,
             tray_focus: None,
             taskband,
             shown: if settings.autohide { 0.0 } else { 1.0 },
@@ -478,14 +481,16 @@ fn run_effect(e: Effect) {
         }
         Effect::WinX => {
             let at = with_bar(|b| {
-                b.close_thumbs();
+                b.set_menu_up(true);
                 let (l, _, _, _) = b.row().slot_rect(0);
                 let wr = b.window_rect();
                 (b.hwnd, wr.left + (l * b.scale()).round() as i32, wr.top)
             });
             if let Some((owner, x, y)) = at {
                 log::line(&format!("win+x menu at {x},{y}"));
-                if let Some(c) = winx::show(owner, x, y) {
+                let picked = winx::show(owner, x, y);
+                let _ = with_bar(|b| b.set_menu_up(false));
+                if let Some(c) = picked {
                     let ok = bus::post(c, 0);
                     log::line(&format!("bus {c:?}: {}", if ok { "posted" } else { "no owner" }));
                 }
@@ -493,15 +498,18 @@ fn run_effect(e: Effect) {
         }
         Effect::JumpList(i) => {
             let Some((owner, x, y, key, nodes, recent)) = with_bar(|b| b.jump_list(i)).flatten() else { return };
+            let _ = with_bar(|b| b.set_menu_up(true));
             let id = menu::track(owner, x, y, &nodes, true);
+            let _ = with_bar(|b| b.set_menu_up(false));
             log::line(&format!("jump list {i}: picked {id}"));
             if let Some(p) = jump::pick(id) {
                 let _ = with_bar(|b| b.jump_pick(&key, p, &recent));
             }
         }
         Effect::Context(kind, x, y) => {
-            with_bar(|b| b.close_thumbs());
+            with_bar(|b| b.set_menu_up(true));
             context::show(hwnd, x, y, kind);
+            with_bar(|b| b.set_menu_up(false));
         }
         Effect::Quit => {
             teardown();
@@ -1151,31 +1159,40 @@ impl Bar {
 
     /// The pointer is over `slot` (None: elsewhere): starts, switches or ends the thumbnails.
     fn thumb_hover(&mut self, slot: Option<usize>) {
+        use crate::thumbs::{HoverStep, hover_step};
         let slot = slot.filter(|&i| i > 0 && self.groups.get(i - 1).is_some_and(|g| !g.wins.is_empty()));
         let open = self.thumbs.as_ref().map(|f| f.slot);
         // SAFETY: timers on our own window.
         unsafe {
-            match (open, slot) {
-                (Some(o), Some(i)) if o == i => {
+            match hover_step(open, self.thumb_want, slot, self.menu_up) {
+                HoverStep::Keep => {}
+                HoverStep::Stay => {
                     let _ = KillTimer(Some(self.hwnd), TIMER_THUMB_CLOSE);
                 }
-                (Some(_), Some(i)) => self.open_thumbs(i),
-                (Some(_), None) => {
+                HoverStep::Switch(i) => self.open_thumbs(i),
+                HoverStep::CloseSoon => {
                     SetTimer(Some(self.hwnd), TIMER_THUMB_CLOSE, THUMB_CLOSE_MS, None);
                 }
-                (None, Some(i)) => {
-                    if self.thumb_want != Some(i) {
-                        self.thumb_want = Some(i);
-                        let mut ms = 400u32;
-                        let _ = SystemParametersInfoW(SPI_GETMOUSEHOVERTIME, 0, Some(&mut ms as *mut _ as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
-                        SetTimer(Some(self.hwnd), TIMER_THUMB_OPEN, ms.max(1), None);
-                    }
+                HoverStep::Arm(i) => {
+                    self.thumb_want = Some(i);
+                    let mut ms = 400u32;
+                    let _ = SystemParametersInfoW(SPI_GETMOUSEHOVERTIME, 0, Some(&mut ms as *mut _ as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+                    SetTimer(Some(self.hwnd), TIMER_THUMB_OPEN, ms.max(1), None);
                 }
-                (None, None) => {
+                HoverStep::Disarm => {
                     self.thumb_want = None;
                     let _ = KillTimer(Some(self.hwnd), TIMER_THUMB_OPEN);
                 }
+                HoverStep::Close => self.close_thumbs(),
             }
+        }
+    }
+
+    /// A menu of the bar opens (true) or closes: no thumbnail flyout while it shows.
+    fn set_menu_up(&mut self, up: bool) {
+        self.menu_up = up;
+        if up {
+            self.close_thumbs();
         }
     }
 
@@ -1265,6 +1282,7 @@ impl Bar {
             recent: recent.iter().map(|r| r.0.clone()).collect(),
             pinned_to_bar: g.pin.is_some(),
             windows: g.wins.len(),
+            end_task: reg_dword(w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings"), w!("TaskbarEndTask")).unwrap_or(0) != 0,
             ..Default::default()
         };
         let fr = menu::french();
@@ -1278,6 +1296,7 @@ impl Bar {
                         jump::ID_PIN if input.pinned_to_bar => '\u{E77A}',
                         jump::ID_PIN => '\u{E718}',
                         jump::ID_CLOSE => '\u{E711}',
+                        jump::ID_END_TASK => '\u{E71A}',
                         jump::ID_PINNED..jump::ID_RECENT => '\u{E718}',
                         jump::ID_RECENT..jump::ID_TASK => '\u{E81C}',
                         _ => '\u{E8A7}',
@@ -1307,6 +1326,7 @@ impl Bar {
                     let _ = unsafe { PostMessageW(Some(HWND(*h as _)), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0)) };
                 }
             }
+            jump::Pick::EndTask => actions::end_task(&g.wins),
             jump::Pick::Pin => {
                 if let Some(pi) = g.pin {
                     self.pins.remove(pi);
@@ -1701,7 +1721,7 @@ fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
                 TIMER_THUMB_OPEN => {
                     // SAFETY: our own timer.
                     let _ = unsafe { KillTimer(Some(hwnd), TIMER_THUMB_OPEN) };
-                    if let Some(i) = b.thumb_want.take().filter(|i| b.hover == Some(*i)) {
+                    if let Some(i) = b.thumb_want.take().filter(|i| b.hover == Some(*i) && !b.menu_up) {
                         b.open_thumbs(i);
                     }
                 }
