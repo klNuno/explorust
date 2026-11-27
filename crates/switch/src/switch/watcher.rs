@@ -4,8 +4,8 @@ use super::{
     explorer, folder_close, prepare_lock,
     reopen_list::{self, Folder},
 };
-use guard::desktop_recovery::{ExplorerExit, ensure_desktop, restore_desktop, show_sign_out_notice};
-use guard::policy::{self, ANSWER_WITHIN, DESKTOP_RECOVERY_LIMIT, DesktopAction, ExitState};
+use guard::desktop_recovery::{ExplorerExit, ensure_desktop, restore_desktop, show_sign_out_notice, stop_retiring};
+use guard::policy::{self, DESKTOP_RECOVERY_LIMIT, DesktopAction, ExitState, RetiringExit};
 use guard::proc::{Child, Event, wait_any};
 use guard::switch_events::{CANCEL_FOR_RESTORE, EXITING_EXPLORER, SWITCH_EXE, switch_event};
 use guard::{account, install, log, reopen, taskbar, ui};
@@ -299,7 +299,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
     }
     log::line(&format!("switch: watcher reading Explorer folders for switch pid {owner}"));
     let snapshot = snapshot_path(stamp);
-    let mut folders = capture_folders(&snapshot, Instant::now())?;
+    let (mut folders, mut preloaded) = capture_folders(&snapshot, Instant::now())?;
     log::line(&format!(
         "switch: watcher ready for switch pid {owner}, saved {} Explorer folder windows",
         folders.len()
@@ -339,12 +339,12 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         if abandoned() || explorer::file_operations() {
             continue;
         }
-        if reopen_list::same_windows(&folders, explorer::folder_windows().into_iter()) {
+        if reopen_list::same_windows(&folders, explorer::user_windows(&preloaded).into_iter()) {
             break recovery;
         }
         drop(recovery);
         log::line("switch: Explorer folder windows changed; refreshing the handoff");
-        folders = capture_folders(&snapshot, refresh_started).inspect_err(|_| {
+        (folders, preloaded) = capture_folders(&snapshot, refresh_started).inspect_err(|_| {
             let _ = std::fs::remove_file(&snapshot);
         })?;
     };
@@ -355,7 +355,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
         return Ok(0);
     }
     let started = (|| -> Result<bool, String> {
-        let Some(earlier_receipts) = close_folders(&folders, explorer_pid, owner, stamp, abandoned)? else {
+        let Some(earlier_receipts) = close_folders(&folders, &preloaded, explorer_pid, owner, stamp, abandoned)? else {
             return Ok(false);
         };
         if abandoned() {
@@ -370,7 +370,7 @@ fn watch(arguments: impl Iterator<Item = String>) -> Result<u32, String> {
                 log::line(&format!("switch: requested Exit Explorer for pid {explorer_pid}"));
                 let started = Instant::now();
                 wait_for_original_exit(&retiring, &owner_process, &signals)?;
-                explorer::wait_for_desktop_windows()?;
+                explorer::wait_for_desktop_windows(&preloaded)?;
                 log::line(&format!("switch: Explorer desktop exited after {} ms", started.elapsed().as_millis()));
                 Ok(true)
             }
@@ -466,6 +466,7 @@ fn wait_for_original_exit(original: &Child, owner: &Child, signals: &Signals) ->
     let events = [original.handle, owner.handle, signals.rollback.0];
     let started = Instant::now();
     let mut missing_since = None;
+    let mut last_stop: Option<Instant> = None;
     loop {
         if Event::is_signalled(CANCEL_FOR_RESTORE) {
             return Err("turning off explorust while Explorer's exit is pending".into());
@@ -475,19 +476,36 @@ fn wait_for_original_exit(original: &Child, owner: &Child, signals: &Signals) ->
             Some(_) => return Err("the switch ended while Explorer's exit was pending".into()),
             None => {}
         }
-        if started.elapsed() >= DESKTOP_RECOVERY_LIMIT {
-            return Err("Explorer did not exit within the handoff budget".into());
-        }
-        if taskbar::owns_tray(original.pid) {
+        let file_operations = taskbar::explorer_file_operations();
+        // A copy restarts the grace: Explorer is only ended a full grace after the last one.
+        let missing = if file_operations || taskbar::owns_tray(original.pid) {
             missing_since = None;
-        } else if missing_since.get_or_insert_with(Instant::now).elapsed() >= ANSWER_WITHIN {
-            return Err("Explorer lost its taskbar and did not finish exiting".into());
+            None
+        } else {
+            Some(missing_since.get_or_insert_with(Instant::now).elapsed())
+        };
+        match policy::retiring_exit(started.elapsed(), missing, file_operations) {
+            RetiringExit::Wait => {}
+            RetiringExit::GiveUp => return Err("Explorer did not exit within the handoff budget".into()),
+            // An Explorer that crashed on its way out keeps its process on the error box.
+            RetiringExit::Stop if last_stop.is_none_or(|last| last.elapsed() >= Duration::from_secs(2)) => {
+                last_stop = Some(Instant::now());
+                if stop_retiring(original)? {
+                    log::line(&format!(
+                        "switch: Explorer pid {} lost its taskbar {} ms ago and did not exit; stopped it",
+                        original.pid,
+                        missing.unwrap_or_default().as_millis()
+                    ));
+                }
+            }
+            RetiringExit::Stop => {}
         }
     }
 }
 
 fn close_folders(
     folders: &[Folder],
+    preloaded: &explorer::Preloaded,
     desktop: u32,
     owner: u32,
     stamp: u64,
@@ -522,13 +540,13 @@ fn close_folders(
     }
     // Another window may have opened while the outgoing desktop processed the closes.
     let original: Vec<_> = folders.iter().filter(|folder| folder.owner == desktop).map(|folder| (folder.hwnd, folder.owner)).collect();
-    Ok(explorer::folder_windows().iter().all(|window| original.contains(window)).then_some(earlier_receipts))
+    Ok(explorer::user_windows(preloaded).iter().all(|window| original.contains(window)).then_some(earlier_receipts))
 }
 
-fn capture_folders(snapshot: &Path, started: Instant) -> Result<Vec<Folder>, String> {
-    let folders = loop {
-        if let Some(folders) = explorer::open_folders()? {
-            break folders;
+fn capture_folders(snapshot: &Path, started: Instant) -> Result<(Vec<Folder>, explorer::Preloaded), String> {
+    let (folders, preloaded) = loop {
+        if let Some(capture) = explorer::open_folders()? {
+            break capture;
         }
         if started.elapsed() >= PREPARE_BUDGET {
             return Err("Explorer folder windows did not settle before the switch".into());
@@ -542,7 +560,10 @@ fn capture_folders(snapshot: &Path, started: Instant) -> Result<Vec<Folder>, Str
         let _ = std::fs::remove_file(temp);
         return Err(format!("save Explorer recovery snapshot: {error}"));
     }
-    Ok(folders)
+    if !preloaded.is_empty() {
+        log::line(&format!("switch: left out {} hidden preloaded Explorer window(s)", preloaded.len()));
+    }
+    Ok((folders, preloaded))
 }
 
 fn clear_snapshot(stamp: u64) {

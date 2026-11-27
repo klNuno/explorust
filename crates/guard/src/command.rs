@@ -17,9 +17,10 @@
 //! - `--uninstall [--yes|--quiet]`: the user's way back (`uninstall`), asks Windows for rights.
 //!   `--machine [--for <sid>]` is its elevated half.
 
-use crate::{account, install, log, manage, proc, reg, reopen, setup, supervise, taskbar, uninstall, watchdog};
+use crate::{account, install, log, manage, policy, proc, reg, reopen, setup, supervise, taskbar, uninstall, watchdog};
 use crate::proc::Event;
-use crate::switch_events::{CANCEL_FOR_RESTORE, GUARD_MUTEX, SWITCH_EXE, switch_event};
+use crate::switch_events::{CANCEL_FOR_RESTORE, EXITING_EXPLORER, GUARD_MUTEX, SWITCH_EXE, switch_event};
+use std::time::{Duration, Instant};
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use windows::Win32::System::Threading::CreateMutexW;
@@ -38,8 +39,11 @@ pub fn run() {
         let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
     let code = match arg.as_str() {
-        "" if option_env!("EXPLORUST_PACKAGE_BUILD").is_some() => bootstrap(),
-        "" => run_shell(None, None, None, None),
+        "" => match shell_start() {
+            None => 0,
+            Some(claim) if option_env!("EXPLORUST_PACKAGE_BUILD").is_some() => bootstrap(claim),
+            Some(claim) => run_shell(None, None, None, None, Some(claim)),
+        },
         "--adopt" => adopt(),
         "--install" => manage::install(),
         "--restore" => manage::restore(),
@@ -86,26 +90,76 @@ pub fn run() {
     std::process::exit(code as i32);
 }
 
+/// How long a Winlogon start waits for a live switch or a desktop recovery in this session.
+const SESSION_BUSY_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// Winlogon starts the shell again when the process it watched ends with an error code, also
+/// mid-session: Explorer crashing while a live switch retires it. That start must not take a
+/// session that already has a shell, nor count as a sign-in. `None`: leave the session alone.
+/// `Some(claim)`: a sign-in; both locks stay held until the guard owns its mutex, fallback
+/// included, so no switch or desktop recovery acts between this decision and the takeover.
+fn shell_start() -> Option<install::SessionClaim> {
+    // A live switch, then its rollback, owns the session until it releases these (taken in the
+    // order restores use). One still held after the wait is stuck: decide from what the session shows.
+    // A watcher past its recovery budget releases its lock yet still waits for the retiring
+    // Explorer while EXITING_EXPLORER is signalled: let it finish, then look at the session.
+    let deadline = Instant::now() + SESSION_BUSY_WAIT;
+    let left = || deadline.saturating_duration_since(Instant::now()).as_millis() as u32;
+    let lock = |name: &str, lock: Result<install::Lock, String>| {
+        lock.inspect_err(|error| log::line(&format!("shell start: {name}: {error} after 5 min; deciding without it"))).ok()
+    };
+    let claim = loop {
+        let switch = lock("switch", install::switch_lock_for(left()));
+        let recovery = lock("recovery", install::recovery_lock_for(left()));
+        let claim = install::SessionClaim { switch, recovery };
+        if !Event::is_signalled(EXITING_EXPLORER) {
+            break claim;
+        }
+        if left() == 0 {
+            log::line("shell start: Explorer's exit still pending after 5 min; deciding without it");
+            break claim;
+        }
+        drop(claim);
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let guard = install::guard_running().unwrap_or_else(|error| {
+        log::line(&format!("shell start: {error}"));
+        false
+    });
+    match policy::shell_start(guard, taskbar::explorer()) {
+        policy::ShellStart::SignIn => Some(claim),
+        policy::ShellStart::GuardRuns => {
+            log::line("shell start: a guard already holds this session; leaving it");
+            None
+        }
+        policy::ShellStart::ExplorerRuns(pid) => {
+            log::line(&format!("shell start: Explorer pid {pid} already owns the taskbar; leaving it"));
+            None
+        }
+    }
+}
+
 /// Winlogon must be able to run this program even if the loader rejects the bound supervisor.
 /// Hand over only once the supervisor has checked its identity and owns the session mutex.
-fn bootstrap() -> u32 {
+fn bootstrap(claim: install::SessionClaim) -> u32 {
+    let mut claim = Some(claim);
     if crate::hotkey::shift_held() {
         log::line("Shift held at logon: plain explorer");
-        return run_shell(None, None, Some(Logon::Explorer), None);
+        return run_shell(None, None, Some(Logon::Explorer), None, claim);
     }
-    let start = || -> Result<(), String> {
+    let mut start = || -> Result<(), String> {
         crate::package::repair_at_logon(&install::dir())?;
         let name = format!(r"Local\explorust-supervisor-{}", std::process::id());
         let ready = Event::named(&name)?;
         let exe = std::env::current_exe().map_err(|e| e.to_string())?
             .with_file_name(install::SUPERVISOR_EXE);
-        watchdog::run(&exe, &format!("--bootstrap {name}"), Some(&ready), None)
+        watchdog::run(&exe, &format!("--bootstrap {name}"), Some(&ready), None, &mut claim)
     };
     match start() {
         Ok(()) => 0,
         Err(error) => {
             log::line(&format!("guard: {error}; starting Explorer without package identity"));
-            run_shell(None, None, Some(Logon::Explorer), None)
+            run_shell(None, None, Some(Logon::Explorer), None, claim)
         }
     }
 }
@@ -129,7 +183,7 @@ pub fn run_supervisor() {
     };
     let code = match mode.as_deref() {
         Some("--bootstrap") => match args.next().as_deref().and_then(|name| Event::open_for_signal(name).ok()) {
-            Some(ready) => run_shell(None, None, Some(Logon::Takeover(ready)), explorer_ready.as_ref()),
+            Some(ready) => run_shell(None, None, Some(Logon::Takeover(ready)), explorer_ready.as_ref(), None),
             None => 2,
         },
         Some("--adopt") => adopt(),
@@ -141,7 +195,7 @@ pub fn run_supervisor() {
 
 fn adopt() -> u32 {
     match std::env::args().nth(2).and_then(|p| p.parse().ok()) {
-        Some(pid) => run_shell(Some((pid, std::env::args().nth(3))), None, None, None),
+        Some(pid) => run_shell(Some((pid, std::env::args().nth(3))), None, None, None, None),
         None => {
             say("--adopt needs the explorust pid");
             2
@@ -180,7 +234,7 @@ fn run_live(mut args: impl Iterator<Item = String>, explorer_ready: Option<&Even
     }
     if bootstrap {
         let exe = guard.with_file_name(install::SUPERVISOR_EXE);
-        return match watchdog::run(&exe, &format!("--live {worker} {stamp}"), None, Some(stamp)) {
+        return match watchdog::run(&exe, &format!("--live {worker} {stamp}"), None, Some(stamp), &mut None) {
             Ok(()) => 0,
             Err(error) => {
                 log::line(&format!("guard: live supervisor: {error}"));
@@ -188,7 +242,7 @@ fn run_live(mut args: impl Iterator<Item = String>, explorer_ready: Option<&Even
             }
         };
     }
-    run_shell(None, Some((stamp, rollback)), None, explorer_ready)
+    run_shell(None, Some((stamp, rollback)), None, explorer_ready, None)
 }
 
 enum Logon {
@@ -196,7 +250,9 @@ enum Logon {
     Explorer,
 }
 
-fn run_shell(adopt: Option<(u32, Option<String>)>, handoff: Option<(u64, Event)>, logon: Option<Logon>, explorer_ready: Option<&Event>) -> u32 {
+/// `claim` is a sign-in's hold on the switch and recovery locks, released once this guard owns
+/// the session mutex.
+fn run_shell(adopt: Option<(u32, Option<String>)>, handoff: Option<(u64, Event)>, logon: Option<Logon>, explorer_ready: Option<&Event>, claim: Option<install::SessionClaim>) -> u32 {
     // SAFETY: one guard per session; the last-error value is read immediately after creation.
     let handle = match unsafe { CreateMutexW(None, false, &HSTRING::from(GUARD_MUTEX)) } {
         Ok(handle) => handle,
@@ -208,6 +264,7 @@ fn run_shell(adopt: Option<(u32, Option<String>)>, handoff: Option<(u64, Event)>
     let already = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     // SAFETY: the supervisory loop owns and closes the handle, even if a dialog is still open.
     let _mutex = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    drop(claim);
     if already {
         log::line("another guard runs in this session: exiting");
         return 0;

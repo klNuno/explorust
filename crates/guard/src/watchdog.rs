@@ -12,6 +12,7 @@ pub fn run(
     args: &str,
     takeover: Option<&Event>,
     handoff: Option<u64>,
+    claim: &mut Option<install::SessionClaim>,
 ) -> Result<(), String> {
     let active = Event::named(BOOTSTRAP_ACTIVE)?;
     active.signal()?;
@@ -30,6 +31,9 @@ pub fn run(
             child.exit_code()
         ));
     }
+    // The supervisor owns the session mutex now: a switch or a recovery may act from here. On an
+    // error above the caller keeps the claim through its fallback.
+    *claim = None;
     log::line(&format!(
         "bootstrap: waiting for supervisor pid {}",
         child.pid

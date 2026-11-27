@@ -197,6 +197,50 @@ pub const DESKTOP_RECOVERY_LIMIT: Duration = Duration::from_secs(155);
 pub const DESKTOP_OBSERVE_LIMIT: Duration = Duration::from_secs(600);
 pub const RETIRING_EXPLORER_ATTEMPTS: u8 = 3;
 
+/// A healthy Explorer exits within a few seconds of destroying its taskbar. One that crashed on
+/// the way out (a shell extension or a mod injected into it) sits on its error box until someone
+/// answers it, or forever when the error box is not shown.
+pub const RETIRING_EXPLORER_GRACE: Duration = Duration::from_secs(10);
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RetiringExit {
+    Wait,
+    /// Its taskbar is gone: end the process and carry on with the switch.
+    Stop,
+    /// Hand the session back to recovery.
+    GiveUp,
+}
+
+/// The live switch after Exit Explorer: `tray_missing_for` is how long the retiring Explorer has
+/// had no taskbar, `None` while it still owns one.
+pub fn retiring_exit(elapsed: Duration, tray_missing_for: Option<Duration>, file_operations: bool) -> RetiringExit {
+    if elapsed >= DESKTOP_RECOVERY_LIMIT {
+        RetiringExit::GiveUp
+    } else if !file_operations && tray_missing_for.is_some_and(|missing| missing >= RETIRING_EXPLORER_GRACE) {
+        RetiringExit::Stop
+    } else {
+        RetiringExit::Wait
+    }
+}
+
+/// What a guard started by Winlogon finds. Winlogon starts the shell again whenever the process
+/// it watched ends with an error code, also in the middle of a session (Explorer crashing while a
+/// live switch retires it); only an empty session is a sign-in to take.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ShellStart {
+    SignIn,
+    GuardRuns,
+    ExplorerRuns(u32),
+}
+
+pub fn shell_start(guard_running: bool, explorer_taskbar: Option<u32>) -> ShellStart {
+    match (guard_running, explorer_taskbar) {
+        (true, _) => ShellStart::GuardRuns,
+        (false, Some(pid)) => ShellStart::ExplorerRuns(pid),
+        (false, None) => ShellStart::SignIn,
+    }
+}
+
 /// After the UI wait, observe a pending exit or copy without holding the recovery lock.
 pub fn observe_recovery(exit: ExitState, original_alive: bool, file_operations: bool) -> DesktopAction {
     if exit.pending() && original_alive {
@@ -304,6 +348,33 @@ impl ExplorerRecovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explorer_crashing_on_exit_is_stopped_not_rolled_back() {
+        let secs = Duration::from_secs;
+        // His PC: the taskbar went 5.4 s after Exit Explorer was posted and the process sat on an
+        // access violation box for 8.5 s more. The switch must keep waiting, then end it.
+        assert_eq!(retiring_exit(secs(6), Some(Duration::from_millis(5_400)), false), RetiringExit::Wait);
+        assert_eq!(retiring_exit(secs(9), Some(secs(9)), false), RetiringExit::Wait);
+        assert_eq!(retiring_exit(secs(11), Some(RETIRING_EXPLORER_GRACE), false), RetiringExit::Stop);
+        // A copy still running in it is never cut off; the budget bounds the wait.
+        assert_eq!(retiring_exit(secs(60), Some(secs(59)), true), RetiringExit::Wait);
+        assert_eq!(retiring_exit(DESKTOP_RECOVERY_LIMIT, Some(secs(150)), true), RetiringExit::GiveUp);
+        assert_eq!(retiring_exit(DESKTOP_RECOVERY_LIMIT, None, false), RetiringExit::GiveUp);
+        // A taskbar still owned is a slow exit, not a crash.
+        assert_eq!(retiring_exit(secs(40), None, false), RetiringExit::Wait);
+    }
+
+    #[test]
+    fn a_winlogon_restart_in_a_running_session_is_not_a_sign_in() {
+        // After Explorer crashed out of a live switch, Winlogon started the guard again while the
+        // restored Explorer owned the taskbar: explorust was refused and the logon counted a problem.
+        assert_eq!(shell_start(false, Some(11604)), ShellStart::ExplorerRuns(11604));
+        // The switch's own guard took the session first.
+        assert_eq!(shell_start(true, None), ShellStart::GuardRuns);
+        assert_eq!(shell_start(true, Some(7)), ShellStart::GuardRuns);
+        assert_eq!(shell_start(false, None), ShellStart::SignIn);
+    }
 
     #[test]
     fn a_pending_exit_keeps_the_observer_after_the_ui_deadline() {

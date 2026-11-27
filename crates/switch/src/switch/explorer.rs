@@ -1,26 +1,38 @@
 //! Observe and close only Explorer processes on this desktop and in this Windows session.
 
-use super::reopen_list::{self, Folder};
+use super::reopen_list::{self, Folder, FolderWindow};
 use guard::{explorer_launch::Apartment, explorer_path, log, taskbar};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, CoCreateInstance, CoTaskMemFree, IServiceProvider,
 };
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_INFORMATION};
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Shell::{
     IFolderView, IPersistFolder2, IShellBrowser, IShellItem, IShellWindows, IWebBrowser2,
     SHCreateItemFromIDList, SID_STopLevelBrowser, SIGDN_DESKTOPABSOLUTEPARSING, ShellWindows,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetWindowThreadProcessId, PostMessageW,
+    FindWindowExW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
 };
 use windows::core::{Interface, PCWSTR, w};
 
 const EXIT_EXPLORER: u32 = 0x5B4;
 pub const CLOSE_BUDGET: Duration = Duration::from_secs(30);
+const PROCESS_DEFAULT_HARD_ERROR_MODE: u32 = 12;
+/// SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX) as the
+/// kernel stores it: the critical-error bit is inverted (measured in g1: 0x8002).
+const QUIET_HARD_ERRORS: u32 = 0x8002;
 
-fn windows(class: PCWSTR) -> Vec<(HWND, u32)> {
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtSetInformationProcess(process: HANDLE, class: u32, info: *const core::ffi::c_void, len: u32) -> i32;
+}
+
+/// Top-level windows of `class` with their owning process and visibility.
+fn windows(class: PCWSTR) -> Vec<(HWND, u32, bool)> {
     let mut entries = Vec::new();
     let mut after = None;
     // SAFETY: enumerate top-level windows on this thread's desktop.
@@ -28,7 +40,7 @@ fn windows(class: PCWSTR) -> Vec<(HWND, u32)> {
         while let Ok(hwnd) = FindWindowExW(None, after, class, None) {
             let mut pid = 0;
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            entries.push((hwnd, pid));
+            entries.push((hwnd, pid, IsWindowVisible(hwnd).as_bool()));
             after = Some(hwnd);
         }
     }
@@ -37,19 +49,33 @@ fn windows(class: PCWSTR) -> Vec<(HWND, u32)> {
 
 pub use guard::taskbar::explorer_file_operations as file_operations;
 
-pub fn folder_windows() -> Vec<(isize, u32)> {
+fn explorer_folder_windows() -> Vec<FolderWindow> {
     windows(w!("CabinetWClass"))
         .into_iter()
-        .filter(|(_, pid)| taskbar::is_explorer(*pid))
-        .map(|(window, pid)| (window.0 as isize, pid))
+        .filter(|(_, pid, _)| taskbar::is_explorer(*pid))
+        .map(|(window, owner, visible)| FolderWindow { hwnd: window.0 as isize, owner, visible })
         .collect()
 }
 
+/// Every Explorer folder window, hidden ones included.
+pub fn folder_windows() -> Vec<(isize, u32)> {
+    explorer_folder_windows().into_iter().map(|window| (window.hwnd, window.owner)).collect()
+}
+
+/// Hidden preloaded folder windows excused at capture.
+pub type Preloaded = HashSet<(isize, u32)>;
+
+/// The folder windows a snapshot must cover.
+pub fn user_windows(preloaded: &Preloaded) -> Vec<(isize, u32)> {
+    reopen_list::user_windows(explorer_folder_windows(), preloaded)
+}
+
 /// Returns None if windows came or went while COM was reading their folders.
-pub fn open_folders() -> Result<Option<Vec<Folder>>, String> {
-    let open = folder_windows();
+pub fn open_folders() -> Result<Option<(Vec<Folder>, Preloaded)>, String> {
+    let windows = explorer_folder_windows();
+    let open: Vec<_> = windows.iter().map(|window| (window.hwnd, window.owner)).collect();
     if open.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Some((Vec::new(), Preloaded::new())));
     }
     let _apartment = Apartment::new().map_err(|e| format!("initialize ShellWindows COM: {e}"))?;
     // SAFETY: the worker owns the apartment and drops all interfaces before uninitializing it.
@@ -60,6 +86,7 @@ pub fn open_folders() -> Result<Option<Vec<Folder>>, String> {
             .Count()
             .map_err(|e| format!("count ShellWindows: {e}"))?;
         let mut entries = Vec::new();
+        let mut listed = HashSet::new();
         for i in 0..count {
             let Ok(browser) = list
                 .Item(&VARIANT::from(i))
@@ -71,6 +98,7 @@ pub fn open_folders() -> Result<Option<Vec<Folder>>, String> {
             let Some(&(_, owner)) = open.iter().find(|(h, _)| *h == hwnd.0) else {
                 continue;
             };
+            listed.insert((hwnd.0, owner));
             match active_folder(&browser) {
                 Ok(folder) if !folder.is_empty() && !folder.contains('\0') => {
                     entries.push(Folder { hwnd: hwnd.0, owner, path: folder })
@@ -89,10 +117,11 @@ pub fn open_folders() -> Result<Option<Vec<Folder>>, String> {
         if current.len() != open.len() || current.iter().any(|window| !open.contains(window)) {
             return Ok(None);
         }
-        if !reopen_list::same_windows(&entries, open.into_iter()) {
+        let preloaded = reopen_list::preloaded(&windows, &listed);
+        if !reopen_list::same_windows(&entries, reopen_list::user_windows(windows, &preloaded).into_iter()) {
             return Err("one or more Explorer windows could not be saved".into());
         }
-        Ok(Some(reopen_list::folders(entries)))
+        Ok(Some((reopen_list::folders(entries), preloaded)))
     }
 }
 
@@ -145,13 +174,39 @@ pub fn post_exit(
         return Ok(false);
     }
     arm()?;
+    quiet_crash_box(pid);
     // SAFETY: this is the taskbar's Exit Explorer command, with no pointer arguments.
     unsafe { PostMessageW(Some(tray), EXIT_EXPLORER, WPARAM(0), LPARAM(0)) }
         .map_err(|e| format!("request Exit Explorer: {e}"))?;
     Ok(true)
 }
 
-pub fn wait_for_desktop_windows() -> Result<(), String> {
+/// An Explorer that crashes on its way out (a shell mod) would otherwise sit on a hard-error box
+/// when Windows Error Reporting is off. Only for the Explorer the user agreed to retire.
+fn quiet_crash_box(pid: u32) {
+    // SAFETY: the handle is closed here; the mode is a 4-byte value read during the call.
+    let result = unsafe {
+        OpenProcess(PROCESS_SET_INFORMATION, false, pid)
+            .map_err(|e| e.to_string())
+            .and_then(|process| {
+                let mode = QUIET_HARD_ERRORS;
+                let status = NtSetInformationProcess(
+                    process,
+                    PROCESS_DEFAULT_HARD_ERROR_MODE,
+                    (&raw const mode).cast(),
+                    size_of::<u32>() as u32,
+                );
+                let _ = CloseHandle(process);
+                if status >= 0 { Ok(()) } else { Err(format!("NTSTATUS {status:#010x}")) }
+            })
+    };
+    match result {
+        Ok(()) => log::line(&format!("switch: Explorer pid {pid} crash box off")),
+        Err(e) => log::line(&format!("switch: could not turn off Explorer pid {pid}'s crash box: {e}")),
+    }
+}
+
+pub fn wait_for_desktop_windows(preloaded: &Preloaded) -> Result<(), String> {
     let started = Instant::now();
     loop {
         if let Some((_, owner)) = taskbar::explorer_window() {
@@ -159,9 +214,9 @@ pub fn wait_for_desktop_windows() -> Result<(), String> {
         }
         let desktop_window = windows(w!("Progman"))
             .into_iter()
-            .any(|(_, owner)| taskbar::is_explorer(owner));
+            .any(|(_, owner, _)| taskbar::is_explorer(owner));
         // Wait until every original Explorer folder window is gone before handing over to Files.
-        if !desktop_window && folder_windows().is_empty() {
+        if !desktop_window && user_windows(preloaded).is_empty() {
             return Ok(());
         }
         if started.elapsed() >= CLOSE_BUDGET {

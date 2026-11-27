@@ -13,9 +13,9 @@ use windows::Win32::Security::Cryptography::{
     CertDeleteCertificateFromStore, CertFindCertificateInStore, CertOpenStore, CertFreeCertificateContext, HCERTSTORE,
     PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
 };
-use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
-use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateMutexW, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject};
 use windows::Win32::UI::Shell::IsUserAnAdmin;
 use windows::core::{HSTRING, PCWSTR};
 
@@ -247,6 +247,26 @@ pub fn user_setup_lock() -> Result<Lock, String> {
 
 pub fn switch_lock_for(timeout_ms: u32) -> Result<Lock, String> {
     named_lock(crate::switch_events::SWITCH_MUTEX, timeout_ms, "another switch is running in this session")
+}
+
+/// A Winlogon start's hold on the switch and recovery locks, kept until its guard owns the session
+/// mutex. Either may be missing when a stuck holder kept it past the wait.
+pub struct SessionClaim {
+    pub switch: Option<Lock>,
+    pub recovery: Option<Lock>,
+}
+
+/// True while a guard holds the session (its mutex exists).
+pub fn guard_running() -> Result<bool, String> {
+    // SAFETY: the open handle is closed immediately. The running guard keeps its own handle.
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(crate::switch_events::GUARD_MUTEX)) } {
+        Ok(handle) => {
+            let _ = unsafe { CloseHandle(handle) };
+            Ok(true)
+        }
+        Err(e) if e.code() == ERROR_FILE_NOT_FOUND.to_hresult() => Ok(false),
+        Err(e) => Err(format!("query the guard: {e}")),
+    }
 }
 
 pub fn recovery_lock_for(timeout_ms: u32) -> Result<Lock, String> {
